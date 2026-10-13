@@ -40,7 +40,9 @@
 
 pub mod annexb;
 pub mod geometry;
+pub mod obu;
 mod probe;
+pub mod sei;
 
 #[cfg(windows)]
 mod capture;
