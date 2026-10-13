@@ -1,0 +1,53 @@
+[package]
+name = "rec-video"
+description = "rec video pipeline: Windows.Graphics.Capture -> D3D11 NV12 convert -> Media Foundation hardware encoder."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rec-core.workspace = true
+thiserror = "2.0.21"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Foundation",
+    "Foundation_Metadata",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Security_Authorization_AppCapabilityAccess",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Already a dependency of `windows`; `#[implement]` (the tracked-sample
+# callback) expands to paths in this crate.
+windows-core = "0.62"
+
+[target.'cfg(windows)'.dev-dependencies]
+# Only the `record` example uses these (window lookup, CPU/memory statistics).
+windows = { workspace = true, features = [
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_UI_HiDpi",
+] }
