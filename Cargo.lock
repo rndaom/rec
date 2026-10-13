@@ -72,6 +72,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rec-mux"
+version = "0.0.1"
+dependencies = [
+ "rec-core",
+ "thiserror",
+]
+
+[[package]]
 name = "recd"
 version = "0.0.1"
 dependencies = [
