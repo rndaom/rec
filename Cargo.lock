@@ -55,6 +55,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rec-audio"
+version = "0.0.1"
+dependencies = [
+ "rec-core",
+ "thiserror",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "rec-cli"
 version = "0.0.1"
 dependencies = [
