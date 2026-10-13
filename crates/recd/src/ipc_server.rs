@@ -4,13 +4,17 @@
 //! (clients are CLIs, the settings UI and macro tools; requests are rare and
 //! tiny). The pipe is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so no
 //! other process can squat on the name, and it rejects remote clients.
+//!
+//! Once recd starts shutting down ([`IpcServer::close`]) the message loop no
+//! longer answers, so requests are refused at once instead of waiting for a
+//! reply that never comes.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rec_core::ipc::{self, Request, Response};
 use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE};
@@ -30,6 +34,11 @@ use crate::win::wide;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Saves with post-roll can take a while; give up eventually.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(180);
+/// How often a waiting request checks whether recd is shutting down.
+const CLOSE_CHECK: Duration = Duration::from_millis(100);
+/// How long dropping the server waits for its thread.
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTTING_DOWN: &str = "rec is shutting down";
 
 #[derive(Debug)]
 pub struct IpcServer {
@@ -93,20 +102,31 @@ impl Write for PipeIo<'_> {
     }
 }
 
-fn serve(pipe: &Pipe, events: &Events) {
+fn serve(pipe: &Pipe, events: &Events, closing: &AtomicBool) {
     let mut io = PipeIo(pipe);
     let Some(line) = read_line(&mut io) else {
         return;
     };
+    let error = |message: &str| Response::Error {
+        message: message.into(),
+    };
     let response = match ipc::decode_line::<Request>(&line) {
+        Ok(_) if closing.load(Ordering::Acquire) => error(SHUTTING_DOWN),
         Ok(request) => {
             let (reply, answer) = mpsc::channel();
             events.send(Event::Ipc(request, reply));
-            answer
-                .recv_timeout(REPLY_TIMEOUT)
-                .unwrap_or_else(|_| Response::Error {
-                    message: "rec did not answer in time".into(),
-                })
+            let start = Instant::now();
+            loop {
+                match answer.recv_timeout(CLOSE_CHECK) {
+                    Ok(response) => break response,
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                        if !closing.load(Ordering::Acquire) && start.elapsed() < REPLY_TIMEOUT => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) if closing.load(Ordering::Acquire) => {
+                        break error(SHUTTING_DOWN);
+                    }
+                    Err(_) => break error("rec did not answer in time"),
+                }
+            }
         }
         Err(e) => Response::Error {
             message: format!("invalid request: {e}"),
@@ -145,7 +165,7 @@ impl IpcServer {
         let thread = std::thread::Builder::new()
             .name("ipc".into())
             .spawn(move || {
-                loop {
+                while !stop_flag.load(Ordering::Acquire) {
                     // SAFETY: our pipe handle, used synchronously on this thread.
                     let connected = match unsafe { ConnectNamedPipe(pipe.handle(), None) } {
                         Ok(()) => true,
@@ -155,7 +175,7 @@ impl IpcServer {
                         break;
                     }
                     if connected {
-                        serve(&pipe, &events);
+                        serve(&pipe, &events, &stop_flag);
                     }
                     // SAFETY: as above.
                     let _ = unsafe { DisconnectNamedPipe(pipe.handle()) };
@@ -172,17 +192,33 @@ impl IpcServer {
     }
 }
 
+impl IpcServer {
+    /// Refuses requests from now on; call when shutdown begins.
+    pub fn close(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        // Wake the blocked ConnectNamedPipe by connecting once ourselves.
-        let _ = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(ipc::pipe_name());
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
+        self.close();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        // Wake a blocked ConnectNamedPipe by connecting ourselves. While a
+        // client is still being served the pipe is busy, so keep trying
+        // until the thread has seen the stop flag.
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while !thread.is_finished() && Instant::now() < deadline {
+            let _ = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(ipc::pipe_name());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !thread.is_finished() {
+            warning!("ipc thread did not stop; leaving it");
+        } else if thread.join().is_err() {
             warning!("ipc thread panicked");
         }
     }

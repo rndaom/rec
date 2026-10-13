@@ -321,6 +321,10 @@ impl FrameHandler {
         drop(src);
         let _ = frame.Close();
         self.shared.stats.captured.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stats
+            .last_frame
+            .store(rec_core::time::qpc_now(), Ordering::Relaxed);
 
         // Follow window resizes so the pool buffers match the content.
         if content.Width > 0 && content.Height > 0 {

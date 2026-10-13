@@ -71,6 +71,9 @@ pub struct Status {
     pub encoder: Option<String>,
     pub buffered_seconds: f64,
     pub buffer_bytes: u64,
+    /// A problem while recording, e.g. the game can't really be captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,10 +139,17 @@ mod tests {
             encoder: Some("NVENC HEVC".into()),
             buffered_seconds: 42.5,
             buffer_bytes: 1 << 20,
+            warning: Some("the picture is black".into()),
         });
         let line = encode_line(&response);
         assert!(line.starts_with("{\"result\":\"status\""));
         assert_eq!(decode_line::<Response>(&line).unwrap(), response);
+        // Older recd builds send no warning.
+        let old = line.replace(",\"warning\":\"the picture is black\"", "");
+        let Response::Status(status) = decode_line::<Response>(&old).unwrap() else {
+            panic!("not a status");
+        };
+        assert_eq!(status.warning, None);
     }
 
     #[test]

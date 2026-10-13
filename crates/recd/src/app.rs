@@ -57,6 +57,37 @@ const TOAST_MS: u32 = 2500;
 /// Don't retry a target that failed to start more often than this.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 
+/// Retry delays after consecutive failures to start on the same target.
+/// Games often create their window and then switch it to fullscreen; a
+/// capture started in between can fail, and works a moment later.
+const QUICK_RETRIES: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
+
+/// A target that failed to record.
+#[derive(Clone, Copy, Debug)]
+struct Failure {
+    hwnd: Hwnd,
+    at: Instant,
+    /// Consecutive failures on this target.
+    count: usize,
+}
+
+impl Failure {
+    fn retry_after(&self) -> Duration {
+        QUICK_RETRIES
+            .get(self.count.saturating_sub(1))
+            .copied()
+            .unwrap_or(RETRY_AFTER)
+    }
+
+    fn retry_due(&self) -> bool {
+        self.at.elapsed() >= self.retry_after()
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     Hotkey(i32),
@@ -272,7 +303,7 @@ struct App {
     paused: bool,
     /// Why the last session stopped or failed to start.
     error: Option<String>,
-    failed: Option<(Hwnd, Instant)>,
+    failed: Option<Failure>,
     own_pid: u32,
 }
 
@@ -353,6 +384,10 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        // Nothing answers requests any more: refuse them right away.
+        if let Some(ipc) = &self.ipc {
+            ipc.close();
+        }
         self.stop_session("shutting down");
         self.hotkeys.unregister();
         self.ipc = None;
@@ -379,12 +414,13 @@ impl App {
 
     fn headline(&self) -> String {
         match (&self.session, self.state()) {
-            (Some(s), (RecorderState::Recording, _)) => {
-                format!(
+            (Some(s), (RecorderState::Recording, _)) => match s.problem() {
+                Some(p) => format!("Recording {} · {}", s.target.game, p.short()),
+                None => format!(
                     "Recording {} · {} s buffer",
                     s.target.game, self.config.replay.seconds
-                )
-            }
+                ),
+            },
             (_, (RecorderState::Error, Some(reason))) => format!("Not recording: {reason}"),
             (_, (_, Some(reason))) => reason,
             _ => String::new(),
@@ -392,7 +428,9 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        let problem = self.session.as_ref().and_then(Session::problem);
         let look = match self.state().0 {
+            RecorderState::Recording if problem.is_some() => Look::Error,
             RecorderState::Recording => Look::Recording,
             RecorderState::Idle => Look::Idle,
             RecorderState::Paused => Look::Paused,
@@ -419,6 +457,11 @@ impl App {
             encoder: self.session.as_ref().map(Session::describe),
             buffered_seconds,
             buffer_bytes,
+            warning: self
+                .session
+                .as_ref()
+                .and_then(Session::problem)
+                .map(|p| p.short().into()),
         }
     }
 
@@ -460,9 +503,21 @@ impl App {
             }
             Err(e) => {
                 error!("could not record {}: {e}", target.game);
-                self.failed = Some((target.hwnd, Instant::now()));
+                let count = self
+                    .failed
+                    .filter(|f| f.hwnd.0 == target.hwnd.0)
+                    .map_or(1, |f| f.count + 1);
+                self.failed = Some(Failure {
+                    hwnd: target.hwnd,
+                    at: Instant::now(),
+                    count,
+                });
                 self.error = Some(e.clone());
-                self.notify(Kind::Error, &format!("Can't record {}", target.game), &e);
+                // The first failure is often transient (see QUICK_RETRIES):
+                // only speak up when the quick retry failed too.
+                if count >= 2 {
+                    self.notify(Kind::Error, &format!("Can't record {}", target.game), &e);
+                }
             }
         }
         self.refresh();
@@ -487,7 +542,7 @@ impl App {
                 self.consider(foreground.into());
             }
             RecordWhen::Always => {
-                let retry_ok = self.failed.is_none_or(|(_, t)| t.elapsed() > RETRY_AFTER);
+                let retry_ok = self.failed.is_none_or(|f| f.retry_due());
                 if retry_ok {
                     self.start_session(Target {
                         hwnd: Hwnd::default(),
@@ -526,7 +581,7 @@ impl App {
         }
         if self
             .failed
-            .is_some_and(|(h, t)| h.0 == info.hwnd && t.elapsed() < RETRY_AFTER)
+            .is_some_and(|f| f.hwnd.0 == info.hwnd && !f.retry_due())
         {
             return;
         }
@@ -550,7 +605,12 @@ impl App {
         // SAFETY: IsWindow accepts any handle value.
         let window_gone = hwnd.0 != 0 && !unsafe { IsWindow(Some(hwnd.get())) }.as_bool();
         match session.health() {
-            Health::Ok if !window_gone => {}
+            Health::Ok if !window_gone => {
+                if let Some(Some(problem)) = self.session.as_mut().and_then(Session::watch) {
+                    let (title, detail) = problem.describe(&game);
+                    self.notify(Kind::Error, &title, &detail);
+                }
+            }
             Health::Ok | Health::SourceClosed => {
                 self.stop_session("game closed");
                 self.error = None;
@@ -558,7 +618,11 @@ impl App {
             }
             Health::Failed(reason) => {
                 self.stop_session(&reason);
-                self.failed = Some((hwnd, Instant::now()));
+                self.failed = Some(Failure {
+                    hwnd,
+                    at: Instant::now(),
+                    count: QUICK_RETRIES.len() + 1,
+                });
                 self.error = Some(reason.clone());
                 self.notify(Kind::Error, &format!("Recording {game} stopped"), &reason);
             }

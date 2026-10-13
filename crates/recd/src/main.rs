@@ -17,6 +17,7 @@ mod paths;
 mod saver;
 mod session;
 mod tray;
+mod watch;
 mod win;
 
 use std::process::ExitCode;

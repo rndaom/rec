@@ -342,13 +342,19 @@ mod imp {
             let st = capture.stats();
             let bytes = tally.lock().unwrap().bytes;
             println!(
-                "[{s:>3}s] captured {} submitted {} (repeated {}) encoded {} dropped {} | {:.1} Mbit/s{}",
+                "[{s:>3}s] captured {} submitted {} (repeated {}) encoded {} dropped {} | {:.1} Mbit/s{}{}",
                 st.frames_captured,
                 st.frames_submitted,
                 st.frames_repeated,
                 st.frames_encoded,
                 st.frames_dropped,
                 (bytes - last_bytes) as f64 * 8.0 / 1e6,
+                st.black_since
+                    .map(|t| format!(
+                        " | black for {:.1} s",
+                        (rec_core::time::qpc_now() - t) as f64 / 1e7
+                    ))
+                    .unwrap_or_default(),
                 st.last_error
                     .as_deref()
                     .map(|e| format!(" | error: {e}"))

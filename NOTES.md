@@ -6,7 +6,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 
 **Read first:** [docs/decisions.md](docs/decisions.md) (the why), [docs/roadmap.md](docs/roadmap.md) (the what), [docs/research.md](docs/research.md) (the evidence).
 
-**Status (2026-10-12):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio done.
+**Status (2026-10-12):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio and exclusive-fullscreen detection done.
 
 | Crate | Role |
 |---|---|
@@ -20,7 +20,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 **Next step:** M2. Suggested order:
 1. Benchmark harness, to lock in the performance budget early
 2. ~~Per-process audio tracks~~ (done)
-3. Black-frame / exclusive-fullscreen detection
+3. ~~Black-frame / exclusive-fullscreen detection~~ (done)
 4. Pipeline recovery (device lost, resolution change), using new `segment` numbers
 5. Quick-panel overlay
 6. HDR
@@ -32,6 +32,8 @@ Handoff file so any session can pick up quickly. Keep it short and current.
   - `GraphicsCaptureItem.Closed` didn't fire when windows closed, so `rec-video` polls once a second that the source still exists.
   - `MinUpdateInterval` is set to half the frame period; a full period starves high-fps games.
   - The AMD HEVC MFT honours peak-constrained VBR.
+  - Fullscreen optimizations make DXGI fullscreen games (flip or blt) capturable; the shell then reports "D3D fullscreen". True exclusive fullscreen (reproduce with `__COMPAT_LAYER=DisableDXMaximizedWindowedMode` and the `fake_game` example) still delivers frames, at a reduced rate, but black apart from the cursor. `recd/src/watch.rs` turns that into a "switch to borderless" hint.
+  - `StartCapture` can fail with E_INVALIDARG while a game window is switching to fullscreen; recd retries after 2/5/10/30 s and only toasts from the second failure.
 - Audio:
   - The MF AAC encoder has zero effective priming delay (measured).
   - WASAPI `AUTOCONVERTPCM` handles all format conversion.

@@ -7,17 +7,22 @@ use rec_audio::{AudioCapture, AudioCaptureConfig, AudioInput, AudioSource, Proce
 use rec_core::config::{AudioConfig, Codec, Config, Quality};
 use rec_core::media::{TrackInfo, TrackKind, VIDEO_TRACK};
 use rec_core::replay::{Limits, Packet, ReplayBuffer, TrackId};
-use rec_core::time::secs;
+use rec_core::time::{qpc_now, secs};
 use rec_video::{CaptureSource, CodecPreference, VideoCapture, VideoCaptureConfig};
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
     MonitorFromWindow,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::Win32::UI::Shell::{QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetForegroundWindow, GetWindowDisplayAffinity, IsIconic, WDA_NONE,
+};
 use windows::core::BOOL;
 
+use crate::detect;
 use crate::log::{info, warning};
+use crate::watch::{Observation, Problem, Watcher};
 use crate::win::Hwnd;
 
 /// What a session records.
@@ -50,6 +55,8 @@ pub struct Session {
     // Video is declared before audio so it stops first when dropped.
     video: VideoCapture,
     _audio: Option<AudioCapture>,
+    watcher: Watcher,
+    problem: Option<Problem>,
 }
 
 /// Seconds kept beyond the requested clip length: room for keyframe
@@ -355,7 +362,56 @@ impl Session {
             description,
             video,
             _audio: audio,
+            watcher: Watcher::new(qpc_now()),
+            problem: None,
         })
+    }
+
+    /// Checks that the game is really being captured (see [`crate::watch`]).
+    /// Returns the new state when it changed.
+    pub fn watch(&mut self) -> Option<Option<Problem>> {
+        let hwnd = self.target.hwnd;
+        if hwnd.0 == 0 {
+            // Desktop recording: a still desktop sends no frames, rightly.
+            return None;
+        }
+        let stats = self.video.stats();
+        let mut affinity = WDA_NONE.0;
+        // SAFETY: plain queries that accept stale handles; `affinity` is a
+        // valid out-pointer.
+        let (in_front, blocks_capture) = unsafe {
+            let in_front = GetForegroundWindow() == hwnd.get() && !IsIconic(hwnd.get()).as_bool();
+            let blocks = GetWindowDisplayAffinity(hwnd.get(), &mut affinity).is_ok()
+                && affinity != WDA_NONE.0;
+            (in_front, blocks)
+        };
+        let covers_monitor = detect::window_info(hwnd.get()).is_some_and(|i| i.covers_monitor);
+        let obs = Observation {
+            now: qpc_now(),
+            last_frame: stats.last_frame_time,
+            black_since: stats.black_since,
+            in_front,
+            covers_monitor,
+            blocks_capture,
+            // SAFETY: plain query.
+            d3d_fullscreen: unsafe { SHQueryUserNotificationState() }
+                .is_ok_and(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN),
+        };
+        let problem = self.watcher.check(&obs);
+        if problem == self.problem {
+            return None;
+        }
+        match problem {
+            Some(p) => warning!("{}: {}", self.target.game, p.short()),
+            None => info!("{}: capture looks fine again", self.target.game),
+        }
+        self.problem = problem;
+        Some(problem)
+    }
+
+    /// The capture problem the watcher currently sees, if any.
+    pub fn problem(&self) -> Option<Problem> {
+        self.problem
     }
 
     pub fn health(&self) -> Health {

@@ -105,6 +105,9 @@ fn report(response: Response) -> ExitCode {
             if let Some(reason) = status.reason {
                 println!("reason:   {reason}");
             }
+            if let Some(warning) = status.warning {
+                println!("problem:  {warning}");
+            }
             if let Some(target) = status.target {
                 println!("target:   {target}");
             }

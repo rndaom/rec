@@ -461,6 +461,11 @@ impl Converter {
         result.ctx("VideoProcessorBlt")
     }
 
+    /// `slot`'s NV12 texture (output size).
+    pub(crate) fn texture(&self, slot: usize) -> &ID3D11Texture2D {
+        &self.slots[slot].texture
+    }
+
     /// Takes `slot`'s sample for submission and arms its return callback.
     pub(crate) fn take_sample(&self, slot: usize) -> Result<IMFSample, VideoError> {
         let sample = self

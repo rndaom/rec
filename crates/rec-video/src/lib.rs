@@ -40,6 +40,7 @@
 
 pub mod annexb;
 pub mod geometry;
+mod probe;
 
 #[cfg(windows)]
 mod capture;
@@ -54,11 +55,12 @@ mod pipeline;
 #[cfg(windows)]
 mod util;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use rec_core::media::{VideoCodec, VideoFormat};
 pub use rec_core::replay::{Packet, TrackId};
+use rec_core::time::Hns;
 
 /// What to capture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +153,14 @@ pub struct VideoStats {
     pub frames_dropped: u64,
     /// Keyframes that lacked parameter sets and had cached ones inserted.
     pub parameter_sets_inserted: u64,
+    /// QPC time the newest frame was captured; `None` before the first.
+    /// Windows only delivers a frame when the source changed, but a game
+    /// changes it with every present: a game in the foreground whose frames
+    /// stop arriving is not being captured (true exclusive fullscreen).
+    pub last_frame_time: Option<Hns>,
+    /// While the encoded picture is black: since when (QPC time of the first
+    /// black picture checked). Checked every two seconds.
+    pub black_since: Option<Hns>,
     /// The captured window or monitor went away; the pipeline has stopped.
     pub source_closed: bool,
     /// The encode thread is running.
@@ -210,6 +220,10 @@ pub(crate) struct SharedStats {
     pub encoded: AtomicU64,
     pub dropped: AtomicU64,
     pub ps_inserted: AtomicU64,
+    /// QPC time of the newest captured frame; 0 = none yet.
+    pub last_frame: AtomicI64,
+    /// 0 = not black (or not checked yet).
+    pub black_since: AtomicI64,
     pub source_closed: AtomicBool,
     pub running: AtomicBool,
     /// Set by any thread on a fatal error; the encode thread then stops.
@@ -237,6 +251,8 @@ impl SharedStats {
             frames_encoded: self.encoded.load(Ordering::Relaxed),
             frames_dropped: self.dropped.load(Ordering::Relaxed),
             parameter_sets_inserted: self.ps_inserted.load(Ordering::Relaxed),
+            last_frame_time: Some(self.last_frame.load(Ordering::Relaxed)).filter(|&t| t != 0),
+            black_since: Some(self.black_since.load(Ordering::Relaxed)).filter(|&t| t != 0),
             source_closed: self.source_closed.load(Ordering::Acquire),
             running: self.running.load(Ordering::Acquire),
             last_error: self.last_error.lock().ok().and_then(|e| e.clone()),

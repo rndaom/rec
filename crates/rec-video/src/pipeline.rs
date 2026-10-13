@@ -18,6 +18,7 @@ use crate::convert::Converter;
 use crate::d3d::{self, Gpu};
 use crate::encoder::{Encoder, EncoderParams};
 use crate::geometry::output_size;
+use crate::probe::BlackProbe;
 use crate::util::{ComApartment, Context, Event, Timer, wait_any};
 use crate::{PacketSink, SharedStats, VideoCaptureConfig, VideoError, VideoInfo};
 
@@ -92,6 +93,7 @@ struct Pipeline {
     gpu: Gpu,
     info: VideoInfo,
     out: Output,
+    probe: BlackProbe,
     stats: Arc<SharedStats>,
     source: crate::CaptureSource,
     fps: u32,
@@ -204,6 +206,7 @@ impl Pipeline {
             &params,
         )?;
         let converter = Converter::new(&gpu.device, width, height, config.fps)?;
+        let probe = BlackProbe::new(&gpu.device, width, height)?;
 
         let mut param_sets = ParameterSets::new(encoder.codec);
         if let Some(header) = &encoder.sequence_header {
@@ -243,6 +246,7 @@ impl Pipeline {
             _capture: capture,
             encoder,
             converter,
+            probe,
             shared,
             gpu,
             info,
@@ -303,6 +307,7 @@ impl Pipeline {
         let out = &mut self.out;
         self.encoder
             .poll(|data, t, key| out.on_frame(data, t, key))?;
+        self.probe.poll(&self.gpu.context, time, &self.stats);
 
         let latest = self
             .shared
@@ -325,6 +330,8 @@ impl Pipeline {
             _ => match self.converter.free_slot(self.last_slot) {
                 Some(s) => {
                     self.converter.blit(&latest, s)?;
+                    self.probe
+                        .offer(&self.gpu.context, self.converter.texture(s), time);
                     s
                 }
                 None => {
