@@ -43,6 +43,9 @@ pub mod geometry;
 mod probe;
 
 #[cfg(windows)]
+#[allow(dead_code)] // wired into the pipeline separately
+mod amf;
+#[cfg(windows)]
 mod capture;
 #[cfg(windows)]
 mod convert;
