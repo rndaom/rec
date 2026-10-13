@@ -46,6 +46,8 @@ mod probe;
 pub mod sei;
 
 #[cfg(windows)]
+mod amf;
+#[cfg(windows)]
 mod backend;
 #[cfg(windows)]
 mod capture;
