@@ -1,6 +1,13 @@
 //! The initialization segment: `ftyp` and an empty-sample-table `moov` with
 //! `mvex`. Duration fields are written as zero and patched by the writer when
 //! the clip is finished, so the positions of those fields are reported back.
+//!
+//! The video sample entry carries the codec configuration box followed by the
+//! colour description from [`VideoColor`]: always a `colr` (`nclx`) box, and
+//! for HDR10 also `mdcv` and `clli`, so players tone-map correctly without
+//! having to parse the bitstream.
+
+use rec_core::media::{HdrMetadata, VideoColor};
 
 use crate::boxes::{Put, UNITY_MATRIX, boxed, full_box};
 use crate::error::MuxError;
@@ -17,6 +24,7 @@ pub(crate) enum TrackKind<'a> {
         width: u16,
         height: u16,
         config: &'a CodecConfig,
+        color: VideoColor,
     },
     Audio {
         channels: u16,
@@ -207,6 +215,7 @@ fn sample_entry(b: &mut Vec<u8>, t: &InitTrack<'_>) -> Result<(), MuxError> {
             width,
             height,
             config,
+            color,
         } => {
             boxed(b, &config.entry, |b| {
                 b.put_zeros(6);
@@ -224,6 +233,7 @@ fn sample_entry(b: &mut Vec<u8>, t: &InitTrack<'_>) -> Result<(), MuxError> {
                 boxed(b, &config.config_box, |b| {
                     b.extend_from_slice(&config.config)
                 });
+                colour_boxes(b, *color);
             });
             Ok(())
         }
@@ -271,6 +281,46 @@ fn sample_entry(b: &mut Vec<u8>, t: &InitTrack<'_>) -> Result<(), MuxError> {
             Ok(())
         }
     }
+}
+
+/// The colour boxes of a video sample entry (ISO/IEC 14496-12 12.1.5, 12.1.6).
+fn colour_boxes(b: &mut Vec<u8>, color: VideoColor) {
+    let (primaries, transfer, matrix) = color.cicp();
+    boxed(b, b"colr", |b| {
+        b.put_fourcc(b"nclx");
+        b.put_u16(u16::from(primaries));
+        b.put_u16(u16::from(transfer));
+        b.put_u16(u16::from(matrix));
+        // full_range_flag in the top bit, 7 reserved bits. Both VideoColor
+        // variants are limited range.
+        b.put_u8(0);
+    });
+    if let VideoColor::Hdr10(meta) = color {
+        mastering_display(b, &meta);
+        content_light_level(b, &meta);
+    }
+}
+
+/// `mdcv`: the SMPTE ST 2086 payload. The box lists the primaries as green,
+/// blue, red (the order of the HEVC SEI and of ffmpeg's muxer and demuxer),
+/// not the red, green, blue order of the `HdrMetadata` fields.
+fn mastering_display(b: &mut Vec<u8>, m: &HdrMetadata) {
+    boxed(b, b"mdcv", |b| {
+        for [x, y] in [m.green, m.blue, m.red, m.white] {
+            b.put_u16(x);
+            b.put_u16(y);
+        }
+        b.put_u32(m.max_luminance);
+        b.put_u32(m.min_luminance);
+    });
+}
+
+/// `clli`: CTA-861.3 content light level; 0 means unknown.
+fn content_light_level(b: &mut Vec<u8>, m: &HdrMetadata) {
+    boxed(b, b"clli", |b| {
+        b.put_u16(m.max_cll);
+        b.put_u16(m.max_fall);
+    });
 }
 
 /// MPEG-4 descriptor with the 4-byte padded length form.
@@ -322,6 +372,7 @@ mod tests {
                     width: 320,
                     height: 240,
                     config: &cfg,
+                    color: VideoColor::Sdr,
                 },
             },
             InitTrack {
@@ -357,6 +408,99 @@ mod tests {
         let ftyp = u32::from_be_bytes(init[0..4].try_into().unwrap()) as usize;
         let moov = u32::from_be_bytes(init[ftyp..ftyp + 4].try_into().unwrap()) as usize;
         assert_eq!(ftyp + moov, init.len());
+    }
+
+    /// Distinct values everywhere, so a swapped field or a wrong primary
+    /// order changes the expected bytes.
+    fn metadata() -> HdrMetadata {
+        HdrMetadata {
+            red: [0x1111, 0x2222],
+            green: [0x3333, 0x4444],
+            blue: [0x5555, 0x6666],
+            white: [0x7777, 0x8888],
+            max_luminance: 0x0098_9680, // 1000 cd/m2
+            min_luminance: 0x0000_0005,
+            max_cll: 0x03E8,
+            max_fall: 0x00C8,
+        }
+    }
+
+    fn colour_bytes(color: VideoColor) -> Vec<u8> {
+        let mut b = Vec::new();
+        colour_boxes(&mut b, color);
+        b
+    }
+
+    #[test]
+    fn sdr_writes_only_a_bt709_limited_range_colr() {
+        assert_eq!(
+            colour_bytes(VideoColor::Sdr),
+            [
+                0, 0, 0, 19, b'c', b'o', b'l', b'r', // size, type
+                b'n', b'c', b'l', b'x', // colour_type
+                0, 1, 0, 1, 0, 1, // primaries, transfer, matrix: BT.709
+                0, // full_range_flag = 0, reserved
+            ]
+        );
+    }
+
+    #[test]
+    fn hdr10_writes_colr_mdcv_clli() {
+        let expected: Vec<u8> = [
+            // colr: BT.2020 primaries, PQ, BT.2020 non-constant luminance
+            &[0, 0, 0, 19, b'c', b'o', b'l', b'r', b'n', b'c', b'l', b'x'][..],
+            &[0, 9, 0, 16, 0, 9, 0],
+            // mdcv: green, blue, red, white point, max, min luminance
+            &[0, 0, 0, 32, b'm', b'd', b'c', b'v'],
+            &[0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x66, 0x66],
+            &[0x11, 0x11, 0x22, 0x22, 0x77, 0x77, 0x88, 0x88],
+            &[0x00, 0x98, 0x96, 0x80, 0, 0, 0, 5],
+            // clli: max_content_light_level, max_pic_average_light_level
+            &[0, 0, 0, 12, b'c', b'l', b'l', b'i', 0x03, 0xE8, 0x00, 0xC8],
+        ]
+        .concat();
+        assert_eq!(colour_bytes(VideoColor::Hdr10(metadata())), expected);
+    }
+
+    #[test]
+    fn colour_boxes_follow_the_codec_config_in_the_sample_entry() {
+        let cfg = CodecConfig {
+            entry: *b"hvc1",
+            config_box: *b"hvcC",
+            config: vec![1, 2, 3],
+        };
+        let init = |color| {
+            let tracks = [InitTrack {
+                track_id: 1,
+                name: "Video",
+                timescale: 90_000,
+                enabled: true,
+                kind: TrackKind::Video {
+                    width: 320,
+                    height: 240,
+                    config: &cfg,
+                    color,
+                },
+            }];
+            build_init(&tracks, 0).unwrap().0
+        };
+
+        let hdr = init(VideoColor::Hdr10(metadata()));
+        let entry = find(&hdr, b"hvc1").unwrap();
+        let entry_size = u32::from_be_bytes(hdr[entry..entry + 4].try_into().unwrap()) as usize;
+        let hvcc = find(&hdr, b"hvcC").unwrap();
+        assert_eq!(
+            &hdr[hvcc..hvcc + 11],
+            [0, 0, 0, 11, b'h', b'v', b'c', b'C', 1, 2, 3]
+        );
+        // The three colour boxes sit directly after hvcC and end the entry.
+        assert_eq!(&hdr[hvcc + 11 + 4..hvcc + 11 + 8], b"colr");
+        assert_eq!(&hdr[hvcc + 11 + 19 + 4..hvcc + 11 + 19 + 8], b"mdcv");
+        assert_eq!(hvcc + 11 + 19 + 32 + 12, entry + entry_size);
+
+        let sdr = init(VideoColor::Sdr);
+        assert!(find(&sdr, b"colr").is_some());
+        assert!(find(&sdr, b"mdcv").is_none() && find(&sdr, b"clli").is_none());
     }
 
     #[test]

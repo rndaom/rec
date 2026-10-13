@@ -588,6 +588,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
                 width: self.video.format.width as u16,
                 height: self.video.format.height as u16,
                 config,
+                color: self.video.format.color,
             },
         }];
         for (i, a) in self.audio.iter().enumerate() {

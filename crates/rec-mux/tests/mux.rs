@@ -7,7 +7,7 @@ mod common;
 use std::io::Cursor;
 
 use common::*;
-use rec_core::media::{TrackInfo, VideoCodec};
+use rec_core::media::{HdrMetadata, TrackInfo, VideoCodec, VideoColor};
 use rec_core::replay::Packet;
 use rec_core::time::{HNS_PER_SEC, Hns};
 use rec_mux::{Mp4Writer, MuxError, write_clip};
@@ -893,4 +893,173 @@ fn io_errors_are_reported_and_poison_the_writer() {
     assert!(i >= 30);
     assert!(matches!(w.write(&packets[i + 1]), Err(MuxError::Poisoned)));
     assert!(matches!(w.finish(), Err(MuxError::Poisoned)));
+}
+
+// ------------------------------------------------------------------ colour
+
+fn hdr10() -> VideoColor {
+    VideoColor::Hdr10(HdrMetadata {
+        red: [35_400, 14_600],
+        green: [8_500, 39_850],
+        blue: [6_550, 2_300],
+        white: [15_635, 16_450],
+        max_luminance: 10_000_000, // 1000 cd/m2
+        min_luminance: 50,         // 0.005 cd/m2
+        max_cll: 1000,
+        max_fall: 400,
+    })
+}
+
+fn fixture_aus(codec: VideoCodec) -> Vec<VideoAu> {
+    match codec {
+        VideoCodec::H264 => h264_aus(),
+        VideoCodec::Hevc => hevc_aus(),
+        VideoCodec::Av1 => av1_aus(),
+    }
+}
+
+fn mux_video(codec: VideoCodec, color: VideoColor, aus: &[VideoAu]) -> Vec<u8> {
+    mux(
+        vec![video_info_with_color(codec, color)],
+        &video_packets(aus, 1),
+    )
+}
+
+#[test]
+fn every_codec_describes_sdr_colour_with_a_colr_box_only() {
+    for (codec, config_box) in [
+        (VideoCodec::H264, b"avcC"),
+        (VideoCodec::Hevc, b"hvcC"),
+        (VideoCodec::Av1, b"av1C"),
+    ] {
+        let bytes = mux_video(codec, VideoColor::Sdr, &fixture_aus(codec));
+        let (_, boxes) = video_sample_entry(&bytes);
+        let kinds: Vec<_> = boxes.iter().map(|b| b.0).collect();
+        assert_eq!(kinds, [*config_box, *b"colr"], "{codec:?}");
+        // nclx, BT.709 primaries / transfer / matrix, limited range.
+        assert_eq!(
+            boxes[1].1,
+            [b'n', b'c', b'l', b'x', 0, 1, 0, 1, 0, 1, 0],
+            "{codec:?}"
+        );
+    }
+}
+
+#[test]
+fn every_codec_describes_hdr10_with_colr_mdcv_clli() {
+    // The muxer trusts VideoFormat::color, so the 8-bit fixtures are enough to
+    // check the boxes for each sample entry type.
+    for (codec, config_box) in [
+        (VideoCodec::H264, b"avcC"),
+        (VideoCodec::Hevc, b"hvcC"),
+        (VideoCodec::Av1, b"av1C"),
+    ] {
+        let bytes = mux_video(codec, hdr10(), &fixture_aus(codec));
+        let (_, boxes) = video_sample_entry(&bytes);
+        let kinds: Vec<_> = boxes.iter().map(|b| b.0).collect();
+        assert_eq!(
+            kinds,
+            [*config_box, *b"colr", *b"mdcv", *b"clli"],
+            "{codec:?}"
+        );
+        assert_eq!(
+            boxes[1].1,
+            [b'n', b'c', b'l', b'x', 0, 9, 0, 16, 0, 9, 0],
+            "{codec:?}"
+        );
+        // green, blue, red, white point, max / min luminance
+        let mdcv: Vec<u8> = [
+            [
+                8_500u16, 39_850, 6_550, 2_300, 35_400, 14_600, 15_635, 16_450,
+            ]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<_>>(),
+            10_000_000u32.to_be_bytes().to_vec(),
+            50u32.to_be_bytes().to_vec(),
+        ]
+        .concat();
+        assert_eq!(boxes[2].1, mdcv, "{codec:?}");
+        assert_eq!(boxes[3].1, [0x03, 0xE8, 0x01, 0x90], "{codec:?}");
+    }
+}
+
+#[test]
+fn sdr_colour_is_reported_by_ffprobe() {
+    if !have_ffmpeg("sdr_colour_is_reported_by_ffprobe") {
+        return;
+    }
+    for (codec, name) in [
+        (VideoCodec::H264, "sdr_h264.mp4"),
+        (VideoCodec::Hevc, "sdr_hevc.mp4"),
+        (VideoCodec::Av1, "sdr_av1.mp4"),
+    ] {
+        let path = save(
+            name,
+            &mux_video(codec, VideoColor::Sdr, &fixture_aus(codec)),
+        );
+        let p = probe(&path);
+        let v = p.video();
+        assert_eq!(v.get("color_primaries"), "bt709", "{codec:?}");
+        assert_eq!(v.get("color_transfer"), "bt709", "{codec:?}");
+        assert_eq!(v.get("color_space"), "bt709", "{codec:?}");
+        assert_eq!(v.get("color_range"), "tv", "{codec:?}");
+        assert!(video_side_data(&path).is_empty(), "{codec:?}");
+        assert_eq!(decode_errors(&path), "", "{codec:?}");
+    }
+}
+
+#[test]
+fn hdr10_main10_hevc_track_is_reported_by_ffprobe() {
+    let bytes = mux_video(VideoCodec::Hevc, hdr10(), &hevc10_aus());
+    let (entry, _) = video_sample_entry(&bytes);
+    assert_eq!(&entry, b"hvc1");
+
+    if !have_ffmpeg("hdr10_main10_hevc_track_is_reported_by_ffprobe") {
+        return;
+    }
+    let path = save("hdr10_hevc.mp4", &bytes);
+    let p = probe(&path);
+    let v = p.video();
+    // hvcC is built from the 10-bit SPS.
+    assert_eq!(v.get("codec_name"), "hevc");
+    assert_eq!(v.get("profile"), "Main 10");
+    assert_eq!(v.get("pix_fmt"), "yuv420p10le");
+    assert_eq!(v.usize("nb_read_frames"), 90);
+    // The bitstream has no colour VUI, so these come from colr.
+    assert_eq!(v.get("color_primaries"), "bt2020");
+    assert_eq!(v.get("color_transfer"), "smpte2084");
+    assert_eq!(v.get("color_space"), "bt2020nc");
+    assert_eq!(v.get("color_range"), "tv");
+
+    let side = video_side_data(&path);
+    let find = |kind: &str| {
+        side.iter()
+            .find(|s| s.get("side_data_type").is_some_and(|t| t == kind))
+            .unwrap_or_else(|| panic!("no {kind} side data in {side:?}"))
+    };
+    let mastering = find("Mastering display metadata");
+    for (key, expected) in [
+        ("red_x", "35400/50000"),
+        ("red_y", "14600/50000"),
+        ("green_x", "8500/50000"),
+        ("green_y", "39850/50000"),
+        ("blue_x", "6550/50000"),
+        ("blue_y", "2300/50000"),
+        ("white_point_x", "15635/50000"),
+        ("white_point_y", "16450/50000"),
+        ("min_luminance", "50/10000"),
+        ("max_luminance", "10000000/10000"),
+    ] {
+        assert_eq!(
+            mastering.get(key).map(String::as_str),
+            Some(expected),
+            "{key}"
+        );
+    }
+    let light = find("Content light level metadata");
+    assert_eq!(light.get("max_content").map(String::as_str), Some("1000"));
+    assert_eq!(light.get("max_average").map(String::as_str), Some("400"));
+
+    assert_eq!(decode_errors(&path), "");
 }

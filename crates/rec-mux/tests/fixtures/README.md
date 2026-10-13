@@ -22,6 +22,14 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=30:duration=3 \
   -x265-params "bframes=0:keyint=30:min-keyint=30:scenecut=0:repeat-headers=1:open-gop=0:log-level=error" \
   -f hevc hevc_320x240_30fps.h265
 
+# HEVC Main 10 (Annex-B), 10-bit 4:2:0, same structure as the Main fixture.
+# It has no colour VUI and no SEI, so HDR10 tags in the tests can only come
+# from the MP4 container.
+ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=30:duration=3 \
+  -c:v libx265 -preset medium -pix_fmt yuv420p10le -crf 36 \
+  -x265-params "bframes=0:keyint=30:min-keyint=30:scenecut=0:repeat-headers=1:open-gop=0:log-level=error" \
+  -f hevc hevc10_320x240_30fps.h265
+
 # AV1 (IVF; every frame is a temporal unit of low-overhead OBUs, the
 # sequence header is repeated on each keyframe), low-delay structure so the
 # output order equals the decode order

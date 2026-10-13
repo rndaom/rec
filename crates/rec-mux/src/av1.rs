@@ -547,6 +547,19 @@ mod tests {
     }
 
     #[test]
+    fn av1c_flags_a_10bit_main_profile_sequence() {
+        let seq = sequence_header(&Opts {
+            high_bitdepth: true,
+            color_description: Some((9, 16, 9)), // BT.2020 / PQ, as for HDR10
+            ..Opts::default()
+        });
+        let av1c = build_av1c(std::slice::from_ref(&seq)).unwrap();
+        // Tier 0, high_bitdepth, not twelve_bit, 4:2:0, position 0.
+        assert_eq!(av1c[1], 4);
+        assert_eq!(av1c[2], 0b0100_1100);
+    }
+
+    #[test]
     fn converts_temporal_units() {
         let seq = sequence_header(&Opts::default());
         let mut tu = vec![0x12, 0x00]; // temporal delimiter with size field

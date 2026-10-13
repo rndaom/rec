@@ -27,6 +27,13 @@
 //!   that starts after it (audio runs slightly ahead of video) is cut.
 //! * The video `dts` and `duration` of packets are ignored: with no B-frames
 //!   `pts == dts` and a sample lasts until the next one.
+//! * The colour of the video track comes from [`VideoFormat::color`], not from
+//!   the bitstream: the sample entry gets a `colr` (`nclx`, limited range) box
+//!   after the codec configuration box, and HDR10 adds `mdcv` and `clli` with
+//!   the static metadata. The bit depth in `hvcC` / `av1C` is read from the
+//!   parameter sets, so it always matches the stream.
+//!
+//! [`VideoFormat::color`]: rec_core::media::VideoFormat::color
 
 mod annexb;
 mod av1;

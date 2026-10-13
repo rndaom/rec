@@ -297,6 +297,19 @@ mod tests {
     }
 
     #[test]
+    fn builds_hvcc_for_main10() {
+        // Profile, chroma format and both bit depths come from the SPS.
+        let vps = vec![0x40, 0x01, 0x0C, 0x01];
+        let sps = synthetic_sps(false, 2, 1, 2, 0, false);
+        let pps = vec![0x44, 0x01, 0xC1, 0x72];
+        let hvcc = build_hvcc(&[vps], &[sps], &[pps]).unwrap();
+        assert_eq!(hvcc[1], 2, "general_profile_idc");
+        assert_eq!(hvcc[16], 0xFC | 1, "chromaFormat 4:2:0");
+        assert_eq!(hvcc[17], 0xF8 | 2, "bitDepthLumaMinus8");
+        assert_eq!(hvcc[18], 0xF8 | 2, "bitDepthChromaMinus8");
+    }
+
+    #[test]
     fn hvcc_requires_all_parameter_sets() {
         let sps = synthetic_sps(false, 1, 1, 0, 0, false);
         let one = vec![vec![0x40, 1]];

@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use rec_core::media::{
-    AudioCodec, AudioFormat, TrackInfo, TrackKind, VIDEO_TRACK, VideoCodec, VideoFormat,
+    AudioCodec, AudioFormat, TrackInfo, TrackKind, VIDEO_TRACK, VideoCodec, VideoColor, VideoFormat,
 };
 use rec_core::replay::Packet;
 use rec_core::time::{HNS_PER_SEC, Hns};
@@ -126,6 +126,10 @@ pub fn av1_aus() -> Vec<VideoAu> {
 }
 
 pub fn video_info(codec: VideoCodec) -> TrackInfo {
+    video_info_with_color(codec, VideoColor::Sdr)
+}
+
+pub fn video_info_with_color(codec: VideoCodec, color: VideoColor) -> TrackInfo {
     TrackInfo {
         id: VIDEO_TRACK,
         name: "Video".into(),
@@ -134,7 +138,7 @@ pub fn video_info(codec: VideoCodec) -> TrackInfo {
             width: 320,
             height: 240,
             fps: FPS as u32,
-            color: rec_core::media::VideoColor::Sdr,
+            color,
         }),
     }
 }
@@ -145,6 +149,12 @@ pub fn h264_aus() -> Vec<VideoAu> {
 
 pub fn hevc_aus() -> Vec<VideoAu> {
     split_access_units(VideoCodec::Hevc, &fixture("hevc_320x240_30fps.h265"))
+}
+
+/// The 10-bit (Main 10) HEVC fixture. Its bitstream carries no colour VUI and
+/// no SEI, so any colour ffprobe reports must come from the container.
+pub fn hevc10_aus() -> Vec<VideoAu> {
+    split_access_units(VideoCodec::Hevc, &fixture("hevc10_320x240_30fps.h265"))
 }
 
 /// Frame `i` of a 30 fps stream starting at `BASE`.
@@ -391,6 +401,33 @@ pub fn probe(path: &Path) -> Probe {
     Probe { streams, format }
 }
 
+/// Stream-level side data ffprobe reports for the first video stream, one
+/// key/value map per `[SIDE_DATA]` section (container-level HDR metadata
+/// shows up here).
+pub fn video_side_data(path: &Path) -> Vec<HashMap<String, String>> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_streams"])
+        .arg(path)
+        .output()
+        .expect("running ffprobe");
+    assert!(out.status.success(), "ffprobe failed on {}", path.display());
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut sections = Vec::new();
+    let mut current: Option<HashMap<String, String>> = None;
+    for line in text.lines() {
+        match line.trim() {
+            "[SIDE_DATA]" => current = Some(HashMap::new()),
+            "[/SIDE_DATA]" => sections.extend(current.take()),
+            l => {
+                if let (Some(c), Some((k, v))) = (current.as_mut(), l.split_once('=')) {
+                    c.insert(k.to_owned(), v.to_owned());
+                }
+            }
+        }
+    }
+    sections
+}
+
 /// Decodes everything to a null sink and returns what ffmpeg printed at
 /// `-v error` level (empty when the file is clean).
 pub fn decode_errors(path: &Path) -> String {
@@ -453,4 +490,44 @@ pub fn offsets_of(file: &[u8], fourcc: &[u8; 4]) -> Vec<usize> {
         .filter(|b| &b.0 == fourcc)
         .map(|b| b.1)
         .collect()
+}
+
+/// Child boxes `(fourcc, payload)` of a container payload.
+pub fn children(buf: &[u8]) -> BoxList<'_> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 8 <= buf.len() {
+        let size = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        assert!(size >= 8 && pos + size <= buf.len(), "bad box at {pos}");
+        out.push((
+            buf[pos + 4..pos + 8].try_into().unwrap(),
+            &buf[pos + 8..pos + size],
+        ));
+        pos += size;
+    }
+    out
+}
+
+pub type BoxList<'a> = Vec<([u8; 4], &'a [u8])>;
+
+pub fn child<'a>(buf: &'a [u8], fourcc: &[u8; 4]) -> &'a [u8] {
+    children(buf)
+        .into_iter()
+        .find(|c| &c.0 == fourcc)
+        .unwrap_or_else(|| panic!("no {} box", String::from_utf8_lossy(fourcc)))
+        .1
+}
+
+/// The sample entry of the file's first track: `(fourcc, children)`, where the
+/// children are the boxes after the 78-byte `VisualSampleEntry` header
+/// (codec configuration, `colr`, `mdcv`, `clli`, ...).
+pub fn video_sample_entry(file: &[u8]) -> ([u8; 4], BoxList<'_>) {
+    let moov = child(file, b"moov");
+    let trak = child(moov, b"trak");
+    let minf = child(child(trak, b"mdia"), b"minf");
+    let stsd = child(child(minf, b"stbl"), b"stsd");
+    // version/flags and entry_count precede the entries.
+    let entries = children(&stsd[8..]);
+    let (fourcc, entry) = entries[0];
+    (fourcc, children(&entry[78..]))
 }
