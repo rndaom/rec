@@ -56,13 +56,13 @@ cargo test
 ```
 
 ## Running
-Start `targeteleaseecd.exe`. A dot appears in the notification area:
+Start `target\release\recd.exe`. A dot appears in the notification area:
 - **Red:** recording.
 - **Grey ring:** waiting for a game.
 - **Amber:** paused.
 - **Orange ring:** a problem. Hover over it or open its menu to see why.
 
-Start a game and press **Alt+F8** to save the last 60 seconds to `Videosec\<game>\`.
+Start a game and press **Alt+F8** to save the last 60 seconds to `Videos\rec\<game>\`.
 
 ## Using the CLI
 ```bash
