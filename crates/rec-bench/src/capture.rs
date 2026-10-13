@@ -8,6 +8,11 @@
 //! | frame time | `FrameTime` or `MsBetweenPresents` | `msBetweenPresents` |
 //! | timestamp  | `CPUStartQPC` (`--qpc_time`) or `CPUStartTime` | `TimeInSeconds` |
 //!
+//! PresentMon 2.x writes extra rows per present when frame generation is in
+//! use, marked in a `FrameType` column (`Application`, `Repeated`,
+//! `AMD_AFMF`, `Intel_XEFG`). Only the application's own frames are the
+//! game's frame rate, so when the column exists the others are ignored.
+//!
 //! Only `CPUStartQPC` is on the QPC clock and can be lined up with the times
 //! at which the bench asked `recd` to save a clip. The other timestamps are
 //! relative to the start of the capture, so save-spike analysis is
@@ -82,6 +87,18 @@ fn app_matches(app: &str, wanted: &str) -> bool {
     stem(app).eq_ignore_ascii_case(stem(wanted))
 }
 
+/// Whether a `FrameType` value marks a frame the driver or game generated
+/// (anything but the application's own frame). Compared case-insensitively.
+/// An empty, `NA` or unspecified value is not known to be generated, so such a
+/// row is kept rather than silently dropping a file with an unusual column.
+fn is_generated_frame(frame_type: &str) -> bool {
+    let t = frame_type.trim();
+    !(t.is_empty()
+        || ["application", "na", "notset", "unspecified", "unknown"]
+            .iter()
+            .any(|known| t.eq_ignore_ascii_case(known)))
+}
+
 /// Returns the key with the most occurrences; ties go to the first seen.
 fn most_common<'a>(keys: impl Iterator<Item = &'a str>) -> Option<(String, usize)> {
     let mut counts: Vec<(&str, usize)> = Vec::new();
@@ -139,12 +156,18 @@ pub fn parse(text: &str, qpc_frequency: i64, wanted: Option<&str>) -> Result<Cap
     };
     let app_col = find(&["application", "processname"]);
     let chain_col = find(&["swapchainaddress"]);
+    let type_col = find(&["frametype"]);
 
     let mut rows = Vec::new();
     let mut skipped_rows = 0;
+    let mut generated_rows = 0;
     for line in lines {
         let fields = split_line(line);
         let get = |col: usize| fields.get(col).map(|s| s.trim());
+        if type_col.and_then(get).is_some_and(is_generated_frame) {
+            generated_rows += 1;
+            continue;
+        }
         let frame_ms = get(frame_col).and_then(|s| s.parse::<f64>().ok());
         let Some(frame_ms) = frame_ms.filter(|ms| ms.is_finite() && *ms > 0.0) else {
             skipped_rows += 1;
@@ -178,11 +201,16 @@ pub fn parse(text: &str, qpc_frequency: i64, wanted: Option<&str>) -> Result<Cap
     }
     if rows.is_empty() {
         return Err(format!(
-            "no usable frames in the file ({skipped_rows} rows skipped for missing or invalid values)"
+            "no usable frames in the file ({skipped_rows} rows skipped for missing or invalid              values, {generated_rows} generated-frame rows ignored)"
         ));
     }
 
     let mut notes = Vec::new();
+    if generated_rows > 0 {
+        notes.push(format!(
+            "{generated_rows} frame-generation rows (FrameType other than Application) ignored:              the numbers are for the application's own frames"
+        ));
+    }
 
     // Pick the application.
     let application = if app_col.is_some() {
@@ -438,6 +466,35 @@ mod tests {
         assert!(err.contains("no frame-time column"), "{err}");
         let err = parse("Application,FrameTime\ngame.exe,NA\n", FREQ, None).unwrap_err();
         assert!(err.contains("no usable frames"), "{err}");
+    }
+
+    #[test]
+    fn frame_generation_rows_are_ignored() {
+        let csv = "Application,FrameType,FrameTime,CPUStartQPC
+                   game.exe,Application,16.0,1
+                   game.exe,AMD_AFMF,8.0,2
+                   game.exe,application,17.0,3
+                   game.exe,Repeated,8.5,4
+                   game.exe,Intel_XEFG,8.5,5
+                   game.exe,NA,18.0,6
+";
+        let c = parse(csv, FREQ, Some("game.exe")).unwrap();
+        assert_eq!(c.frame_ms, [16.0, 17.0, 18.0]);
+        assert_eq!(c.timestamps.unwrap(), [1, 3, 6]);
+        assert_eq!(c.skipped_rows, 0);
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.contains("3 frame-generation rows"))
+        );
+    }
+
+    #[test]
+    fn a_file_with_only_generated_rows_is_an_error() {
+        let csv = "Application,FrameType,FrameTime
+game.exe,AMD_AFMF,8.0
+";
+        assert!(parse(csv, FREQ, None).is_err());
     }
 
     #[test]

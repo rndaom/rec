@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use rec_core::config::{self, Config};
 use serde::Serialize;
 
-use crate::budget::{self, Check, Comparison};
+use crate::budget::{self, Check, Comparison, Verdict};
 use crate::sampler::Usage;
 use crate::stats::{FrameStats, STUTTER_FACTOR, SaveSpike};
 use crate::sys;
@@ -34,11 +34,26 @@ pub struct PhaseResult {
     pub stats: FrameStats,
     /// `recd`'s own cost during the phase ("on" phases only).
     pub recd: Option<Usage>,
+    /// Saves asked of `recd`, whether or not they succeeded.
     pub saves_requested: usize,
+    /// Of those, the ones that returned an error or no answer.
+    pub saves_failed: usize,
     pub save_spikes: Vec<SaveSpike>,
     /// Saves whose +-1 s window was not fully inside the capture.
     pub saves_skipped: usize,
+    /// How `recd` was prepared for this capture ("on" phases only).
+    pub recd_start: Option<RecdStart>,
     pub notes: Vec<String>,
+}
+
+/// An "on" phase starts from a freshly started `recd` whose replay buffer has
+/// had time to fill, so every "on" capture sees the same steady state.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct RecdStart {
+    /// Seconds between `recd` starting to record and the capture starting.
+    pub warmup_secs: u32,
+    /// What `recd` reported as buffered when the capture started.
+    pub buffered_secs: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -56,6 +71,9 @@ pub struct SystemInfo {
     pub cpu: Option<String>,
     pub logical_cores: u32,
     pub os: Option<String>,
+    /// Whether `rec-bench` itself (and so the `recd` it started) ran as
+    /// administrator.
+    pub elevated: bool,
     /// `recd`'s encoder string from `rec status`; includes the GPU name.
     pub encoder: Option<String>,
     pub recd_version: Option<String>,
@@ -79,6 +97,8 @@ pub struct Params {
     pub duration_secs: u32,
     pub runs: u32,
     pub warmup_secs: u32,
+    /// Minimum warm-up of a freshly started `recd` before an "on" capture.
+    pub on_warmup_secs: u32,
     pub save_every_secs: Option<u32>,
 }
 
@@ -126,6 +146,7 @@ pub fn system_info() -> SystemInfo {
         cpu,
         logical_cores: sys::logical_cores(),
         os,
+        elevated: sys::is_elevated(),
         ..SystemInfo::default()
     }
 }
@@ -198,16 +219,23 @@ pub fn describe(stats: &FrameStats) -> String {
 fn check_rows(out: &mut String, checks: &[Check]) {
     out.push_str("| Check | Measured | Budget | Result |\n|---|---:|---:|:---:|\n");
     for c in checks {
+        let noise = c
+            .uncertainty
+            .map_or(String::new(), |u| format!(" \u{b1} {u:.2}{}", c.unit));
         let _ = writeln!(
             out,
-            "| {} | {:.2}{} | {} {:.1}{} | {} |",
+            "| {} | {:.2}{}{noise} | {} {:.1}{} | {} |",
             c.name,
             c.value,
             c.unit,
             c.op,
             c.limit,
             c.unit,
-            if c.pass { "pass" } else { "FAIL" }
+            match c.verdict {
+                Verdict::Pass => "pass",
+                Verdict::Fail => "FAIL",
+                Verdict::Inconclusive => "INCONCLUSIVE",
+            }
         );
     }
 }
@@ -259,8 +287,9 @@ pub fn render_markdown(s: &Summary) -> String {
     let _ = writeln!(o, "- Game process: `{}`", s.process);
     let _ = write!(
         o,
-        "- Capture: {} s per phase after {} s warm-up, {} run(s) of recd off and on, order alternating",
-        s.params.duration_secs, s.params.warmup_secs, s.params.runs
+        "- Capture: {} s per phase after {} s warm-up, {} run(s) of recd off and on, order \
+         alternating; recd restarted before every \"on\" phase and warmed up for at least {} s",
+        s.params.duration_secs, s.params.warmup_secs, s.params.runs, s.params.on_warmup_secs
     );
     if let Some(every) = s.params.save_every_secs {
         let _ = write!(o, ", a 10 s clip saved every {every} s while on");
@@ -279,6 +308,11 @@ pub fn render_markdown(s: &Summary) -> String {
     let _ = writeln!(o, "| CPU | {} |", opt(&s.system.cpu));
     let _ = writeln!(o, "| Logical cores | {} |", s.system.logical_cores);
     let _ = writeln!(o, "| OS | {} |", opt(&s.system.os));
+    let _ = writeln!(
+        o,
+        "| Run as administrator | {} |",
+        if s.system.elevated { "yes" } else { "no" }
+    );
     let _ = writeln!(o, "| Encoder / GPU | {} |", opt(&s.system.encoder));
     let _ = writeln!(o, "| recd | {} |", opt(&s.system.recd_version));
     let _ = writeln!(o, "| Capture target | {} |", opt(&s.system.capture_target));
@@ -308,9 +342,25 @@ pub fn render_markdown(s: &Summary) -> String {
         let _ = writeln!(
             o,
             "\n## Verdict against the D11 budget: {}\n",
-            if cmp.pass { "PASS" } else { "FAIL" }
+            cmp.verdict.label()
         );
         check_rows(&mut o, &cmp.checks);
+        let _ = writeln!(
+            o,
+            "\n\u{b1} is the noise on the mean: 2 x the standard deviation across runs / \
+             sqrt(runs). A check is only decided when the mean is farther from its budget than \
+             that. With fewer than {} runs the noise is unknown, so a check is only decided when \
+             the mean is at least {} points (FPS loss) or {} points (CPU) from its budget.",
+            budget::MIN_RUNS_FOR_NOISE,
+            budget::SMALL_SAMPLE_LOSS_MARGIN_PCT,
+            budget::SMALL_SAMPLE_CPU_MARGIN_PCT
+        );
+        if cmp.verdict == Verdict::Inconclusive {
+            o.push_str(
+                "\n**INCONCLUSIVE:** a check is too close to its budget to tell from these \
+                 runs. Do more runs (5 or more), or use a quieter machine, and compare again.\n",
+            );
+        }
 
         o.push_str("\n## Recording on vs. off\n\n");
         o.push_str(
@@ -384,14 +434,23 @@ pub fn render_markdown(s: &Summary) -> String {
     if s.runs.iter().any(|r| r.on.recd.is_some()) {
         o.push_str("\n## recd's own cost while recording\n\n");
         o.push_str(
-            "| Run | CPU, % of whole machine | CPU, % of one core | Private MB (avg) | Private MB (peak) |\n\
-             |---|---:|---:|---:|---:|\n",
+            "recd was restarted before every \"on\" capture and warmed up so its replay buffer \
+             was full, which makes the \"on\" captures comparable.\n\n\
+             | Run | CPU, % of whole machine | CPU, % of one core | Private MB (avg) \
+             | Private MB (peak) | Fresh start, warm-up (s) | Buffered at start (s) |\n\
+             |---|---:|---:|---:|---:|---:|---:|\n",
         );
         for run in &s.runs {
             if let Some(u) = &run.on.recd {
+                let (warmup, buffered) = run
+                    .on
+                    .recd_start
+                    .map_or(("n/a".to_string(), "n/a".to_string()), |r| {
+                        (r.warmup_secs.to_string(), format!("{:.1}", r.buffered_secs))
+                    });
                 let _ = writeln!(
                     o,
-                    "| {} | {:.3}% | {:.2}% | {:.1} | {:.1} |",
+                    "| {} | {:.3}% | {:.2}% | {:.1} | {:.1} | {warmup} | {buffered} |",
                     run.run,
                     u.cpu_total_pct,
                     u.cpu_one_core_pct,
@@ -404,6 +463,15 @@ pub fn render_markdown(s: &Summary) -> String {
 
     if s.runs.iter().any(|r| r.on.saves_requested > 0) {
         o.push_str("\n## Frame-time spike around clip saves\n\n");
+        o.push_str("| Run | Saves requested | Saves failed |\n|---|---:|---:|\n");
+        for run in &s.runs {
+            let _ = writeln!(
+                o,
+                "| {} | {} | {} |",
+                run.run, run.on.saves_requested, run.on.saves_failed
+            );
+        }
+        o.push('\n');
         o.push_str(
             "Worst frame time within 1 s of each save (from 1 s before the request to 1 s after it \
              finished), against that capture's median frame time.\n\n\
@@ -514,29 +582,39 @@ mod tests {
                 private_avg_mb: 110.0,
                 samples: 61,
             }),
-            saves_requested: 2,
+            saves_requested: 3,
+            saves_failed: 1,
             save_spikes: vec![SaveSpike {
                 at_s: 20.0,
                 worst_ms: 25.0,
                 ratio: 1.5,
             }],
             saves_skipped: 1,
+            recd_start: with_recd.then_some(RecdStart {
+                warmup_secs: 60,
+                buffered_secs: 59.5,
+            }),
             notes: vec!["a note".into()],
         }
     }
 
     fn summary() -> Summary {
-        let runs = vec![RunRecord {
-            run: 1,
-            order: [Phase::Off, Phase::On],
-            off: phase(100.0, false),
-            on: phase(99.0, true),
-        }];
-        let pairs = [PhasePair {
-            off: runs[0].off.stats.clone(),
-            on: runs[0].on.stats.clone(),
-            recd_cpu_total_pct: Some(0.31),
-        }];
+        let runs: Vec<RunRecord> = (1..=3)
+            .map(|run| RunRecord {
+                run,
+                order: [Phase::Off, Phase::On],
+                off: phase(100.0, false),
+                on: phase(99.0, true),
+            })
+            .collect();
+        let pairs: Vec<PhasePair> = runs
+            .iter()
+            .map(|r| PhasePair {
+                off: r.off.stats.clone(),
+                on: r.on.stats.clone(),
+                recd_cpu_total_pct: Some(0.31),
+            })
+            .collect();
         Summary {
             tool_version: "0.0.1".into(),
             date: "2026-10-12".into(),
@@ -544,8 +622,9 @@ mod tests {
             process: "Game.exe".into(),
             params: Params {
                 duration_secs: 60,
-                runs: 1,
+                runs: 3,
                 warmup_secs: 5,
+                on_warmup_secs: 60,
                 save_every_secs: Some(20),
             },
             system: SystemInfo {
@@ -582,6 +661,9 @@ mod tests {
             "bitrate preset",
             "max height 1080p",
             "Verdict against the D11 budget: PASS",
+            "Saves requested",
+            "Fresh start, warm-up",
+            "restarted before every",
             "-1.00%",
             "recd's own cost",
             "Frame-time spike",
@@ -590,6 +672,24 @@ mod tests {
         ] {
             assert!(md.contains(needle), "missing `{needle}` in:\n{md}");
         }
+    }
+
+    #[test]
+    fn inconclusive_verdict_is_explained() {
+        let mut s = summary();
+        s.runs.truncate(1);
+        s.comparison = compare(&[PhasePair {
+            off: s.runs[0].off.stats.clone(),
+            on: s.runs[0].on.stats.clone(),
+            recd_cpu_total_pct: Some(0.31),
+        }]);
+        let md = render_markdown(&s);
+        assert!(
+            md.contains("Verdict against the D11 budget: INCONCLUSIVE"),
+            "{md}"
+        );
+        assert!(md.contains("Do more runs"), "{md}");
+        assert!(md.contains("Fewer than 3 runs"), "{md}");
     }
 
     #[test]
@@ -606,7 +706,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["process"], "Game.exe");
         assert_eq!(value["runs"][0]["order"][0], "off");
-        assert_eq!(value["comparison"]["pass"], true);
+        assert_eq!(value["comparison"]["verdict"], "pass");
     }
 
     #[test]

@@ -1,16 +1,22 @@
 //! Thin, safe wrappers over the few Win32 calls the bench needs: process CPU
-//! and memory counters, process lookup, the registry, the QPC frequency, the
-//! local date and Ctrl+C handling.
+//! and memory counters, process lookup and waiting, the owner of a named pipe,
+//! the token's elevation, the registry, the QPC frequency, the local date and
+//! Ctrl+C handling.
 
 use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::io;
 use std::os::windows::ffi::OsStringExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     CloseHandle, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
@@ -19,6 +25,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
+use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
@@ -27,9 +34,9 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{
-    GetActiveProcessorCount, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-    QueryFullProcessImageNameW,
+    GetActiveProcessorCount, GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_VM_READ, QueryFullProcessImageNameW, WaitForSingleObject,
 };
 use windows::core::{BOOL, HSTRING, PWSTR};
 
@@ -200,6 +207,63 @@ pub fn find_processes(exe_name: &str) -> Vec<u32> {
     pids
 }
 
+/// Windows `ERROR_PIPE_BUSY`: every pipe instance is serving another client.
+const ERROR_PIPE_BUSY: i32 = 231;
+
+/// Id of the process serving the named pipe `name`, or `None` if there is no
+/// such pipe.
+///
+/// This is how the bench knows which `recd` it is talking to: the process
+/// name alone is ambiguous if more than one `recd.exe` exists. The client
+/// handle is opened and closed without sending anything, so the server's read
+/// ends at once instead of waiting for a request.
+pub fn pipe_server_pid(name: &str) -> Result<Option<u32>, String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let pipe = loop {
+        match OpenOptions::new().read(true).write(true).open(name) {
+            Ok(pipe) => break pipe,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("could not open {name}: {e}")),
+        }
+    };
+    let mut pid = 0u32;
+    // SAFETY: the handle stays valid until `pipe` is dropped at the end of
+    // this function and `pid` is valid for writes.
+    unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut pid) }
+        .map_err(|e| format!("GetNamedPipeServerProcessId failed: {e}"))?;
+    Ok(Some(pid))
+}
+
+/// Whether this process runs with an elevated (administrator) token. `false`
+/// if that cannot be determined.
+pub fn is_elevated() -> bool {
+    let mut token = HANDLE::default();
+    // SAFETY: the pseudo-handle from `GetCurrentProcess` needs no closing and
+    // `token` is valid for writes.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    // SAFETY: `elevation` is a writable `TOKEN_ELEVATION` of the size passed
+    // and `token` is a token handle opened for query.
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    // SAFETY: we own the token handle and close it once.
+    let _ = unsafe { CloseHandle(token) };
+    queried.is_ok() && elevation.TokenIsElevated != 0
+}
+
 /// An open handle to another process, for reading its CPU time and memory.
 #[derive(Debug)]
 pub struct Process(HANDLE);
@@ -221,6 +285,44 @@ impl Process {
         handle
             .map(Self)
             .map_err(|e| format!("could not open process {pid}: {e}"))
+    }
+
+    /// Opens a process only to wait for it to exit.
+    pub fn open_waitable(pid: u32) -> Result<Self, String> {
+        // SAFETY: no pointers involved; the handle is closed in `Drop`.
+        unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                pid,
+            )
+        }
+        .map(Self)
+        .map_err(|e| format!("could not open process {pid}: {e}"))
+    }
+
+    /// Waits up to `timeout` for the process to exit. `Ok(true)` if it has.
+    /// Returns an error early if Ctrl+C arrives.
+    pub fn wait_exit(&self, timeout: Duration) -> Result<bool, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let slice = left.min(Duration::from_millis(100));
+            // SAFETY: valid handle with the SYNCHRONIZE right.
+            let result = unsafe { WaitForSingleObject(self.0, slice.as_millis() as u32) };
+            if result == WAIT_OBJECT_0 {
+                return Ok(true);
+            }
+            if result != WAIT_TIMEOUT {
+                return Err("waiting for the process failed".into());
+            }
+            if left <= slice {
+                return Ok(false);
+            }
+            if interrupted() {
+                return Err("interrupted".into());
+            }
+        }
     }
 
     /// Kernel plus user CPU time consumed so far, in seconds.
@@ -302,5 +404,43 @@ pub fn make_std_handles_non_inheritable() {
         // SAFETY: valid handle; only the inherit flag is changed. Failure
         // (e.g. for a pseudo-console handle) is harmless.
         let _ = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn a_missing_pipe_has_no_server() {
+        assert_eq!(
+            pipe_server_pid(r"\.\pipe\rec-bench-test-no-such-pipe").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn elevation_can_be_queried() {
+        // Either answer is valid; the call must not crash.
+        let _ = is_elevated();
+    }
+
+    #[test]
+    fn waiting_for_a_process_sees_it_exit() {
+        let mut child = Command::new("cmd").args(["/C", "exit"]).spawn().unwrap();
+        let watch = Process::open_waitable(child.id()).unwrap();
+        assert!(watch.wait_exit(Duration::from_secs(10)).unwrap());
+        let _ = child.wait();
+
+        let mut long = Command::new("cmd")
+            .args(["/C", "ping -n 20 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        let watch = Process::open_waitable(long.id()).unwrap();
+        assert!(!watch.wait_exit(Duration::from_millis(200)).unwrap());
+        let _ = long.kill();
+        let _ = long.wait();
+        assert!(watch.wait_exit(Duration::from_secs(10)).unwrap());
     }
 }

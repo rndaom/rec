@@ -15,6 +15,8 @@ usage:
       --duration <secs>     length of each capture (default 60)
       --runs <n>            number of off/on pairs (default 3)
       --warmup <secs>       settle time before each capture (default 5)
+      --on-warmup <secs>    minimum time a freshly started recd records before an \"on\"
+                            capture (default: the replay length in your rec config)
       --recd <path>         recd.exe to start for the \"on\" phases (default: next to rec-bench)
       --save-every <secs>   also save a 10 s clip every N seconds during \"on\" captures
                             and report the frame-time spike around each
@@ -34,6 +36,8 @@ pub struct RunArgs {
     pub duration: u32,
     pub runs: u32,
     pub warmup: u32,
+    /// Override for the "on" warm-up; `None` means the configured replay length.
+    pub on_warmup: Option<u32>,
     pub recd: Option<PathBuf>,
     pub save_every: Option<u32>,
     pub label: Option<String>,
@@ -133,6 +137,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 "duration",
                 "runs",
                 "warmup",
+                "on-warmup",
                 "recd",
                 "save-every",
                 "label",
@@ -159,6 +164,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 duration,
                 runs: number(&options, "runs", Some(3), 1..=50)?.unwrap_or(3),
                 warmup: number(&options, "warmup", Some(5), 0..=600)?.unwrap_or(5),
+                on_warmup: number(&options, "on-warmup", None, 0..=3600)?,
                 recd: path(&options, "recd"),
                 save_every,
                 label: options
@@ -223,6 +229,7 @@ mod tests {
         assert_eq!(a.process, "Game.exe");
         assert_eq!((a.duration, a.runs, a.warmup), (60, 3, 5));
         assert_eq!(a.save_every, None);
+        assert_eq!(a.on_warmup, None);
         assert_eq!(a.presentmon, None);
         assert_eq!(a.recd, None);
         assert_eq!(a.label, None);
@@ -233,12 +240,13 @@ mod tests {
     fn run_all_options_in_both_spellings() {
         let a = run(
             "run --process Game.exe --presentmon C:/pm/PresentMon.exe --duration 30 \
-             --runs=5 --warmup 10 --recd D:/rec/recd.exe --save-every=7 --label=my-test --out results",
+             --runs=5 --warmup 10 --on-warmup=90 --recd D:/rec/recd.exe --save-every=7 --label=my-test --out results",
         );
         assert_eq!(a.presentmon, Some(PathBuf::from("C:/pm/PresentMon.exe")));
         assert_eq!((a.duration, a.runs, a.warmup), (30, 5, 10));
         assert_eq!(a.recd, Some(PathBuf::from("D:/rec/recd.exe")));
         assert_eq!(a.save_every, Some(7));
+        assert_eq!(a.on_warmup, Some(90));
         assert_eq!(a.label.as_deref(), Some("my-test"));
         assert_eq!(a.out, PathBuf::from("results"));
     }

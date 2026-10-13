@@ -4,6 +4,11 @@
 //! (`Request::Quit` over IPC), and it only ever kills processes it spawned
 //! itself (PresentMon). A `recd` that was already running when the bench
 //! started is stopped for the "off" phases and restarted at the end.
+//!
+//! IPC is never used to find out whether `recd` has gone after `Quit`: while
+//! it shuts down its pipe can still accept a connection that is never
+//! answered, and `ipc::send` has no read timeout. The bench waits on the
+//! process instead.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -50,6 +55,44 @@ pub fn running_image(recd_path: &Path) -> Option<PathBuf> {
         .find_map(|pid| Process::open(pid).ok()?.image_path())
 }
 
+/// Id of the process serving the rec pipe, if there is one.
+pub fn server_pid() -> Result<Option<u32>, String> {
+    sys::pipe_server_pid(&ipc::pipe_name())
+}
+
+/// A `recd` process the bench waits for after asking it to quit.
+struct ExitWatch {
+    pid: u32,
+    /// `None` if the process could not be opened for waiting; it is then
+    /// found by enumerating processes.
+    handle: Option<Process>,
+}
+
+impl ExitWatch {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            handle: Process::open_waitable(pid).ok(),
+        }
+    }
+
+    /// Waits until the process is gone or `deadline` passes; `true` if gone.
+    fn wait(&self, exe_name: &str, deadline: Instant) -> Result<bool, String> {
+        match &self.handle {
+            Some(handle) => handle.wait_exit(deadline.saturating_duration_since(Instant::now())),
+            None => loop {
+                if !sys::find_processes(exe_name).contains(&self.pid) {
+                    return Ok(true);
+                }
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                sys::sleep(Duration::from_millis(100))?;
+            },
+        }
+    }
+}
+
 /// What a state-wait should do with the status it just saw.
 pub enum Readiness {
     Ready,
@@ -69,13 +112,30 @@ impl Recd {
         Self { path, child: None }
     }
 
-    /// Process id of the running `recd`: the one this bench started, else
-    /// whatever process has the executable's name.
-    pub fn pid(&self) -> Option<u32> {
-        self.child
-            .as_ref()
-            .map(Child::id)
-            .or_else(|| sys::find_processes(&exe_name(&self.path)).first().copied())
+    /// Process id of the running `recd`: the one this bench started, else the
+    /// owner of the rec pipe. Only if the pipe cannot be inspected is the
+    /// process name used, and then only when exactly one process has it:
+    /// sampling some other `recd.exe` would silently give wrong numbers.
+    pub fn pid(&self) -> Result<u32, String> {
+        if let Some(child) = &self.child {
+            return Ok(child.id());
+        }
+        let name = exe_name(&self.path);
+        let why = match server_pid() {
+            Ok(Some(pid)) => return Ok(pid),
+            Ok(None) => return Err("recd is not running".into()),
+            Err(e) => e,
+        };
+        match sys::find_processes(&name).as_slice() {
+            [pid] => Ok(*pid),
+            [] => Err(format!(
+                "no process named {name} was found (pass --recd with the right file name)"
+            )),
+            many => Err(format!(
+                "{} processes are named {name} ({many:?}) and the one behind the rec pipe could                  not be identified ({why})",
+                many.len()
+            )),
+        }
     }
 
     /// Spawns `recd` without waiting for it. Its output is discarded: it is a
@@ -144,6 +204,21 @@ impl Recd {
     /// not running.
     pub fn stop(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + EXIT_TIMEOUT;
+        // Find the process to wait for before asking it to quit, while the
+        // pipe still answers. A child of ours is waited for directly.
+        let name = exe_name(&self.path);
+        let watch: Vec<ExitWatch> = if self.child.is_some() {
+            Vec::new()
+        } else {
+            match server_pid() {
+                Ok(Some(pid)) => vec![ExitWatch::new(pid)],
+                Ok(None) => Vec::new(),
+                Err(_) => sys::find_processes(&name)
+                    .into_iter()
+                    .map(ExitWatch::new)
+                    .collect(),
+            }
+        };
         loop {
             match ipc::send(&Request::Quit) {
                 Ok(_) => break,
@@ -168,27 +243,33 @@ impl Recd {
                 Err(e) => return Err(e),
             }
         }
-        // Quit accepted: wait for the process, or for the pipe to vanish if
-        // it is not our child.
-        loop {
-            let gone = match &mut self.child {
-                Some(child) => matches!(child.try_wait(), Ok(Some(_))),
-                None => status()?.is_none(),
-            };
-            if gone {
-                break;
+        // Quit accepted: wait for the process itself, never for the pipe.
+        let timed_out = || {
+            format!(
+                "recd did not exit within {} s after being asked to quit",
+                EXIT_TIMEOUT.as_secs()
+            )
+        };
+        if let Some(child) = &mut self.child {
+            while !matches!(child.try_wait(), Ok(Some(_))) {
+                if Instant::now() >= deadline {
+                    return Err(timed_out());
+                }
+                sys::sleep(Duration::from_millis(100))?;
             }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "recd did not exit within {} s after being asked to quit",
-                    EXIT_TIMEOUT.as_secs()
-                ));
+        } else if watch.is_empty() {
+            return Err("recd accepted `quit` but its process could not be identified, so the                  bench cannot tell when it has exited"
+                .into());
+        } else {
+            for target in &watch {
+                if !target.wait(&name, deadline)? {
+                    return Err(timed_out());
+                }
             }
-            sys::sleep(Duration::from_millis(100))?;
         }
         self.child = None;
-        // The pipe goes away slightly before the process finishes tearing
-        // down capture and encoder resources.
+        // The process has exited, but give the driver a moment to release the
+        // capture and encoder resources before the next phase.
         sys::sleep(Duration::from_millis(500))
     }
 

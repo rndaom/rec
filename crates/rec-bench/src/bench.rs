@@ -16,7 +16,7 @@ use crate::capture;
 use crate::cli::{AnalyzeArgs, IdleArgs, RunArgs};
 use crate::presentmon;
 use crate::recd::{self, Readiness, Recd};
-use crate::report::{self, Params, Phase, PhaseResult, RunRecord, Summary};
+use crate::report::{self, Params, Phase, PhaseResult, RecdStart, RunRecord, Summary};
 use crate::sampler::Sampler;
 use crate::stats;
 use crate::sys;
@@ -30,6 +30,13 @@ const SAVE_SECONDS: u32 = 10;
 
 /// How much longer than `--duration` PresentMon may take before it is killed.
 const PRESENTMON_SLACK: Duration = Duration::from_secs(30);
+
+/// After Ctrl+C, how long PresentMon gets to close its ETW session itself
+/// (it shares our console, so it receives the Ctrl+C too) before it is killed.
+const PRESENTMON_INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+
+/// Replay length assumed when the rec config cannot be read (rec's default).
+const DEFAULT_REPLAY_SECONDS: u32 = 60;
 
 // ---------------------------------------------------------------- analyze
 
@@ -102,13 +109,7 @@ pub fn idle(args: &IdleArgs) -> Result<(), String> {
             recd.start()?;
         }
         let status = recd.wait_for(recd::STATE_TIMEOUT, "idle", not_idle)?;
-        let pid = recd.pid().ok_or_else(|| {
-            format!(
-                "recd answers on its pipe but no process named {} was found (pass --recd with the \
-                 right file name)",
-                recd::exe_name(&recd_path)
-            )
-        })?;
+        let pid = recd.pid()?;
         println!(
             "measuring recd (pid {pid}) for {} s after a {} s warm-up",
             args.duration, args.warmup
@@ -198,30 +199,57 @@ fn delete_clips(paths: &[PathBuf]) -> Vec<String> {
     problems
 }
 
-fn kill(child: &mut Child) {
+/// Kills PresentMon (our own child) and ends the real-time ETW session that
+/// killing it leaves running. A failure to end the session is only logged: the
+/// next capture replaces a stale session anyway.
+fn stop_presentmon(child: &mut Child, presentmon: &Path) {
     let _ = child.kill();
     let _ = child.wait();
+    if let Err(e) = presentmon::terminate_session(presentmon) {
+        eprintln!("warning: could not end PresentMon's ETW session `rec-bench`: {e}");
+    }
 }
 
-/// Waits for PresentMon, killing it (it is our own child) on timeout or
-/// Ctrl+C. Returns its exit code.
-fn wait_for_presentmon(child: &mut Child, limit: Duration) -> Result<Option<i32>, String> {
+/// Waits up to `grace` for `child` to exit on its own.
+fn exits_within(child: &mut Child, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Waits for PresentMon, killing it (it is our own child) on timeout. On
+/// Ctrl+C it is first given a few seconds to exit and close its session
+/// itself. Returns its exit code.
+fn wait_for_presentmon(
+    child: &mut Child,
+    presentmon: &Path,
+    limit: Duration,
+) -> Result<Option<i32>, String> {
     let deadline = Instant::now() + limit;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status.code()),
             Ok(None) => {}
             Err(e) => {
-                kill(child);
+                stop_presentmon(child, presentmon);
                 return Err(format!("could not wait for PresentMon: {e}"));
             }
         }
         if sys::interrupted() {
-            kill(child);
+            if !exits_within(child, PRESENTMON_INTERRUPT_GRACE) {
+                stop_presentmon(child, presentmon);
+            }
             return Err("interrupted".into());
         }
         if Instant::now() >= deadline {
-            kill(child);
+            stop_presentmon(child, presentmon);
             return Err(format!(
                 "PresentMon did not finish within {} s and was stopped",
                 limit.as_secs()
@@ -238,6 +266,11 @@ struct Bench<'a> {
     out_dir: PathBuf,
     qpc_frequency: i64,
     system: report::SystemInfo,
+    /// Seconds a freshly started recd records before an "on" capture starts:
+    /// at least the replay length, so its buffer is full.
+    on_warmup: u32,
+    /// Replay length from the rec config, if it could be read.
+    replay_secs: Option<u32>,
 }
 
 impl Bench<'_> {
@@ -245,11 +278,12 @@ impl Bench<'_> {
         self.out_dir.join("raw")
     }
 
-    /// Makes sure recd is running and recording the game.
-    fn ensure_recording(&mut self) -> Result<Status, String> {
-        if recd::status()?.is_none() {
-            self.recd.start()?;
-        }
+    /// Restarts recd and waits until it is recording the game. A fresh recd
+    /// has an empty replay buffer, so every "on" phase starts from the same
+    /// state instead of some reusing a recd whose buffer is already full.
+    fn restart_recording(&mut self) -> Result<Status, String> {
+        self.recd.stop()?;
+        self.recd.start()?;
         let status = self
             .recd
             .wait_for(recd::STATE_TIMEOUT, "recording", |s| match s.state {
@@ -275,14 +309,42 @@ impl Bench<'_> {
     fn run_phase(&mut self, run: u32, phase: Phase) -> Result<PhaseResult, String> {
         let args = self.args;
         println!("run {run}/{}: recd {}", args.runs, phase.name());
-        match phase {
-            Phase::Off => self.recd.stop()?,
-            Phase::On => {
-                self.ensure_recording()?;
+        let warmup = match phase {
+            Phase::Off => {
+                self.recd.stop()?;
+                args.warmup
             }
+            Phase::On => {
+                self.restart_recording()?;
+                self.on_warmup
+            }
+        };
+        let mut notes = Vec::new();
+        if phase == Phase::On {
+            println!("  recd restarted; warming up for {warmup} s so its replay buffer fills");
+        } else {
+            println!("  warming up for {warmup} s");
         }
-        println!("  warming up for {} s", args.warmup);
-        sys::sleep(Duration::from_secs(u64::from(args.warmup)))?;
+        sys::sleep(Duration::from_secs(u64::from(warmup)))?;
+        let recd_start = if phase == Phase::On {
+            let buffered = recd::status()?
+                .ok_or("recd stopped during its warm-up")?
+                .buffered_seconds;
+            if let Some(replay) = self.replay_secs {
+                if buffered < f64::from(replay) * 0.95 {
+                    notes.push(format!(
+                        "the replay buffer held {buffered:.1} s of the configured {replay} s when \
+                         the capture started; raise --on-warmup"
+                    ));
+                }
+            }
+            Some(RecdStart {
+                warmup_secs: warmup,
+                buffered_secs: buffered,
+            })
+        } else {
+            None
+        };
 
         let stem = format!("run{run}-{}", phase.name());
         let csv = self.raw_dir().join(format!("{stem}.csv"));
@@ -293,15 +355,10 @@ impl Bench<'_> {
         let mut pm = presentmon::spawn(&self.presentmon, &args.process, &csv, args.duration, &log)?;
 
         let sampler = if phase == Phase::On {
-            let started = self
-                .recd
-                .pid()
-                .ok_or_else(|| "recd is not running".to_string())
-                .and_then(Sampler::start);
-            match started {
+            match self.recd.pid().and_then(Sampler::start) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    kill(&mut pm);
+                    stop_presentmon(&mut pm, &self.presentmon);
                     return Err(e);
                 }
             }
@@ -314,16 +371,17 @@ impl Bench<'_> {
             .map(|n| Saver::start(Duration::from_secs(u64::from(n))));
 
         let limit = Duration::from_secs(u64::from(args.duration)) + PRESENTMON_SLACK;
-        let exit = wait_for_presentmon(&mut pm, limit);
+        let exit = wait_for_presentmon(&mut pm, &self.presentmon, limit);
 
         // Always stop the helpers, even if PresentMon failed.
         let saves = saver.map(Saver::finish);
         let usage = sampler.map(Sampler::finish);
-        let mut notes = Vec::new();
         let mut saves_requested = 0;
+        let mut saves_failed = 0;
         let mut save_times = Vec::new();
         if let Some(saves) = saves {
-            saves_requested = saves.times.len();
+            saves_failed = saves.errors.len();
+            saves_requested = saves.times.len() + saves_failed;
             save_times = saves.times;
             notes.extend(saves.errors.iter().map(|e| format!("save failed: {e}")));
             notes.extend(delete_clips(&saves.paths));
@@ -393,8 +451,10 @@ impl Bench<'_> {
             stats,
             recd: usage,
             saves_requested,
+            saves_failed,
             save_spikes: spikes,
             saves_skipped: skipped,
+            recd_start,
             notes,
         })
     }
@@ -451,6 +511,7 @@ fn build_summary(
     label: &str,
     runs: Vec<RunRecord>,
     complete: bool,
+    notes: Vec<String>,
 ) -> Summary {
     let pairs: Vec<PhasePair> = runs
         .iter()
@@ -469,6 +530,7 @@ fn build_summary(
             duration_secs: bench.args.duration,
             runs: bench.args.runs,
             warmup_secs: bench.args.warmup,
+            on_warmup_secs: bench.on_warmup,
             save_every_secs: bench.args.save_every,
         },
         system: bench.system.clone(),
@@ -476,7 +538,7 @@ fn build_summary(
         comparison: budget::compare(&pairs),
         runs,
         complete,
-        notes: Vec::new(),
+        notes,
     }
 }
 
@@ -509,6 +571,12 @@ pub fn run(args: &RunArgs) -> Result<(), String> {
     fs::create_dir_all(out_dir.join("raw"))
         .map_err(|e| format!("could not create {}: {e}", out_dir.display()))?;
 
+    let rec_config = report::config_summary();
+    let replay_secs = rec_config.as_ref().map(|c| c.replay_seconds);
+    let on_warmup = args
+        .on_warmup
+        .unwrap_or_else(|| replay_secs.unwrap_or(DEFAULT_REPLAY_SECONDS))
+        .max(args.warmup);
     let mut bench = Bench {
         args,
         presentmon,
@@ -516,7 +584,26 @@ pub fn run(args: &RunArgs) -> Result<(), String> {
         out_dir,
         qpc_frequency: sys::qpc_frequency(),
         system: report::system_info(),
+        on_warmup,
+        replay_secs,
     };
+    let mut notes = Vec::new();
+    if args.on_warmup.is_none() && replay_secs.is_none() {
+        notes.push(format!(
+            "the rec config could not be read, so the \"on\" warm-up defaulted to \
+             {DEFAULT_REPLAY_SECONDS} s"
+        ));
+    }
+    if bench.system.elevated {
+        println!(
+            "rec-bench is running as administrator, so the recd it starts will be elevated too"
+        );
+        notes.push(
+            "rec-bench ran as administrator, so recd ran elevated in the \"on\" phases; an \
+             elevated recd can behave differently from a normal one"
+                .into(),
+        );
+    }
 
     if prior.is_some() {
         println!(
@@ -532,14 +619,33 @@ pub fn run(args: &RunArgs) -> Result<(), String> {
     let stopped = bench.recd.stop();
     let restored = if stopped.is_ok() && prior.is_some() {
         // Start it from where it was running, else from the path we used.
-        recd::restore(prior_image.as_ref().unwrap_or(&recd_path))
+        let path = prior_image.as_ref().unwrap_or(&recd_path);
+        if bench.system.elevated {
+            // A recd started from here would carry our admin token, and its
+            // pipe would then be admin-only: `rec save` from a normal terminal
+            // would stop working. Leave the decision to the user.
+            let line = format!(
+                "rec-bench ran as administrator, so it did not start your recd again (it would \
+                 run elevated and normal `rec` commands could no longer reach it). Start recd \
+                 again yourself: {}",
+                path.display()
+            );
+            println!("\n{line}");
+            notes.push(line);
+            Ok(())
+        } else {
+            recd::restore(path)
+        }
     } else {
         Ok(())
     };
+    if let Err(e) = &restored {
+        notes.push(format!("could not start your recd again: {e}"));
+    }
 
     let complete = outcome.is_ok() && records.len() == args.runs as usize;
     if !records.is_empty() {
-        let summary = build_summary(&bench, &date, &label, records, complete);
+        let summary = build_summary(&bench, &date, &label, records, complete, notes);
         let markdown = report::render_markdown(&summary);
         fs::write(bench.out_dir.join("summary.md"), &markdown)
             .and_then(|()| {

@@ -4,11 +4,14 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const RELEASES_URL: &str = "https://github.com/GameTechDev/PresentMon/releases";
 
 /// ETW session name. A fixed name plus `--stop_existing_session` means a
-/// previous interrupted bench cannot leave a stale session that blocks this one.
+/// previous interrupted bench cannot leave a stale session that blocks this one,
+/// and lets [`terminate_session`] clean up after a PresentMon that was killed.
 const SESSION_NAME: &str = "rec-bench";
 
 /// Index of the best PresentMon executable among `names` (file names in one
@@ -90,6 +93,52 @@ pub fn args(process: &str, csv: &Path, duration_secs: u32) -> Vec<OsString> {
     // Raw QPC counter values, so frames line up with our own QPC timestamps.
     flag("--qpc_time", None);
     args
+}
+
+/// How long `--terminate_existing_session` may take before it is given up on.
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Command-line arguments that make PresentMon stop the leftover ETW session
+/// and exit.
+pub fn terminate_args() -> Vec<OsString> {
+    vec![
+        "--terminate_existing_session".into(),
+        "--session_name".into(),
+        SESSION_NAME.into(),
+    ]
+}
+
+/// Stops the real-time ETW session a killed PresentMon leaves running.
+///
+/// `TerminateProcess` gives PresentMon no chance to close its session, and a
+/// real-time ETW session outlives its consumer. PresentMon can end it by
+/// name. The caller treats a failure as a warning: the next capture starts
+/// with `--stop_existing_session` anyway.
+pub fn terminate_session(exe: &Path) -> Result<(), String> {
+    let mut child = Command::new(exe)
+        .args(terminate_args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", exe.display()))?;
+    let deadline = Instant::now() + TERMINATE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("PresentMon exited with {status}")),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "PresentMon did not finish within {} s and was stopped",
+                    TERMINATE_TIMEOUT.as_secs()
+                ));
+            }
+            Err(e) => return Err(format!("could not wait for PresentMon: {e}")),
+        }
+    }
 }
 
 /// Starts a timed capture. PresentMon's own output goes to `log` (it is small
@@ -206,6 +255,22 @@ mod tests {
                 "rec-bench",
                 "--no_console_stats",
                 "--qpc_time",
+            ]
+        );
+    }
+
+    #[test]
+    fn terminate_command_line_names_the_capture_session() {
+        let a: Vec<String> = terminate_args()
+            .into_iter()
+            .map(|s| s.into_string().unwrap())
+            .collect();
+        assert_eq!(
+            a,
+            [
+                "--terminate_existing_session",
+                "--session_name",
+                "rec-bench"
             ]
         );
     }
