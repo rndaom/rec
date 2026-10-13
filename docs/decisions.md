@@ -122,3 +122,13 @@ Free and open source, using the standard Rust dual license.
 - **On save:** no frame-time spike.
 
 **Measurement:** PresentMon/CapFrameX on NVIDIA, AMD, Intel and a hybrid laptop. Results are published in the README.
+
+## D12. HDR: record what the display shows, as HDR10
+
+When Windows HDR is on for the captured display, rec captures the compositor's FP16 scRGB picture and records **HDR10**: 10-bit HEVC Main10 or AV1, BT.2020 primaries, PQ, limited range. `hdr = "tonemap"` records SDR from the same capture instead; `hdr = "off"` captures 8-bit as Windows presents it (highlights clip). SDR displays are unaffected.
+- **Our own shaders, not the video processor:** what D3D11 video processors do with FP16 input differs between drivers. Two small pixel shaders (compiled at start by the OS's `d3dcompiler_47.dll`) scale, letterbox, convert and write the P010 or NV12 planes directly, and a GPU test checks them against a CPU reference to within one code value.
+- **Honest metadata:** the mastering display is the user's monitor as DXGI reports it, and the picture is clipped at its peak, so MaxCLL is its peak. A clip never claims more than the display could show. Unknown panels get the conventional BT.2020 / 1000 cd/m².
+- **Metadata everywhere a player looks:** VUI / sequence-header colour from the encoder, the MP4 `colr` / `mdcv` / `clli` boxes, and the static metadata in-band in every keyframe (HEVC SEI, AV1 metadata OBUs), inserted by us so it is the same for every encoder and survives cutting and remuxing. The "washed out" HDR clips users complain about come from metadata missing in one of these places.
+- **Tone-map:** SDR white (Windows' "SDR content brightness") maps to 100%; above 85% of it highlights roll off exponentially per pixel on the brightest channel, so hues hold and nothing clips hard. SDR white ends up about 5% dimmer in linear light (2.5% in signal) than on an SDR capture, the price of keeping highlight detail.
+- **Fallbacks, never a failed recording:** H.264 has no 10-bit hardware profile, so H.264 tone-maps; an encoder without 10-bit falls back to the tone-map with a logged note.
+- **Switching HDR mid-game** restarts only the video pipeline in the new mode (see `recd/src/recover.rs`), like a resolution change.

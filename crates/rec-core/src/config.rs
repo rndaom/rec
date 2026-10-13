@@ -105,8 +105,11 @@ pub enum CaptureTarget {
 pub enum Codec {
     /// HEVC where the GPU supports it, else H.264.
     Auto,
+    /// Plays everywhere; no HDR (an HDR display is tone-mapped to SDR).
     H264,
     Hevc,
+    /// Smallest files; needs an AV1 hardware encoder (Radeon RX 7000,
+    /// GeForce RTX 40, Intel Arc and newer).
     Av1,
 }
 
@@ -121,24 +124,31 @@ pub enum Quality {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EncoderPreference {
+    /// The GPU vendor's native encoder where rec has one (AMD AMF), else
+    /// Media Foundation.
     Auto,
+    /// No native NVENC backend yet: NVIDIA's Media Foundation encoder.
     Nvidia,
+    /// AMD AMF, falling back to Media Foundation if it cannot start.
     Amd,
+    /// No native oneVPL backend yet: Intel's Media Foundation encoder.
     Intel,
     /// Media Foundation hardware encoder, vendor-agnostic.
     MediaFoundation,
-    /// CPU encoding. Costs game performance; opt-in only.
+    /// CPU encoding. Costs game performance; opt-in only. Not available
+    /// yet: the hardware encoder is used.
     Software,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HdrMode {
-    /// Keep HDR (10-bit, HDR10 metadata) when the display is in HDR mode.
+    /// Keep HDR (10-bit HEVC or AV1, HDR10 metadata) when the display is in
+    /// HDR mode; with H.264, or an encoder without 10-bit, tone-map instead.
     Auto,
     /// Tone-map HDR to SDR so clips look right everywhere.
     Tonemap,
-    /// Always record SDR.
+    /// Capture SDR as Windows presents it; HDR highlights clip.
     Off,
 }
 
