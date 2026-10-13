@@ -1,0 +1,38 @@
+[package]
+name = "rec-audio"
+description = "rec audio capture: WASAPI loopback / microphone to AAC-LC packets via Media Foundation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rec-core.workspace = true
+thiserror = "2.0.21"
+
+[target.'cfg(windows)'.dependencies]
+# `#[implement]` (used for IMMNotificationClient) expands to `::windows_core`
+# paths, so the crate must be a direct dependency; it is already pulled in by
+# `windows` itself.
+windows-core = "0.62"
+windows = { workspace = true, features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# QueryProcessCycleTime, for the CPU measurement in the capture example.
+windows = { workspace = true, features = ["Win32_System_WindowsProgramming"] }
