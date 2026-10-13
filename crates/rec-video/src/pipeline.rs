@@ -236,6 +236,7 @@ impl Pipeline {
                 width,
                 height,
                 fps: config.fps,
+                color: rec_core::media::VideoColor::Sdr,
             },
             encoder_name: encoder.name.clone(),
             adapter_name: gpu.adapter_name.clone(),

@@ -134,6 +134,7 @@ pub fn video_info(codec: VideoCodec) -> TrackInfo {
             width: 320,
             height: 240,
             fps: FPS as u32,
+            color: rec_core::media::VideoColor::Sdr,
         }),
     }
 }
