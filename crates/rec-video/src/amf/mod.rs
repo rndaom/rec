@@ -105,6 +105,8 @@ enum Load {
     Missing,
     /// Loaded but unusable; `version` if it could be queried.
     Failed {
+        // Only reported by `runtime_version`; the reason says it too.
+        #[cfg_attr(not(test), allow(dead_code))]
         version: Option<u64>,
         reason: String,
     },
@@ -182,7 +184,9 @@ fn runtime() -> Result<&'static Runtime, VideoError> {
 }
 
 /// The installed AMF runtime version ("major.minor.release"), or `None` when
-/// `amfrt64.dll` is absent or does not report one.
+/// `amfrt64.dll` is absent or does not report one. (Encoder names carry the
+/// version for everything else.)
+#[cfg(test)]
 pub(crate) fn runtime_version() -> Option<String> {
     match load() {
         Load::Ready(rt) => Some(format_version(rt.version)),
@@ -1179,6 +1183,10 @@ fn describe(c: &Ptr<ComponentVtbl>, n: &Names, codec: VideoCodec) -> String {
         show(c.get_i64(n.vbv_buffer_size)),
         show(gop),
         show(b_frames),
-        show(c.get_i64(n.quality_preset)),
+        // Each codec numbers its presets differently; only ours gets a name.
+        match c.get_i64(n.quality_preset) {
+            Some(p) if p == n.preset_balanced => "balanced".to_string(),
+            other => show(other),
+        },
     )
 }

@@ -29,14 +29,12 @@ pub(crate) struct Gpu {
     pub adapter_name: String,
     pub luid: LUID,
     /// PCI vendor id (0x1002 AMD, 0x10DE NVIDIA, 0x8086 Intel).
-    #[allow(dead_code)] // TEMP: used once the AMF backend is wired in
     pub vendor_id: u32,
     /// The adapter is the one whose output shows the target monitor.
     pub owns_monitor: bool,
 }
 
 /// PCI vendor id of AMD adapters.
-#[allow(dead_code)] // TEMP: used once the AMF backend is wired in
 pub(crate) const VENDOR_AMD: u32 = 0x1002;
 
 pub(crate) fn hwnd(raw: isize) -> HWND {

@@ -15,9 +15,11 @@ use rec_core::media::VideoCodec;
 use rec_core::time::Hns;
 use windows::Win32::Media::MediaFoundation::IMFSample;
 
+use crate::amf::{self, AmfEncoder, AmfParams};
 use crate::convert::Converter;
-use crate::d3d::Gpu;
-use crate::encoder::{Encoder, EncoderParams};
+use crate::d3d::{Gpu, VENDOR_AMD};
+use crate::encoder::{self, Encoder, EncoderParams};
+use crate::geometry::align_up;
 use crate::util::Context;
 use crate::{CodecPreference, EncoderBackend, VideoError};
 
@@ -25,8 +27,16 @@ pub(crate) struct Backend {
     kind: Kind,
 }
 
+// One per pipeline, never moved around: the size difference is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum Kind {
     MediaFoundation(Encoder),
+    Amf {
+        encoder: AmfEncoder,
+        /// The pool sample of every slot the encoder may still read, by slot.
+        /// Declared after `encoder` so the session goes first on drop.
+        in_flight: Vec<Option<IMFSample>>,
+    },
 }
 
 impl std::fmt::Debug for Backend {
@@ -39,7 +49,9 @@ impl std::fmt::Debug for Backend {
 
 impl Backend {
     /// Creates an encoder for `params` following `choice`, falling back to
-    /// Media Foundation. Notes about backends that were skipped go to `notes`.
+    /// Media Foundation. `Auto` means AMF on AMD GPUs (NVENC and oneVPL
+    /// backends do not exist yet). Notes about backends that were skipped go
+    /// to `notes`.
     pub(crate) fn create(
         gpu: &Gpu,
         choice: EncoderBackend,
@@ -47,9 +59,30 @@ impl Backend {
         params: &EncoderParams,
         notes: &mut Vec<String>,
     ) -> Result<Self, VideoError> {
-        let _ = choice;
+        let amd = gpu.vendor_id == VENDOR_AMD;
+        match choice {
+            EncoderBackend::Amf if !amd => notes.push(format!(
+                "AMD AMF needs an AMD GPU ({}); using Media Foundation",
+                gpu.adapter_name
+            )),
+            EncoderBackend::Amf | EncoderBackend::Auto if amd => {
+                match create_amf(gpu, codec, params) {
+                    Ok(encoder) => {
+                        return Ok(Self {
+                            kind: Kind::Amf {
+                                encoder,
+                                in_flight: Vec::new(),
+                            },
+                        });
+                    }
+                    Err(e) => {
+                        notes.push(format!("AMD AMF unavailable ({e}); using Media Foundation"))
+                    }
+                }
+            }
+            _ => {}
+        }
         let encoder = Encoder::new(&gpu.device, gpu.luid, &gpu.adapter_name, codec, params)?;
-        let _ = notes;
         Ok(Self {
             kind: Kind::MediaFoundation(encoder),
         })
@@ -58,12 +91,14 @@ impl Backend {
     pub(crate) fn name(&self) -> &str {
         match &self.kind {
             Kind::MediaFoundation(e) => &e.name,
+            Kind::Amf { encoder, .. } => encoder.name(),
         }
     }
 
     pub(crate) fn codec(&self) -> VideoCodec {
         match &self.kind {
             Kind::MediaFoundation(e) => e.codec,
+            Kind::Amf { encoder, .. } => encoder.codec(),
         }
     }
 
@@ -72,12 +107,14 @@ impl Backend {
     pub(crate) fn coded_size(&self) -> (u32, u32) {
         match &self.kind {
             Kind::MediaFoundation(e) => (e.width, e.height),
+            Kind::Amf { encoder, .. } => encoder.coded_size(),
         }
     }
 
     pub(crate) fn rate_control(&self) -> &str {
         match &self.kind {
             Kind::MediaFoundation(e) => &e.rate_control,
+            Kind::Amf { encoder, .. } => encoder.rate_control(),
         }
     }
 
@@ -85,6 +122,8 @@ impl Backend {
     pub(crate) fn sequence_header(&self) -> Option<&[u8]> {
         match &self.kind {
             Kind::MediaFoundation(e) => e.sequence_header.as_deref(),
+            // AMF announces nothing up front; every keyframe carries them.
+            Kind::Amf { .. } => None,
         }
     }
 
@@ -96,6 +135,12 @@ impl Backend {
     ) -> Result<(), VideoError> {
         match &mut self.kind {
             Kind::MediaFoundation(e) => e.poll(on_output),
+            Kind::Amf { encoder, in_flight } => encoder.poll(on_output, |slot| {
+                // Dropping the sample returns the surface to the pool.
+                if let Some(sample) = in_flight.get_mut(slot) {
+                    *sample = None;
+                }
+            }),
         }
     }
 
@@ -103,6 +148,8 @@ impl Backend {
     pub(crate) fn wants_input(&self) -> bool {
         match &self.kind {
             Kind::MediaFoundation(e) => e.wants_input(),
+            // AMF queues 16 frames and says so in `submit` when full.
+            Kind::Amf { .. } => true,
         }
     }
 
@@ -115,19 +162,71 @@ impl Backend {
         time: Hns,
         duration: Hns,
     ) -> Result<bool, VideoError> {
-        let sample = timed_sample(converter, slot, time, duration)?;
-        // Dropping our reference afterwards returns the surface to the pool
-        // as soon as the encoder is done with it.
         match &mut self.kind {
-            Kind::MediaFoundation(e) => e.submit(&sample),
+            Kind::MediaFoundation(e) => {
+                let sample = timed_sample(converter, slot, time, duration)?;
+                // Dropping our reference afterwards returns the surface to
+                // the pool as soon as the encoder is done with it.
+                e.submit(&sample)
+            }
+            Kind::Amf { encoder, in_flight } => {
+                // Taking the sample marks the slot busy until it is dropped.
+                let sample = converter.take_sample(slot)?;
+                let taken = encoder.submit(converter.texture(slot), slot, time, duration)?;
+                if taken {
+                    if in_flight.len() <= slot {
+                        in_flight.resize(slot + 1, None);
+                    }
+                    in_flight[slot] = Some(sample);
+                }
+                Ok(taken)
+            }
         }
     }
 
     pub(crate) fn set_bitrate(&mut self, kbps: u32) -> Result<u32, VideoError> {
         match &mut self.kind {
             Kind::MediaFoundation(e) => e.set_bitrate(kbps),
+            Kind::Amf { encoder, .. } => encoder.set_bitrate(kbps),
         }
     }
+}
+
+/// An AMF encoder for the first of `pref`'s codecs that works, at `params`'
+/// size padded to the codec's alignment (the pipeline centres the picture
+/// in it, as for Media Foundation).
+fn create_amf(
+    gpu: &Gpu,
+    pref: CodecPreference,
+    params: &EncoderParams,
+) -> Result<AmfEncoder, VideoError> {
+    let mut last = None;
+    for &codec in encoder::candidates(pref) {
+        if encoder::profile(codec, params.color).is_none() {
+            continue;
+        }
+        let created = amf::size_alignment(&gpu.device, codec).and_then(|(aw, ah)| {
+            AmfEncoder::new(
+                &gpu.device,
+                &AmfParams {
+                    codec,
+                    width: align_up(params.width, aw),
+                    height: align_up(params.height, ah),
+                    fps: params.fps,
+                    bitrate_kbps: params.bitrate_kbps,
+                    color: params.color,
+                },
+            )
+        });
+        match created {
+            Ok(encoder) => return Ok(encoder),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or(VideoError::NoEncoder {
+        codec: encoder::preference_name(pref),
+        adapter: gpu.adapter_name.clone(),
+    }))
 }
 
 fn timed_sample(

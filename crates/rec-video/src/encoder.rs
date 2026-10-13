@@ -226,7 +226,7 @@ fn coded_size(codec: VideoCodec, name: &str, width: u32, height: u32) -> (u32, u
 }
 
 /// Codecs to try for a preference, in order.
-fn candidates(pref: CodecPreference) -> &'static [VideoCodec] {
+pub(crate) fn candidates(pref: CodecPreference) -> &'static [VideoCodec] {
     match pref {
         CodecPreference::Auto => &[VideoCodec::Hevc, VideoCodec::H264],
         CodecPreference::Hevc => &[VideoCodec::Hevc],
