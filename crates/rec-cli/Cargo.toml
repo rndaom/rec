@@ -1,0 +1,18 @@
+[package]
+name = "rec-cli"
+description = "Command-line control for the rec background service."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "rec"
+path = "src/main.rs"
+
+[dependencies]
+rec-core = { path = "../rec-core" }

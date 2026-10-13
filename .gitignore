@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+
+# Tauri UI (added in a later milestone)
+/ui/node_modules
+/ui/dist
+/ui/src-tauri/target
+
+# Local test output
+*.mp4
+*.mkv
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

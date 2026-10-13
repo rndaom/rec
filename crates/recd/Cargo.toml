@@ -1,0 +1,14 @@
+[package]
+name = "recd"
+description = "rec background service: capture, encode, replay buffer, hotkeys, overlay."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rec-core = { path = "../rec-core" }
