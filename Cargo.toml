@@ -9,6 +9,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/rndaom/rec"
 rust-version = "1.85"
 
+[workspace.dependencies]
+rec-core = { path = "crates/rec-core" }
+# Each crate enables only the Win32/WinRT features it uses.
+windows = "0.62"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"

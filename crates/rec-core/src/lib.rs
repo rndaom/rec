@@ -9,5 +9,6 @@
 pub mod config;
 pub mod hotkey;
 pub mod ipc;
+pub mod media;
 pub mod replay;
 pub mod time;

@@ -15,4 +15,4 @@ name = "rec"
 path = "src/main.rs"
 
 [dependencies]
-rec-core = { path = "../rec-core" }
+rec-core.workspace = true
