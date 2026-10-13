@@ -4,12 +4,15 @@
 //! two minutes of 1440p video costs hundreds of megabytes rather than tens of
 //! gigabytes. Invariants:
 //!
-//! * When non-empty, the oldest packet is a video keyframe, so any snapshot can
-//!   be remuxed straight to a file without re-encoding.
+//! * When non-empty, the oldest *video* packet is a keyframe, so any snapshot
+//!   can be remuxed straight to a file without re-encoding.
 //! * Eviction removes whole GOPs (keyframe to next keyframe) from the oldest
 //!   end, and only while the remainder still covers the configured duration or
 //!   the byte budget is exceeded. A single GOP larger than the byte budget is
 //!   kept; GOPs are about one second long, so the overshoot is bounded.
+//! * Eviction keeps audio whose timestamp is at or after the new oldest
+//!   keyframe even if it arrived before it (video encoding has more latency
+//!   than audio), so clips covering the whole buffer don't start silent.
 //!
 //! The buffer is not synchronised; `recd` owns it behind a mutex. Snapshots
 //! clone `Arc`s, so taking one is cheap and the saver thread can mux it while
@@ -153,10 +156,20 @@ impl ReplayBuffer {
             }
 
             let drop_count = (next_seq - self.front_seq) as usize;
+            let mut kept = Vec::new();
             for packet in self.packets.drain(..drop_count) {
-                self.bytes -= packet.len();
+                if packet.track != self.video_track && packet.pts >= next_pts {
+                    kept.push(packet);
+                } else {
+                    self.bytes -= packet.len();
+                }
             }
-            self.front_seq = next_seq;
+            // Kept packets take the sequence numbers just before the new
+            // oldest keyframe; only video sequence numbers are ever compared.
+            self.front_seq = next_seq - kept.len() as u64;
+            for packet in kept.into_iter().rev() {
+                self.packets.push_front(packet);
+            }
             self.keyframes.pop_front();
         }
     }
@@ -308,6 +321,38 @@ mod tests {
         assert_eq!(audio.len(), 1);
         assert_eq!(audio[0].pts, millis(2050));
         assert_eq!(clip.iter().filter(|p| p.track == VIDEO).count(), 2);
+    }
+
+    #[test]
+    fn eviction_keeps_early_arriving_audio_of_the_new_first_gop() {
+        let mut buf = ReplayBuffer::new(VIDEO, unlimited(secs(2)));
+        fill_video(&mut buf, 2, 1);
+        // Audio for t=2.05s arrives before the t=2.0s keyframe.
+        buf.push(packet(AUDIO, millis(1950), false, 1));
+        buf.push(packet(AUDIO, millis(2050), false, 1));
+        for i in 20..50 {
+            buf.push(packet(VIDEO, millis(i * 100), i % 10 == 0, 1));
+        }
+        // Buffer now starts at the t=2s keyframe; the t=2.05s audio survived.
+        let clip = buf.snapshot(Hns::MIN, None);
+        let first_video = clip.iter().find(|p| p.track == VIDEO).unwrap();
+        assert_eq!(first_video.pts, secs(2));
+        let audio: Vec<_> = clip
+            .iter()
+            .filter(|p| p.track == AUDIO)
+            .map(|p| p.pts)
+            .collect();
+        assert_eq!(audio, vec![millis(2050)]);
+        assert_eq!(buf.bytes(), clip.len());
+
+        // Keeps working as more GOPs are evicted.
+        for i in 50..70 {
+            buf.push(packet(VIDEO, millis(i * 100), i % 10 == 0, 1));
+        }
+        let clip = buf.snapshot(Hns::MIN, None);
+        assert_eq!(clip[0].pts, secs(4));
+        assert!(clip.iter().all(|p| p.track == VIDEO));
+        assert_eq!(buf.bytes(), clip.len());
     }
 
     #[test]

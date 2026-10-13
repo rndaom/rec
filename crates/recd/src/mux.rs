@@ -1,4 +1,4 @@
-//! Clip file writing. Placeholder until `rec-mux` is merged.
+//! Clip file writing via `rec-mux`.
 
 use std::io::{Seek, Write};
 
@@ -6,9 +6,12 @@ use rec_core::media::TrackInfo;
 use rec_core::replay::Packet;
 
 pub fn write<W: Write + Seek>(
-    _out: W,
-    _tracks: Vec<TrackInfo>,
-    _packets: &[Packet],
+    out: W,
+    tracks: Vec<TrackInfo>,
+    packets: &[Packet],
 ) -> Result<(), String> {
-    Err("the MP4 writer is not available in this build".into())
+    let mut out = rec_mux::write_clip(out, tracks, packets)
+        .map_err(|e| format!("could not write the clip: {e}"))?;
+    out.flush()
+        .map_err(|e| format!("could not write the clip: {e}"))
 }

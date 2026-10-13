@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 rec-core.workspace = true
+rec-mux = { path = "../rec-mux" }
 
 [dependencies.windows]
 workspace = true

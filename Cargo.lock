@@ -84,6 +84,7 @@ name = "recd"
 version = "0.0.1"
 dependencies = [
  "rec-core",
+ "rec-mux",
  "windows",
 ]
 
