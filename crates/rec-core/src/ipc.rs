@@ -4,7 +4,11 @@
 //! Transport is a per-user named pipe carrying one JSON object per line: the
 //! client writes a [`Request`], the service answers with one [`Response`].
 
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -95,6 +99,48 @@ pub fn encode_line<T: Serialize>(message: &T) -> String {
 
 pub fn decode_line<T: DeserializeOwned>(line: &str) -> Result<T, serde_json::Error> {
     serde_json::from_str(line.trim_end())
+}
+
+/// Windows `ERROR_PIPE_BUSY`: every pipe instance is serving another client.
+const ERROR_PIPE_BUSY: i32 = 231;
+
+/// The error [`send`] returns when `recd` is not running (the pipe does not
+/// exist). Callers that need to tell "not running" from a real failure compare
+/// against this.
+pub const NOT_RUNNING: &str = "rec is not running (start recd first)";
+
+/// Opens the service's pipe, waiting briefly while it is busy: the server has
+/// a small fixed pool of instances, so a burst of clients can see
+/// `ERROR_PIPE_BUSY` for a few milliseconds.
+fn connect() -> io::Result<File> {
+    let name = pipe_name();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match OpenOptions::new().read(true).write(true).open(&name) {
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Sends one request to the running service and returns its response. Errors
+/// are phrased for a user: this is what the `rec` CLI prints.
+pub fn send(request: &Request) -> Result<Response, String> {
+    let mut pipe = connect().map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => NOT_RUNNING.to_string(),
+        _ => format!("could not connect to rec: {e}"),
+    })?;
+    pipe.write_all(encode_line(request).as_bytes())
+        .and_then(|()| pipe.flush())
+        .map_err(|e| format!("could not send request: {e}"))?;
+
+    let mut line = String::new();
+    BufReader::new(&pipe)
+        .read_line(&mut line)
+        .map_err(|e| format!("could not read response: {e}"))?;
+    decode_line(&line).map_err(|e| format!("invalid response from rec: {e}"))
 }
 
 #[cfg(test)]

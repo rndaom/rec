@@ -65,6 +65,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rec-bench"
+version = "0.0.1"
+dependencies = [
+ "rec-core",
+ "serde",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
 name = "rec-cli"
 version = "0.0.1"
 dependencies = [

@@ -7,7 +7,9 @@ rec runs quietly in the background and keeps the last minute (or however long yo
 > **Status: pre-alpha (milestone 1 done).** rec records games, keeps a replay buffer and saves clips with sound. There is no settings UI yet (edit the config file from the tray menu), no installer, and only one combined audio track. See the [roadmap](docs/roadmap.md).
 
 ## Measured cost
-These are early numbers from one machine (Ryzen 7 9800X3D, RX 7800 XT, Windows 11 25H2). They were taken while recording a live Deadlock match at 1080p60, HEVC, 18 Mbit/s, with a 60 s buffer. Proper PresentMon frame-time benchmarks are next on the roadmap.
+These are early numbers from one machine (Ryzen 7 9800X3D, RX 7800 XT, Windows 11 25H2). They were taken while recording a live Deadlock match at 1080p60, HEVC, 18 Mbit/s, with a 60 s buffer. Proper PresentMon frame-time benchmarks are still to be run.
+
+`rec-bench` ([bench/README.md](bench/README.md)) measures these costs: it compares PresentMon captures with `recd` off and on and reads `recd`'s CPU and memory. The figures in the table below were taken before it existed.
 
 | | `recd` |
 |---|---|
@@ -38,6 +40,10 @@ crates/
   rec-mux/    fragmented MP4 writer (H.264 / HEVC / AV1, multi-track AAC)
   recd/       background service: tray, hotkeys, game detection, sessions, saving
   rec-cli/    `rec` command-line control (rec save 30, rec status, ...)
+  rec-bench/  benchmark harness: PresentMon with and without recd, recd idle cost
+bench/
+  README.md     how to run a fair benchmark and read the results
+  results/      published summaries (raw PresentMon CSVs are git-ignored)
 docs/
   research.md   competitor and technical research
   decisions.md  architecture decisions and why
