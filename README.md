@@ -4,7 +4,17 @@ A free, open-source instant-replay recorder for Windows that stays out of your g
 
 rec runs quietly in the background and keeps the last minute (or however long you choose) of your game. Press **Alt+F8** and that moment is saved as a clip. That's the whole idea. It works in any game or app, needs no account, never uploads anything, and is built so your game keeps its frame rate.
 
-> **Status: pre-alpha.** The foundation is in place (config, hotkeys, IPC protocol, replay buffer, CLI). Capture and encoding are next. See the [roadmap](docs/roadmap.md).
+> **Status: pre-alpha (milestone 1 done).** rec records games, keeps a replay buffer and saves clips with sound. There is no settings UI yet (edit the config file from the tray menu), no installer, and only one combined audio track. See the [roadmap](docs/roadmap.md).
+
+## Measured cost
+These are early numbers from one machine (Ryzen 7 9800X3D, RX 7800 XT, Windows 11 25H2). They were taken while recording a live Deadlock match at 1080p60, HEVC, 18 Mbit/s, with a 60 s buffer. Proper PresentMon frame-time benchmarks are next on the roadmap.
+
+| | `recd` |
+|---|---|
+| CPU | 0.34% of total (5.5% of one core) |
+| Memory | 127 MB private, including the replay buffer |
+| Binary size | 1.2 MB |
+| Saving a 15 s clip | Remux on a low-priority thread, no re-encode |
 
 ## Goals
 - **Game first.**
@@ -23,7 +33,10 @@ rec runs quietly in the background and keeps the last minute (or however long yo
 ```
 crates/
   rec-core/   platform-independent core: config, hotkeys, IPC protocol, replay buffer
-  recd/       background service: capture, encode, hotkeys, tray, overlay
+  rec-video/  Windows.Graphics.Capture -> GPU colour conversion -> hardware encoder
+  rec-audio/  WASAPI loopback and microphone -> AAC
+  rec-mux/    fragmented MP4 writer (H.264 / HEVC / AV1, multi-track AAC)
+  recd/       background service: tray, hotkeys, game detection, sessions, saving
   rec-cli/    `rec` command-line control (rec save 30, rec status, ...)
 docs/
   research.md   competitor and technical research
@@ -41,6 +54,15 @@ cargo build --release
 ```bash
 cargo test
 ```
+
+## Running
+Start `targeteleaseecd.exe`. A dot appears in the notification area:
+- **Red:** recording.
+- **Grey ring:** waiting for a game.
+- **Amber:** paused.
+- **Orange ring:** a problem. Hover over it or open its menu to see why.
+
+Start a game and press **Alt+F8** to save the last 60 seconds to `Videosec\<game>\`.
 
 ## Using the CLI
 ```bash

@@ -12,7 +12,9 @@ workspace = true
 
 [dependencies]
 rec-core.workspace = true
+rec-audio = { path = "../rec-audio" }
 rec-mux = { path = "../rec-mux" }
+rec-video = { path = "../rec-video" }
 
 [dependencies.windows]
 workspace = true

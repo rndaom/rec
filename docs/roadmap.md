@@ -7,37 +7,58 @@
 - [x] `rec` CLI client
 - [x] `recd` stub: load/validate/write config, warn about hotkey conflicts
 
-## M1: It clips
-The goal of M1 is that pressing the hotkey in a borderless game saves a playable MP4 with sound.
-- [ ] `recd`:
-  - [ ] Windows subsystem, single instance, tray icon with health state (recording / idle / error + reason)
-  - [ ] Named-pipe IPC server implementing `rec-core::ipc`
-  - [ ] Game detection: foreground window hook, fullscreen heuristics, allow/ignore lists
-  - [ ] Idle teardown when no game is running
-- [ ] Capture:
-  - [ ] WGC window and display capture, D3D11 device on the adapter that owns the output (LUID)
-  - [ ] Fixed encode tick
-  - [ ] DDA fallback
-- [ ] GPU BGRA→NV12 (D3D11 video processor)
-- [ ] Media Foundation hardware encoder: H.264 + HEVC, IDR every 1 s, no B-frames, capped VBR
-- [ ] Audio:
-  - [ ] WASAPI endpoint loopback + mic, QPC timestamps, silence fill
-  - [ ] Media Foundation AAC encoding
-- [ ] Save:
-  - [ ] Replay buffer wired up
-  - [ ] Save hotkey (`RegisterHotKey`)
-  - [ ] Fragmented-MP4 writer with multi-track audio
-- [ ] Feedback: "clip saved" sound + non-activating toast
-- [ ] Benchmark harness: PresentMon runs scripted against a test game, results in `bench/`
+## M1: It clips ✅
+Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a live Deadlock match (RX 7800 XT, 1080p60 HEVC):
+- 15.7 s clip, decodes cleanly, game audio present.
+- `recd` used 0.34% of total CPU (5.5% of one core).
+- 127 MB private memory, including a 39 MB replay buffer.
+
+**`recd`**
+- [x] Windows subsystem, single instance, tray icon with health state (recording / idle / paused / error + reason)
+- [x] Named-pipe IPC server implementing `rec-core::ipc` (`rec status`, `rec save 30`, `rec pause`, …)
+- [x] Game detection: out-of-context foreground hook, fullscreen heuristics, store-library paths, allow/ignore/private lists
+- [x] Friendly game names
+- [x] Idle teardown when the game closes
+
+**`rec-video`**
+- [x] WGC window and display capture with the border turned off
+- [x] D3D11 device on the adapter that owns the output
+- [x] Fixed encode tick
+- [x] GPU BGRA→NV12 + scaling/letterbox
+- [x] Media Foundation hardware encoder: H.264 + HEVC, IDR every 1 s, no B-frames, peak-constrained VBR
+
+**`rec-audio`**
+- [x] WASAPI loopback + mic, converted to 48 kHz stereo by the audio engine
+- [x] QPC timeline with silence fill and drift correction
+- [x] Follows default-device changes
+- [x] Media Foundation AAC
+
+**`rec-mux`**
+- [x] Fragmented MP4 (H.264 / HEVC / AV1 + multi-track AAC)
+- [x] Crash-safe
+- [x] Streaming post-roll
+
+**Saving and feedback**
+- [x] Save hotkey and post-roll
+- [x] Low-priority (EcoQoS) save thread, folder per game, filename template
+- [x] "Clip saved" sound + non-activating toast, excluded from capture
+
+**Moved to M2**
+- DDA fallback; the benchmark harness
 
 ## M2: It's good
-- [ ] Per-process audio tracks: game, voice chat, mic, other apps, plus a mixed track
+- [ ] Benchmark harness: PresentMon/CapFrameX runs with and without `recd`, results in `bench/` and the README
+- [ ] Per-process audio tracks (game, voice chat, mic, other apps) + mixed track (`AudioSource::ProcessLoopback`)
 - [ ] Native NVENC / AMF / oneVPL backends; AV1; encoder capability probing and fallback chain
 - [ ] HDR: FP16 capture → HEVC Main10 PQ with HDR10 metadata, or tone-map to SDR
 - [ ] Quick-panel overlay (DirectComposition, excluded from capture), keyboard and mouse navigation
-- [ ] Per-game profiles; post-roll; extra clip-length hotkeys; marker hotkey; controller combo
-- [ ] Folder per game, filename template, storage quota with auto-prune (starred clips kept)
-- [ ] Windows 10 path: DDA cropped to the game window; hybrid-GPU handling; device-lost / driver-update / resolution-change recovery without losing the buffer
+- [ ] Per-game profiles; extra clip-length hotkeys in the UI; marker hotkey; controller combo
+- [ ] Storage quota with auto-prune (starred clips kept)
+- [ ] Windows 10 path: DDA fallback (monitor capture without the yellow border)
+- [ ] Exclusive-fullscreen black-frame detection with a "switch to borderless" hint
+- [ ] Hybrid-GPU handling; device-lost / driver-update / resolution-change recovery without losing the buffer
+- [ ] Adaptive GPU priority when frames drop under full GPU load
+- [ ] Cached silent AAC packet instead of encoding silence
 
 ## M3: Library
 - [ ] `rec-ui` (Tauri 2 + Svelte 5): settings, clip library, lossless trim, star / delete (Recycle Bin)

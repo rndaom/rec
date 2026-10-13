@@ -103,8 +103,10 @@ dependencies = [
 name = "recd"
 version = "0.0.1"
 dependencies = [
+ "rec-audio",
  "rec-core",
  "rec-mux",
+ "rec-video",
  "windows",
 ]
 

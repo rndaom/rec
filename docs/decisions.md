@@ -41,7 +41,7 @@ Capture uses only OS compositor APIs (WGC, DDA). We do no DLL injection, no grap
 2. **Native NVENC / AMF / oneVPL** backends follow, loaded at runtime from the GPU driver's own DLLs. They give finer rate control, AV1 on drivers whose MF encoder lacks it, and handling of session limits.
 3. The software fallback is Microsoft's built-in H.264 encoder, opt-in only.
 
-**Audio encode:** Media Foundation AAC, built into Windows.
+**Audio encode:** Media Foundation AAC, built into Windows. Input is always 48 kHz 16-bit stereo, produced by WASAPI's own `AUTOCONVERTPCM` conversion, so a device change never changes the track format.
 
 **Muxing:** our own fragmented-MP4 writer (and later MKV). It is a few hundred lines with full control over crash safety, multiple audio tracks and segment changes.
 
