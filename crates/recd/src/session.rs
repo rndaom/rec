@@ -6,12 +6,14 @@
 use std::sync::{Arc, Mutex};
 
 use rec_audio::{AudioCapture, AudioCaptureConfig, AudioInput, AudioSource, ProcessTarget};
-use rec_core::config::{AudioConfig, Codec, Config, Quality, VideoConfig};
+use rec_core::config::{
+    AudioConfig, Codec, Config, EncoderPreference, HdrMode, Quality, VideoConfig,
+};
 use rec_core::media::{TrackInfo, TrackKind, VIDEO_TRACK, VideoFormat};
 use rec_core::replay::{Limits, Packet, ReplayBuffer, TrackId};
 use rec_core::time::{Hns, as_secs_f64, qpc_now, secs};
 use rec_video::geometry::output_size;
-use rec_video::{CaptureSource, CodecPreference, VideoCapture, VideoCaptureConfig};
+use rec_video::{CaptureSource, CodecPreference, EncoderBackend, VideoCapture, VideoCaptureConfig};
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
@@ -25,7 +27,7 @@ use windows::core::BOOL;
 
 use crate::detect;
 use crate::log::{info, warning};
-use crate::recover::Recovery;
+use crate::recover::{DisplayChange, Recovery};
 use crate::watch::{Observation, Problem, Watcher};
 use crate::win::Hwnd;
 
@@ -345,9 +347,25 @@ fn open_video(
     buffer_seconds: u32,
 ) -> Result<(VideoCapture, VideoFormat, u32, String), String> {
     let codec = match v.codec {
-        Codec::Auto | Codec::Av1 => CodecPreference::Auto,
+        Codec::Auto => CodecPreference::Auto,
         Codec::H264 => CodecPreference::H264,
         Codec::Hevc => CodecPreference::Hevc,
+        Codec::Av1 => CodecPreference::Av1,
+    };
+    // NVIDIA and Intel have no native backend yet; their Media Foundation
+    // encoders are the same hardware.
+    let encoder = match v.encoder {
+        EncoderPreference::Auto => EncoderBackend::Auto,
+        EncoderPreference::Amd => EncoderBackend::Amf,
+        EncoderPreference::MediaFoundation
+        | EncoderPreference::Nvidia
+        | EncoderPreference::Intel
+        | EncoderPreference::Software => EncoderBackend::MediaFoundation,
+    };
+    let hdr = match v.hdr {
+        HdrMode::Auto => rec_video::HdrMode::Auto,
+        HdrMode::Tonemap => rec_video::HdrMode::Tonemap,
+        HdrMode::Off => rec_video::HdrMode::Off,
     };
     let (src_w, src_h) = source_size(source, target.hwnd);
     let (out_w, out_h) = output_size(src_w, src_h, v.max_height);
@@ -368,30 +386,44 @@ fn open_video(
         fps: v.fps,
         max_height: v.max_height,
         codec,
+        encoder,
+        hdr,
+        assume_hdr_display: assume_hdr_display(),
         bitrate_kbps,
         cursor: v.cursor,
         track: VIDEO_TRACK,
         segment,
     };
     let video = VideoCapture::start(config, sink(buffer)).map_err(|e| e.to_string())?;
+    for note in &video.info().notes {
+        warning!("video: {note}");
+    }
     let format = video.info().format.clone();
     let description = describe(&video, bitrate_kbps);
     Ok((video, format, bitrate_kbps, description))
 }
 
-/// E.g. "HEVC 2560x1440@60 18 Mbit/s · AMD Radeon RX 7800 XT".
+/// E.g. "HEVC 2560x1440@60 HDR10 18 Mbit/s · AMD Radeon RX 7800 XT".
 fn describe(video: &VideoCapture, bitrate_kbps: u32) -> String {
     let info = video.info();
     let f = &info.format;
     format!(
-        "{} {}x{}@{} {} Mbit/s · {}",
+        "{} {}x{}@{}{} {} Mbit/s · {}",
         f.codec.name(),
         f.width,
         f.height,
         f.fps,
+        if f.color.is_hdr() { " HDR10" } else { "" },
         crate::panel::mbit(bitrate_kbps),
         info.adapter_name
     )
+}
+
+/// Debug builds only: `REC_DEBUG_ASSUME_HDR=1` records as if the display
+/// were in HDR mode (FP16 capture, HDR10 or tone-mapped clips), to test the
+/// HDR path without switching the display.
+fn assume_hdr_display() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("REC_DEBUG_ASSUME_HDR").is_some()
 }
 
 impl Session {
@@ -425,8 +457,19 @@ impl Session {
         } else {
             CaptureSource::Window(target.hwnd.0)
         };
-        if v.codec == Codec::Av1 {
-            warning!("AV1 encoding is not available yet; using HEVC/H.264");
+        match v.encoder {
+            EncoderPreference::Nvidia | EncoderPreference::Intel => info!(
+                "no native {} encoder backend yet; using its Media Foundation encoder",
+                if v.encoder == EncoderPreference::Nvidia {
+                    "NVIDIA"
+                } else {
+                    "Intel"
+                }
+            ),
+            EncoderPreference::Software => {
+                warning!("software encoding is not supported yet; using the hardware encoder")
+            }
+            _ => {}
         }
         let (video, format, bitrate_kbps, description) = open_video(
             &target,
@@ -520,13 +563,21 @@ impl Session {
             return self.retry_later(now, reason, retry);
         }
         let info = video.info();
-        let encoded = (info.format.width, info.format.height);
+        let encoded = (info.picture_width, info.picture_height);
         let wanted = stats
             .source_size
             .map(|(w, h)| output_size(w, h, self.settings.max_height));
-        let adapter_moved =
-            rec_video::adapter_for(self.source).is_ok_and(|luid| luid != info.adapter_luid);
-        match self.recovery.check(now, encoded, wanted, adapter_moved) {
+        let display = rec_video::display_for(self.source).ok().and_then(|d| {
+            if d.adapter_luid != info.adapter_luid {
+                return Some(DisplayChange::Adapter);
+            }
+            // With HDR off rec captures SDR either way, and an assumed HDR
+            // display never changes.
+            let on = d.color?.hdr;
+            (self.settings.hdr != HdrMode::Off && !assume_hdr_display() && on != info.display_hdr)
+                .then_some(DisplayChange::Hdr { on })
+        });
+        match self.recovery.check(now, encoded, wanted, display) {
             Some(change) => self.restart_video(now, Some(&change.to_string())),
             None => Health::Ok,
         }

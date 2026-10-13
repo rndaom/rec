@@ -22,6 +22,10 @@
 //!   GPU, or a hybrid laptop switches its panel to the other GPU (Advanced
 //!   Optimus, AMD Smart Access Graphics), the pipeline follows once the
 //!   change has held for [`SETTLE`].
+//! - **HDR switched** on or off for the source's display (Win+Alt+B, or the
+//!   window moved to a display in the other mode): the capture format and
+//!   the encoded colour depend on it, so the pipeline restarts in the new
+//!   mode once it has held for [`SETTLE`].
 
 use std::fmt;
 
@@ -49,6 +53,17 @@ pub enum Change {
     Resized { from: (u32, u32), to: (u32, u32) },
     /// The source is now shown by another GPU.
     Adapter,
+    /// HDR is now on (or off) for the source's display.
+    Hdr { on: bool },
+}
+
+/// What changed about the display showing the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayChange {
+    /// It is driven by another GPU now.
+    Adapter,
+    /// Its HDR mode differs from the pipeline's.
+    Hdr { on: bool },
 }
 
 impl fmt::Display for Change {
@@ -58,6 +73,8 @@ impl fmt::Display for Change {
                 write!(f, "size {}x{} -> {}x{}", from.0, from.1, to.0, to.1)
             }
             Change::Adapter => f.write_str("the source moved to another GPU"),
+            Change::Hdr { on: true } => f.write_str("HDR was turned on for the display"),
+            Change::Hdr { on: false } => f.write_str("HDR was turned off for the display"),
         }
     }
 }
@@ -83,7 +100,7 @@ pub struct Recovery {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pending {
     Size((u32, u32)),
-    Adapter,
+    Display(DisplayChange),
 }
 
 impl Recovery {
@@ -136,14 +153,16 @@ impl Recovery {
         self.retry_at.is_some_and(|at| now >= at)
     }
 
-    /// Whether the running pipeline, encoding at `encoded`, should restart
-    /// because the source now calls for `wanted` or is shown by another GPU.
+    /// Whether the running pipeline, encoding a picture of `encoded` size,
+    /// should restart because the source now calls for `wanted`, or its
+    /// display changed. A display change wins over a size change: the
+    /// restart picks up the new size anyway.
     pub fn check(
         &mut self,
         now: Hns,
         encoded: (u32, u32),
         wanted: Option<(u32, u32)>,
-        adapter_moved: bool,
+        display: Option<DisplayChange>,
     ) -> Option<Change> {
         if wanted != self.unreachable {
             self.unreachable = None;
@@ -151,8 +170,8 @@ impl Recovery {
         let size = wanted.filter(|&(w, h)| {
             (w, h) != encoded && w >= MIN_SIDE && h >= MIN_SIDE && Some((w, h)) != self.unreachable
         });
-        let seen = if adapter_moved {
-            Pending::Adapter
+        let seen = if let Some(change) = display {
+            Pending::Display(change)
         } else if let Some(size) = size {
             Pending::Size(size)
         } else {
@@ -166,7 +185,8 @@ impl Recovery {
                 }
                 self.pending = None;
                 Some(match seen {
-                    Pending::Adapter => Change::Adapter,
+                    Pending::Display(DisplayChange::Adapter) => Change::Adapter,
+                    Pending::Display(DisplayChange::Hdr { on }) => Change::Hdr { on },
                     Pending::Size(to) => {
                         self.resized_to = Some(to);
                         Change::Resized { from: encoded, to }
@@ -221,61 +241,98 @@ mod tests {
     #[test]
     fn a_new_size_must_settle_before_a_restart() {
         let mut r = Recovery::new(0);
-        assert_eq!(r.check(2 * S, HD, Some(HD), false), None);
+        assert_eq!(r.check(2 * S, HD, Some(HD), None), None);
         // Dragging a window edge: the size keeps changing.
-        assert_eq!(r.check(4 * S, HD, Some((1000, 700)), false), None);
-        assert_eq!(r.check(6 * S, HD, Some((1100, 750)), false), None);
+        assert_eq!(r.check(4 * S, HD, Some((1000, 700)), None), None);
+        assert_eq!(r.check(6 * S, HD, Some((1100, 750)), None), None);
         // It holds.
-        assert_eq!(r.check(8 * S, HD, Some(QHD), false), None);
+        assert_eq!(r.check(8 * S, HD, Some(QHD), None), None);
         assert_eq!(
-            r.check(10 * S, HD, Some(QHD), false),
+            r.check(10 * S, HD, Some(QHD), None),
             Some(Change::Resized { from: HD, to: QHD })
         );
         r.started(10 * S, QHD);
-        assert_eq!(r.check(12 * S, QHD, Some(QHD), false), None);
+        assert_eq!(r.check(12 * S, QHD, Some(QHD), None), None);
     }
 
     #[test]
     fn going_back_cancels_a_pending_resize() {
         let mut r = Recovery::new(0);
-        assert_eq!(r.check(2 * S, HD, Some(QHD), false), None);
-        assert_eq!(r.check(4 * S, HD, Some(HD), false), None);
-        assert_eq!(r.check(6 * S, HD, Some(QHD), false), None);
+        assert_eq!(r.check(2 * S, HD, Some(QHD), None), None);
+        assert_eq!(r.check(4 * S, HD, Some(HD), None), None);
+        assert_eq!(r.check(6 * S, HD, Some(QHD), None), None);
     }
 
     #[test]
     fn minimized_windows_and_no_frames_are_ignored() {
         let mut r = Recovery::new(0);
         for t in 1..10 {
-            assert_eq!(r.check(t * S, HD, Some((160, 28)), false), None);
-            assert_eq!(r.check(t * S, HD, None, false), None);
+            assert_eq!(r.check(t * S, HD, Some((160, 28)), None), None);
+            assert_eq!(r.check(t * S, HD, None, None), None);
         }
     }
 
     #[test]
     fn a_size_the_restart_did_not_reach_is_not_chased() {
         let mut r = Recovery::new(0);
-        r.check(0, HD, Some(QHD), false);
-        assert!(r.check(2 * S, HD, Some(QHD), false).is_some());
+        r.check(0, HD, Some(QHD), None);
+        assert!(r.check(2 * S, HD, Some(QHD), None).is_some());
         // The new pipeline opened at another size than the frames report.
         r.started(2 * S, (2560, 1400));
         for t in 3..20 {
-            assert_eq!(r.check(t * S, (2560, 1400), Some(QHD), false), None);
+            assert_eq!(r.check(t * S, (2560, 1400), Some(QHD), None), None);
         }
         // A different size later is followed again.
-        r.check(20 * S, (2560, 1400), Some(HD), false);
-        assert!(r.check(22 * S, (2560, 1400), Some(HD), false).is_some());
+        r.check(20 * S, (2560, 1400), Some(HD), None);
+        assert!(r.check(22 * S, (2560, 1400), Some(HD), None).is_some());
+    }
+
+    #[test]
+    fn switching_hdr_restarts_once_settled() {
+        let mut r = Recovery::new(0);
+        let on = Some(DisplayChange::Hdr { on: true });
+        assert_eq!(r.check(S, HD, Some(HD), on), None);
+        assert_eq!(r.check(2 * S, HD, Some(HD), on), None);
+        assert_eq!(
+            r.check(3 * S, HD, Some(HD), on),
+            Some(Change::Hdr { on: true })
+        );
+        // Toggled straight back: nothing to do.
+        let mut r = Recovery::new(0);
+        assert_eq!(r.check(S, HD, Some(HD), on), None);
+        assert_eq!(r.check(2 * S, HD, Some(HD), None), None);
+        assert_eq!(r.check(4 * S, HD, Some(HD), None), None);
+        // A display change wins over a pending size change.
+        let mut r = Recovery::new(0);
+        assert_eq!(r.check(S, HD, Some(QHD), None), None);
+        assert_eq!(r.check(2 * S, HD, Some(QHD), on), None);
+        assert_eq!(
+            r.check(4 * S, HD, Some(QHD), on),
+            Some(Change::Hdr { on: true })
+        );
     }
 
     #[test]
     fn moving_to_another_gpu_restarts_once_settled() {
         let mut r = Recovery::new(0);
-        assert_eq!(r.check(2 * S, HD, Some(HD), true), None);
-        assert_eq!(r.check(4 * S, HD, Some(HD), true), Some(Change::Adapter));
+        assert_eq!(
+            r.check(2 * S, HD, Some(HD), Some(DisplayChange::Adapter)),
+            None
+        );
+        assert_eq!(
+            r.check(4 * S, HD, Some(HD), Some(DisplayChange::Adapter)),
+            Some(Change::Adapter)
+        );
         // A brief flip back and forth does not.
         let mut r = Recovery::new(0);
-        assert_eq!(r.check(2 * S, HD, Some(HD), true), None);
-        assert_eq!(r.check(4 * S, HD, Some(HD), false), None);
-        assert_eq!(r.check(6 * S, HD, Some(HD), true), None);
+        assert_eq!(
+            r.check(2 * S, HD, Some(HD), Some(DisplayChange::Adapter)),
+            None
+        );
+        assert_eq!(r.check(4 * S, HD, Some(HD), None), None);
+        assert_eq!(
+            r.check(6 * S, HD, Some(HD), Some(DisplayChange::Adapter)),
+            None
+        );
     }
 }

@@ -7,6 +7,10 @@
 //! sparse grid of luma samples is read. Cost: one GPU copy and ~32k byte
 //! reads every two seconds at 1080p.
 //!
+//! P010 (HDR10) pictures are read through the high byte of each 16-bit
+//! sample: the 10-bit code sits in the top bits, so the high byte is the
+//! code at 8-bit scale, and the limited-range black level lines up.
+//!
 //! True exclusive fullscreen (Windows 11 26200, AMD) shows up exactly like
 //! this: capture keeps delivering frames, fewer of them, all black apart
 //! from the cursor. recd's `watch` module turns that into advice.
@@ -23,15 +27,22 @@ const BLACK_MAX_LUMA: u8 = 24;
 /// the capture) or a tiny overlay on a black picture still counts as black.
 const BRIGHT_ALLOWED_PER: usize = 1000;
 
-/// Whether a luma plane (`pitch` bytes per row) is black, apart from a few
-/// samples.
-pub(crate) fn is_black(plane: &[u8], pitch: usize, width: usize, height: usize) -> bool {
+/// Whether a luma plane (`pitch` bytes per row, `bytes` per little-endian
+/// sample) is black, apart from a few samples.
+pub(crate) fn is_black(
+    plane: &[u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+    bytes: usize,
+) -> bool {
     let (mut samples, mut bright) = (0, 0);
     for y in (0..height).step_by(STEP) {
-        let Some(row) = plane.get(y * pitch..y * pitch + width) else {
+        let Some(row) = plane.get(y * pitch..y * pitch + width * bytes) else {
             break;
         };
-        for &v in row.iter().step_by(STEP) {
+        // The most significant byte of each sample.
+        for &v in row.iter().skip(bytes - 1).step_by(STEP * bytes) {
             samples += 1;
             bright += usize::from(v > BLACK_MAX_LUMA);
         }
@@ -52,7 +63,7 @@ mod imp {
         D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Device,
         ID3D11DeviceContext, ID3D11Texture2D,
     };
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC};
 
     use super::{PROBE_EVERY, is_black};
     use crate::SharedStats;
@@ -63,6 +74,8 @@ mod imp {
         staging: ID3D11Texture2D,
         width: u32,
         height: u32,
+        /// Bytes per luma sample: 1 (NV12) or 2 (P010).
+        bytes: usize,
         /// A copy is in flight.
         copied: bool,
         next: Hns,
@@ -75,13 +88,14 @@ mod imp {
             device: &ID3D11Device,
             width: u32,
             height: u32,
+            format: DXGI_FORMAT,
         ) -> Result<Self, VideoError> {
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
                 Height: height,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
+                Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -100,13 +114,14 @@ mod imp {
                     .ok_or_else(|| VideoError::Other("CreateTexture2D returned null".into()))?,
                 width,
                 height,
+                bytes: if format == DXGI_FORMAT_P010 { 2 } else { 1 },
                 copied: false,
                 next: 0,
                 black_since: None,
             })
         }
 
-        /// Called after `picture` (an NV12 texture of the probe's size) was
+        /// Called after `picture` (a texture of the probe's size and format) was
         /// converted for the tick at `time`: copies it if a check is due.
         pub(crate) fn offer(
             &mut self,
@@ -156,7 +171,7 @@ mod imp {
             // bytes at pData (the UV plane follows it).
             let plane =
                 unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, pitch * height) };
-            let black = is_black(plane, pitch, width, height);
+            let black = is_black(plane, pitch, width, height, self.bytes);
             // SAFETY: mapped above.
             unsafe { context.Unmap(&self.staging, 0) };
             self.copied = false;
@@ -184,7 +199,7 @@ mod tests {
         plane[pitch * 8 + 16] = 24;
         // Padding past the width is ignored.
         plane[pitch - 1] = 255;
-        assert!(is_black(&plane, pitch, w, h));
+        assert!(is_black(&plane, pitch, w, h, 1));
     }
 
     #[test]
@@ -195,18 +210,35 @@ mod tests {
         for y in 500..532 {
             plane[y * w + 900..y * w + 932].fill(235);
         }
-        assert!(is_black(&plane, w, w, h));
+        assert!(is_black(&plane, w, w, h, 1));
         // A 200x100 lit HUD panel.
         for y in 100..200 {
             plane[y * w + 100..y * w + 300].fill(120);
         }
-        assert!(!is_black(&plane, w, w, h));
+        assert!(!is_black(&plane, w, w, h, 1));
     }
 
     #[test]
     fn a_dark_scene_is_not_black() {
         let (w, h) = (64, 64);
         let plane: Vec<u8> = (0..w * h).map(|i| 18 + (i % 13) as u8).collect();
-        assert!(!is_black(&plane, w, w, h));
+        assert!(!is_black(&plane, w, w, h, 1));
+    }
+
+    #[test]
+    fn p010_black_reads_the_high_byte() {
+        let (w, h) = (64, 32);
+        // 10-bit limited-range black (64) in the top bits: 64 << 6.
+        let black = (64u16 << 6).to_le_bytes();
+        let mut plane: Vec<u8> = black.repeat(w * h);
+        assert!(is_black(&plane, w * 2, w, h, 2));
+        // Mid grey (512 << 6) everywhere in the left half.
+        let grey = (512u16 << 6).to_le_bytes();
+        for y in 0..h {
+            for x in 0..w / 2 {
+                plane[(y * w + x) * 2..][..2].copy_from_slice(&grey);
+            }
+        }
+        assert!(!is_black(&plane, w * 2, w, h, 2));
     }
 }

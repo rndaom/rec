@@ -39,6 +39,29 @@ pub fn output_size(src_width: u32, src_height: u32, max_height: Option<u32>) -> 
     }
 }
 
+/// `v` rounded up to a multiple of `align` (a power of two).
+pub fn align_up(v: u32, align: u32) -> u32 {
+    debug_assert!(align.is_power_of_two());
+    v.saturating_add(align - 1) & !(align - 1)
+}
+
+/// Where a `src_width` x `src_height` image lands in a coded frame of
+/// `coded` size whose visible picture is `picture` (centred, the rest padding
+/// an encoder needs for alignment): letterboxed into the picture, then
+/// offset into the frame. Without padding this is [`letterbox`].
+pub fn place(src_width: u32, src_height: u32, picture: (u32, u32), coded: (u32, u32)) -> Rect {
+    let (pw, ph) = (picture.0.min(coded.0), picture.1.min(coded.1));
+    let r = letterbox(src_width, src_height, pw, ph);
+    let dx = ((coded.0 - pw) / 2) & !1;
+    let dy = ((coded.1 - ph) / 2) & !1;
+    Rect {
+        left: r.left + dx,
+        top: r.top + dy,
+        right: r.right + dx,
+        bottom: r.bottom + dy,
+    }
+}
+
 /// Where a `src_width` x `src_height` image lands inside a `dst_width` x
 /// `dst_height` frame when scaled to fit with its aspect ratio kept. The rest
 /// of the frame is black bars. Offsets and sizes are even so NV12 chroma
@@ -68,6 +91,38 @@ pub fn letterbox(src_width: u32, src_height: u32, dst_width: u32, dst_height: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn align_up_rounds_to_the_next_multiple() {
+        assert_eq!(align_up(1080, 16), 1088);
+        assert_eq!(align_up(1088, 16), 1088);
+        assert_eq!(align_up(946, 64), 960);
+        assert_eq!(align_up(0, 64), 0);
+        assert_eq!(align_up(u32::MAX, 64), !63);
+    }
+
+    #[test]
+    fn place_centres_the_picture_in_the_padded_frame() {
+        // 1080p content in a 1088-high AV1 frame: 1:1, 4 rows each side.
+        assert_eq!(
+            place(1920, 1080, (1920, 1080), (1920, 1088)),
+            Rect {
+                left: 0,
+                top: 4,
+                right: 1920,
+                bottom: 1084
+            }
+        );
+        // An odd window in a 64x16-aligned frame: not stretched.
+        let r = place(946, 532, (946, 532), (960, 544));
+        assert_eq!((r.width(), r.height()), (946, 532));
+        assert_eq!((r.left, r.top), (6, 6));
+        // No padding: plain letterbox.
+        assert_eq!(
+            place(1280, 720, (1920, 1080), (1920, 1080)),
+            letterbox(1280, 720, 1920, 1080)
+        );
+    }
 
     #[test]
     fn output_size_keeps_source_when_uncapped() {

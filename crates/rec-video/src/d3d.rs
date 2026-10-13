@@ -8,7 +8,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
 };
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
+};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
     MonitorFromPoint, MonitorFromWindow,
@@ -26,9 +28,16 @@ pub(crate) struct Gpu {
     pub context: ID3D11DeviceContext,
     pub adapter_name: String,
     pub luid: LUID,
+    /// PCI vendor id (0x1002 AMD, 0x10DE NVIDIA, 0x8086 Intel).
+    #[allow(dead_code)] // TEMP: used once the AMF backend is wired in
+    pub vendor_id: u32,
     /// The adapter is the one whose output shows the target monitor.
     pub owns_monitor: bool,
 }
+
+/// PCI vendor id of AMD adapters.
+#[allow(dead_code)] // TEMP: used once the AMF backend is wired in
+pub(crate) const VENDOR_AMD: u32 = 0x1002;
 
 pub(crate) fn hwnd(raw: isize) -> HWND {
     HWND(raw as *mut core::ffi::c_void)
@@ -82,9 +91,12 @@ pub(crate) fn adapter_luid(source: CaptureSource) -> Result<i64, VideoError> {
     Ok(luid_key(desc.AdapterLuid))
 }
 
-/// Finds the adapter whose DXGI output is `monitor`. Falls back to the first
-/// hardware adapter (e.g. for indirect/virtual displays) with `owns = false`.
-fn find_adapter(monitor: HMONITOR) -> Result<(IDXGIAdapter1, bool), VideoError> {
+/// Finds the adapter whose DXGI output is `monitor`, with that output. Falls
+/// back to the first hardware adapter (e.g. for indirect/virtual displays)
+/// and no output.
+pub(crate) fn find_adapter(
+    monitor: HMONITOR,
+) -> Result<(IDXGIAdapter1, Option<IDXGIOutput>), VideoError> {
     // SAFETY: plain factory creation.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ctx("CreateDXGIFactory1")?;
     let mut first = None;
@@ -100,7 +112,7 @@ fn find_adapter(monitor: HMONITOR) -> Result<(IDXGIAdapter1, bool), VideoError> 
             };
             // SAFETY: GetDesc fills a plain struct.
             if unsafe { output.GetDesc() }.is_ok_and(|desc| desc.Monitor == monitor) {
-                return Ok((adapter, true));
+                return Ok((adapter, Some(output)));
             }
         }
         if first.is_none() {
@@ -108,13 +120,14 @@ fn find_adapter(monitor: HMONITOR) -> Result<(IDXGIAdapter1, bool), VideoError> 
         }
     }
     first
-        .map(|a| (a, false))
+        .map(|a| (a, None))
         .ok_or_else(|| VideoError::Other("no DXGI adapter found".into()))
 }
 
 /// Creates the D3D11 device on the adapter that drives `source`'s monitor.
 pub(crate) fn create_for_source(source: CaptureSource) -> Result<Gpu, VideoError> {
-    let (adapter, owns_monitor) = find_adapter(target_monitor(source))?;
+    let (adapter, output) = find_adapter(target_monitor(source))?;
+    let owns_monitor = output.is_some();
     // SAFETY: GetDesc1 fills a plain struct.
     let desc = unsafe { adapter.GetDesc1() }.ctx("IDXGIAdapter1::GetDesc1")?;
 
@@ -155,6 +168,7 @@ pub(crate) fn create_for_source(source: CaptureSource) -> Result<Gpu, VideoError
         context,
         adapter_name: from_wide(&desc.Description),
         luid: desc.AdapterLuid,
+        vendor_id: desc.VendorId,
         owns_monitor,
     })
 }

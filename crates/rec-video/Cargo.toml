@@ -1,6 +1,6 @@
 [package]
 name = "rec-video"
-description = "rec video pipeline: Windows.Graphics.Capture -> D3D11 NV12 convert -> Media Foundation hardware encoder."
+description = "rec video pipeline: Windows.Graphics.Capture -> D3D11 colour conversion (SDR or HDR10) -> hardware encoder (AMD AMF or Media Foundation)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -23,8 +23,10 @@ windows = { workspace = true, features = [
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",
     "Security_Authorization_AppCapabilityAccess",
+    "Win32_Devices_Display",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",

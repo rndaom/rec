@@ -1,19 +1,17 @@
-//! GPU colour conversion and scaling: BGRA "latest" texture → NV12 encoder
-//! input, via the D3D11 video processor (fixed-function on most GPUs).
+//! GPU colour conversion and scaling of the "latest" captured texture into
+//! the encoder's input surfaces (see [`crate::pool`]):
 //!
-//! The NV12 surfaces live in a small pool. Each is wrapped once in an
-//! `IMFTrackedSample` around an `MFCreateDXGISurfaceBuffer` (zero copy). When
-//! the encoder releases a sample, the tracked sample calls back and the slot
-//! becomes free again, so a surface is never overwritten while the encoder
-//! still reads it.
+//! * SDR (BGRA8 sRGB → NV12 BT.709) runs on the D3D11 video processor,
+//!   fixed-function on most GPUs.
+//! * HDR captures (FP16 scRGB) go through our own shaders ([`crate::shader`])
+//!   to P010 HDR10 or, tone-mapped, to NV12 BT.709: what video processors do
+//!   with HDR input differs too much between drivers to rely on.
 
 use std::mem::ManuallyDrop;
-use std::sync::{Arc, Mutex};
 
-use windows::Win32::Foundation::{E_NOTIMPL, RECT};
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0,
+    D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0,
     D3D11_VIDEO_COLOR_RGBA, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT,
@@ -26,96 +24,112 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_RATIONAL,
 };
-use windows::Win32::Media::MediaFoundation::{
-    IMFAsyncCallback, IMFAsyncCallback_Impl, IMFAsyncResult, IMFSample, IMFTrackedSample,
-    MFCreateDXGISurfaceBuffer, MFCreateTrackedSample,
-};
-use windows::core::{Interface, Ref, implement};
+use windows::Win32::Media::MediaFoundation::IMFSample;
+use windows::core::Interface;
 
 use crate::VideoError;
-use crate::capture::Latest;
-use crate::geometry::letterbox;
+use crate::capture::{CaptureFormat, Latest};
+use crate::geometry::place;
+use crate::pool::Pool;
+use crate::shader::ShaderConverter;
 use crate::util::Context;
 
-/// NV12 surfaces in flight between the converter and the encoder.
-pub(crate) const POOL_SIZE: usize = 4;
+/// What the converter turns captured frames into.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Conversion {
+    /// BGRA8 sRGB → NV12 BT.709.
+    Sdr,
+    /// FP16 scRGB → NV12 BT.709, highlights above SDR white rolled off.
+    Tonemap {
+        /// Brightness of SDR white on the display; it maps to 100%.
+        sdr_white_nits: f32,
+    },
+    /// FP16 scRGB → P010 HDR10 (BT.2020, PQ), clipped at the display's peak.
+    Hdr10 { peak_nits: f32 },
+}
 
-/// An `IMFSample` that crosses to the MF thread that releases it.
-struct SendSample(IMFSample);
-// SAFETY: Media Foundation samples are free-threaded objects; ownership is
-// handed over whole (no shared aliasing), guarded by the `FreeList` mutex.
-unsafe impl Send for SendSample {}
-
-/// Samples the encoder has released, indexed by slot.
-#[derive(Default)]
-struct FreeList(Mutex<Vec<Option<SendSample>>>);
-
-impl FreeList {
-    fn put(&self, slot: usize, sample: IMFSample) {
-        if let Ok(mut slots) = self.0.lock() {
-            if let Some(entry) = slots.get_mut(slot) {
-                *entry = Some(SendSample(sample));
-            }
+impl Conversion {
+    pub(crate) fn capture_format(self) -> CaptureFormat {
+        match self {
+            Conversion::Sdr => CaptureFormat::Bgra8,
+            Conversion::Tonemap { .. } | Conversion::Hdr10 { .. } => CaptureFormat::Fp16,
         }
     }
 
-    fn take(&self, slot: usize) -> Option<IMFSample> {
-        self.0.lock().ok()?.get_mut(slot)?.take().map(|s| s.0)
+    pub(crate) fn output_format(self) -> DXGI_FORMAT {
+        match self {
+            Conversion::Hdr10 { .. } => DXGI_FORMAT_P010,
+            Conversion::Sdr | Conversion::Tonemap { .. } => DXGI_FORMAT_NV12,
+        }
     }
+}
 
-    fn is_free(&self, slot: usize) -> bool {
-        self.0
-            .lock()
-            .ok()
-            .is_some_and(|slots| slots.get(slot).is_some_and(Option::is_some))
+/// The encoder input surfaces plus whichever converter fills them.
+pub(crate) struct Converter {
+    pool: Pool,
+    kind: Kind,
+}
+
+enum Kind {
+    Video(VideoConverter),
+    Shader(ShaderConverter),
+}
+
+impl std::fmt::Debug for Converter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Converter")
+            .field("pool", &self.pool)
+            .finish_non_exhaustive()
     }
+}
 
-    fn any_free(&self, exclude: Option<usize>) -> Option<usize> {
-        let slots = self.0.lock().ok()?;
-        slots
-            .iter()
-            .enumerate()
-            .find(|(i, s)| s.is_some() && Some(*i) != exclude)
-            .map(|(i, _)| i)
-    }
-
-    fn clear(&self) {
-        // Drop outside the lock: releasing a sample may re-enter `put`.
-        let drained: Vec<Option<SendSample>> = match self.0.lock() {
-            Ok(mut slots) => slots.iter_mut().map(Option::take).collect(),
-            Err(_) => return,
+impl Converter {
+    /// Surfaces of `coded` size whose visible `picture` is centred in them
+    /// (they differ only where the encoder needs padding).
+    pub(crate) fn new(
+        device: &ID3D11Device,
+        coded: (u32, u32),
+        picture: (u32, u32),
+        fps: u32,
+        conversion: Conversion,
+    ) -> Result<Self, VideoError> {
+        let pool = Pool::new(device, coded.0, coded.1, conversion.output_format())?;
+        let kind = match conversion {
+            Conversion::Sdr => Kind::Video(VideoConverter::new(device, &pool, picture, fps)?),
+            other => Kind::Shader(ShaderConverter::new(device, &pool, picture, other)?),
         };
-        drop(drained);
-    }
-}
-
-/// Tracked-sample callback: the encoder dropped its last reference.
-#[implement(IMFAsyncCallback)]
-struct SampleReturned {
-    slot: usize,
-    free: Arc<FreeList>,
-}
-
-impl IMFAsyncCallback_Impl for SampleReturned_Impl {
-    fn GetParameters(&self, _flags: *mut u32, _queue: *mut u32) -> windows::core::Result<()> {
-        Err(E_NOTIMPL.into())
+        Ok(Self { pool, kind })
     }
 
-    fn Invoke(&self, result: Ref<IMFAsyncResult>) -> windows::core::Result<()> {
-        let result = result.ok()?;
-        // SAFETY: the tracked sample passes itself as the result object.
-        let object = unsafe { result.GetObject() }?;
-        self.free.put(self.slot, object.cast()?);
-        Ok(())
+    /// True if `slot`'s surface is back from the encoder.
+    pub(crate) fn is_free(&self, slot: usize) -> bool {
+        self.pool.is_free(slot)
     }
-}
 
-struct Slot {
-    texture: ID3D11Texture2D,
-    view: Option<ID3D11VideoProcessorOutputView>,
-    callback: IMFAsyncCallback,
+    /// A free slot, preferring one other than `avoid` (the last submitted).
+    pub(crate) fn free_slot(&self, avoid: Option<usize>) -> Option<usize> {
+        self.pool.free_slot(avoid)
+    }
+
+    /// `slot`'s surface (output size and format).
+    pub(crate) fn texture(&self, slot: usize) -> &ID3D11Texture2D {
+        self.pool.texture(slot)
+    }
+
+    /// Takes `slot`'s sample for submission; see [`Pool::take_sample`].
+    pub(crate) fn take_sample(&self, slot: usize) -> Result<IMFSample, VideoError> {
+        self.pool.take_sample(slot)
+    }
+
+    /// Converts `latest` into `slot`'s surface.
+    pub(crate) fn blit(&mut self, latest: &Latest, slot: usize) -> Result<(), VideoError> {
+        match &mut self.kind {
+            Kind::Video(v) => v.blit(latest, &self.pool, slot),
+            Kind::Shader(s) => s.blit(latest, &self.pool, slot),
+        }
+    }
 }
 
 /// Video processor state for one input texture size.
@@ -127,103 +141,44 @@ struct Processor {
     _enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
     input_view: ID3D11VideoProcessorInputView,
+    /// One per pool slot.
+    output_views: Vec<ID3D11VideoProcessorOutputView>,
     /// Content size the stream rects were last set for.
     rect_for: (u32, u32),
 }
 
-pub(crate) struct Converter {
+/// BGRA8 → NV12 on the D3D11 video processor.
+struct VideoConverter {
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     width: u32,
     height: u32,
+    /// Visible part of the surfaces; see [`place`].
+    picture: (u32, u32),
     fps: u32,
-    slots: Vec<Slot>,
-    free: Arc<FreeList>,
     processor: Option<Processor>,
 }
 
-impl std::fmt::Debug for Converter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Converter")
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Converter {
-    pub(crate) fn new(
+impl VideoConverter {
+    fn new(
         device: &ID3D11Device,
-        width: u32,
-        height: u32,
+        pool: &Pool,
+        picture: (u32, u32),
         fps: u32,
     ) -> Result<Self, VideoError> {
+        let (width, height) = (pool.width, pool.height);
         let video_device: ID3D11VideoDevice = device.cast().ctx("ID3D11VideoDevice")?;
         // SAFETY: plain getter on a valid device.
         let context = unsafe { device.GetImmediateContext() }.ctx("GetImmediateContext")?;
         let video_context: ID3D11VideoContext = context.cast().ctx("ID3D11VideoContext")?;
-
-        let free = Arc::new(FreeList::default());
-        let mut slots = Vec::with_capacity(POOL_SIZE);
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_NV12,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let mut samples = Vec::with_capacity(POOL_SIZE);
-        for slot in 0..POOL_SIZE {
-            let mut texture = None;
-            // SAFETY: valid descriptor; out-pointer valid for writes.
-            unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
-                .ctx("CreateTexture2D(NV12)")?;
-            let texture =
-                texture.ok_or_else(|| VideoError::Other("CreateTexture2D returned null".into()))?;
-            // SAFETY: wraps subresource 0 of a valid texture; no CPU copy.
-            let buffer =
-                unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &texture, 0, false) }
-                    .ctx("MFCreateDXGISurfaceBuffer")?;
-            // SAFETY: plain factory call.
-            let tracked: IMFTrackedSample =
-                unsafe { MFCreateTrackedSample() }.ctx("MFCreateTrackedSample")?;
-            let sample: IMFSample = tracked.cast().ctx("IMFSample")?;
-            // SAFETY: valid buffer.
-            unsafe { sample.AddBuffer(&buffer) }.ctx("IMFSample::AddBuffer")?;
-            samples.push(SendSample(sample));
-            let callback: IMFAsyncCallback = SampleReturned {
-                slot,
-                free: free.clone(),
-            }
-            .into();
-            slots.push(Slot {
-                texture,
-                view: None,
-                callback,
-            });
-        }
-        *free
-            .0
-            .lock()
-            .map_err(|_| VideoError::Other("lock poisoned".into()))? =
-            samples.into_iter().map(Some).collect();
 
         let converter = Self {
             video_device,
             video_context,
             width,
             height,
+            picture,
             fps,
-            slots,
-            free,
             processor: None,
         };
         converter.check_formats()?;
@@ -273,7 +228,13 @@ impl Converter {
     }
 
     /// (Re)creates the processor and views when the input texture changes.
-    fn prepare(&mut self, texture: &ID3D11Texture2D, w: u32, h: u32) -> Result<(), VideoError> {
+    fn prepare(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        w: u32,
+        h: u32,
+        pool: &Pool,
+    ) -> Result<(), VideoError> {
         let current = self.processor.as_ref().is_some_and(|p| {
             p.input_texture == *texture && p.input_width == w && p.input_height == h
         });
@@ -317,19 +278,22 @@ impl Converter {
                 Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
             },
         };
-        for slot in &mut self.slots {
+        let mut output_views = Vec::with_capacity(pool.len());
+        for slot in 0..pool.len() {
             let mut view = None;
             // SAFETY: NV12 render-target texture and valid enumerator.
             unsafe {
                 self.video_device.CreateVideoProcessorOutputView(
-                    &slot.texture,
+                    pool.texture(slot),
                     &enumerator,
                     &out_desc,
                     Some(&mut view),
                 )
             }
             .ctx("CreateVideoProcessorOutputView")?;
-            slot.view = view;
+            output_views.push(view.ok_or_else(|| {
+                VideoError::Other("CreateVideoProcessorOutputView returned null".into())
+            })?);
         }
 
         self.configure(&processor);
@@ -340,6 +304,7 @@ impl Converter {
             _enumerator: enumerator,
             processor,
             input_view,
+            output_views,
             rect_for: (0, 0),
         });
         Ok(())
@@ -401,28 +366,16 @@ impl Converter {
         }
     }
 
-    /// True if `slot`'s sample is back from the encoder.
-    pub(crate) fn is_free(&self, slot: usize) -> bool {
-        self.free.is_free(slot)
-    }
-
-    /// A free slot, preferring one other than `avoid` (the last submitted).
-    pub(crate) fn free_slot(&self, avoid: Option<usize>) -> Option<usize> {
-        self.free
-            .any_free(avoid)
-            .or_else(|| self.free.any_free(None))
-    }
-
     /// Converts `latest` into `slot`'s NV12 surface.
-    pub(crate) fn blit(&mut self, latest: &Latest, slot: usize) -> Result<(), VideoError> {
+    fn blit(&mut self, latest: &Latest, pool: &Pool, slot: usize) -> Result<(), VideoError> {
         let Some(texture) = latest.texture.clone() else {
             return Ok(());
         };
-        self.prepare(&texture, latest.tex_width, latest.tex_height)?;
-        let (Some(p), Some(out_view)) = (self.processor.as_mut(), self.slots[slot].view.as_ref())
-        else {
+        self.prepare(&texture, latest.tex_width, latest.tex_height, pool)?;
+        let Some(p) = self.processor.as_mut() else {
             return Ok(());
         };
+        let out_view = &p.output_views[slot];
         let vc = &self.video_context;
         let content = (latest.content_width, latest.content_height);
         if p.rect_for != content {
@@ -432,7 +385,12 @@ impl Converter {
                 right: content.0 as i32,
                 bottom: content.1 as i32,
             };
-            let r = letterbox(content.0, content.1, self.width, self.height);
+            let r = place(
+                content.0,
+                content.1,
+                self.picture,
+                (self.width, self.height),
+            );
             let dst = RECT {
                 left: r.left as i32,
                 top: r.top as i32,
@@ -459,30 +417,5 @@ impl Converter {
         // exactly once.
         unsafe { ManuallyDrop::drop(&mut stream.pInputSurface) };
         result.ctx("VideoProcessorBlt")
-    }
-
-    /// `slot`'s NV12 texture (output size).
-    pub(crate) fn texture(&self, slot: usize) -> &ID3D11Texture2D {
-        &self.slots[slot].texture
-    }
-
-    /// Takes `slot`'s sample for submission and arms its return callback.
-    pub(crate) fn take_sample(&self, slot: usize) -> Result<IMFSample, VideoError> {
-        let sample = self
-            .free
-            .take(slot)
-            .ok_or_else(|| VideoError::Other(format!("NV12 slot {slot} is not free")))?;
-        let tracked: IMFTrackedSample = sample.cast().ctx("IMFTrackedSample")?;
-        // SAFETY: valid callback; the sample calls it once when released.
-        unsafe { tracked.SetAllocator(&self.slots[slot].callback, None) }
-            .ctx("IMFTrackedSample::SetAllocator")?;
-        Ok(sample)
-    }
-}
-
-impl Drop for Converter {
-    fn drop(&mut self) {
-        // Break the sample → callback → free list → sample cycle.
-        self.free.clear();
     }
 }

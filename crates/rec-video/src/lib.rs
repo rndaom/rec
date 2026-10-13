@@ -1,11 +1,12 @@
-//! rec's video pipeline: Windows.Graphics.Capture → D3D11 video processor
-//! (BGRA → NV12, scale, letterbox) → Media Foundation hardware encoder →
-//! Annex-B [`Packet`]s that follow the contract in [`rec_core::media`].
+//! rec's video pipeline: Windows.Graphics.Capture → D3D11 colour conversion
+//! (scale, letterbox; BGRA → NV12, or for HDR displays FP16 → P010 HDR10 or
+//! tone-mapped NV12) → hardware encoder (AMD AMF or Media Foundation) →
+//! H.264 / HEVC / AV1 [`Packet`]s that follow the contract in
+//! [`rec_core::media`].
 //!
 //! Frames never leave the GPU. Per captured frame the GPU does one
-//! `CopyResource`; per encode tick it does one `VideoProcessorBlt` (skipped
-//! when the previous NV12 frame can simply be resubmitted) and the hardware
-//! encode. No thread spins: the encode thread sleeps on a high-resolution
+//! `CopyResource`; per encode tick it does one conversion (skipped when the
+//! previous picture can simply be resubmitted) and the hardware encode. No thread spins: the encode thread sleeps on a high-resolution
 //! waitable timer and the capture callback runs on the system thread pool.
 //!
 //! The caller must have called `MFStartup` once for the process. The
@@ -45,17 +46,28 @@ mod probe;
 pub mod sei;
 
 #[cfg(windows)]
+mod backend;
+#[cfg(windows)]
 mod capture;
 #[cfg(windows)]
 mod convert;
 #[cfg(windows)]
 mod d3d;
 #[cfg(windows)]
+mod display;
+#[cfg(windows)]
 mod encoder;
 #[cfg(windows)]
 mod pipeline;
 #[cfg(windows)]
+mod pool;
+#[cfg(windows)]
+mod shader;
+#[cfg(windows)]
 mod util;
+
+#[cfg(windows)]
+pub use display::{DisplayColor, DisplayState, display_for};
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -82,6 +94,34 @@ pub enum CodecPreference {
     Auto,
     H264,
     Hevc,
+    Av1,
+}
+
+/// What to do when the captured display is in HDR mode. On an SDR display
+/// all three record SDR the same way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HdrMode {
+    /// Record HDR10 (10-bit HEVC or AV1, BT.2020 PQ, static metadata);
+    /// tone-map to SDR when the codec or encoder cannot do 10-bit.
+    #[default]
+    Auto,
+    /// Tone-map the HDR picture to SDR: plays right everywhere.
+    Tonemap,
+    /// Capture 8-bit SDR as Windows presents it; HDR highlights clip.
+    Off,
+}
+
+/// Which hardware encoder implementation to use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EncoderBackend {
+    /// The GPU vendor's native encoder where rec has one (AMD AMF), else
+    /// Media Foundation.
+    #[default]
+    Auto,
+    /// AMD AMF, falling back to Media Foundation if it cannot start.
+    Amf,
+    /// The Media Foundation hardware encoder only.
+    MediaFoundation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +132,12 @@ pub struct VideoCaptureConfig {
     /// Downscale so the encoded height is at most this (aspect ratio kept).
     pub max_height: Option<u32>,
     pub codec: CodecPreference,
+    pub encoder: EncoderBackend,
+    pub hdr: HdrMode,
+    /// Treat the display as if it were in HDR mode: exercises the HDR path
+    /// (FP16 capture, HDR10 or tone-mapped output) on an SDR display. For
+    /// testing.
+    pub assume_hdr_display: bool,
     /// Mean bitrate in kbit/s.
     pub bitrate_kbps: u32,
     /// Draw the mouse cursor into the capture.
@@ -101,14 +147,17 @@ pub struct VideoCaptureConfig {
 }
 
 impl VideoCaptureConfig {
-    /// Defaults: 60 fps, native size, codec auto, 20 Mbit/s, cursor on,
-    /// video track 0, segment 0.
+    /// Defaults: 60 fps, native size, codec, encoder and HDR auto,
+    /// 20 Mbit/s, cursor on, video track 0, segment 0.
     pub fn new(source: CaptureSource) -> Self {
         Self {
             source,
             fps: 60,
             max_height: None,
             codec: CodecPreference::Auto,
+            encoder: EncoderBackend::Auto,
+            hdr: HdrMode::Auto,
+            assume_hdr_display: false,
             bitrate_kbps: 20_000,
             cursor: true,
             track: rec_core::media::VIDEO_TRACK,
@@ -187,8 +236,10 @@ pub struct VideoStats {
 /// the current mean is what `set_bitrate` last returned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoInfo {
+    /// Codec, size, rate and colour (SDR, or HDR10 with its metadata).
     pub format: VideoFormat,
-    /// Friendly name of the Media Foundation encoder MFT.
+    /// Which encoder runs: the native backend or the Media Foundation MFT's
+    /// friendly name.
     pub encoder_name: String,
     /// DXGI description of the adapter the capture/encode device lives on.
     pub adapter_name: String,
@@ -200,6 +251,11 @@ pub struct VideoInfo {
     /// Rate-control mode (with the mean/max bit rate) the encoder reported
     /// after configuration; not updated by `set_bitrate`.
     pub rate_control: String,
+    /// The visible picture inside the encoded frame: `format`'s size unless
+    /// the encoder needed padding for alignment (the picture is centred).
+    /// This is the size the source was scaled to.
+    pub picture_width: u32,
+    pub picture_height: u32,
     /// Source size when the session started.
     pub source_width: u32,
     pub source_height: u32,
@@ -208,6 +264,12 @@ pub struct VideoInfo {
     pub border_required: Option<bool>,
     /// `MinUpdateInterval` applied to the capture session, if supported.
     pub min_update_interval_hns: Option<i64>,
+    /// The source's display was in HDR mode (or assumed to be) at start;
+    /// compare with [`display_for`] to notice HDR being switched.
+    pub display_hdr: bool,
+    /// Fallbacks taken while starting, e.g. a native encoder that could not
+    /// start or HDR10 that had to be tone-mapped. Worth logging.
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

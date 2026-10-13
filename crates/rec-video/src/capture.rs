@@ -32,8 +32,27 @@ use crate::util::Context;
 use crate::{BorderlessAccess, CaptureSource, SharedStats, VideoError};
 
 const SESSION_CLASS: &str = "Windows.Graphics.Capture.GraphicsCaptureSession";
-const PIXEL_FORMAT: DirectXPixelFormat = DirectXPixelFormat::B8G8R8A8UIntNormalized;
 const POOL_BUFFERS: i32 = 2;
+
+/// Pixel format of captured frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureFormat {
+    /// 8-bit sRGB: what the desktop looks like on an SDR display. On an HDR
+    /// display Windows clips it to SDR.
+    Bgra8,
+    /// 16-bit float scRGB (linear, BT.709 primaries, 1.0 = 80 cd/m²): the
+    /// full HDR picture the compositor shows.
+    Fp16,
+}
+
+impl CaptureFormat {
+    fn pixel_format(self) -> DirectXPixelFormat {
+        match self {
+            CaptureFormat::Bgra8 => DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            CaptureFormat::Fp16 => DirectXPixelFormat::R16G16B16A16Float,
+        }
+    }
+}
 
 /// The most recent captured frame, owned by us (copied out of the pool).
 #[derive(Debug, Default)]
@@ -106,6 +125,7 @@ impl Capture {
         gpu: &Gpu,
         fps: u32,
         cursor: bool,
+        format: CaptureFormat,
         shared: Arc<CaptureShared>,
     ) -> Result<Self, VideoError> {
         if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
@@ -128,7 +148,7 @@ impl Capture {
 
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &rt_device,
-            PIXEL_FORMAT,
+            format.pixel_format(),
             POOL_BUFFERS,
             size,
         )
@@ -138,6 +158,7 @@ impl Capture {
             device: gpu.device.clone(),
             context: gpu.context.clone(),
             rt_device: AgileDevice(rt_device),
+            pixel_format: format.pixel_format(),
             pool_size: Mutex::new(size),
             shared: shared.clone(),
         };
@@ -278,6 +299,7 @@ struct FrameHandler {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     rt_device: AgileDevice,
+    pixel_format: DirectXPixelFormat,
     pool_size: Mutex<SizeInt32>,
     shared: Arc<CaptureShared>,
 }
@@ -334,7 +356,7 @@ impl FrameHandler {
         if content.Width > 0 && content.Height > 0 {
             let mut size = self.pool_size.lock().map_err(|_| poisoned())?;
             if content != *size {
-                pool.Recreate(&self.rt_device.0, PIXEL_FORMAT, POOL_BUFFERS, content)
+                pool.Recreate(&self.rt_device.0, self.pixel_format, POOL_BUFFERS, content)
                     .ctx("Direct3D11CaptureFramePool::Recreate")?;
                 *size = content;
             }

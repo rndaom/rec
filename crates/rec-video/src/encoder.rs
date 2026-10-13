@@ -1,9 +1,10 @@
 //! Media Foundation hardware encoder MFT (asynchronous), driven by its event
-//! generator without blocking.
+//! generator without blocking: H.264, HEVC and AV1, from NV12 (SDR) or P010
+//! (HDR10) surfaces.
 
 use std::mem::ManuallyDrop;
 
-use rec_core::media::VideoCodec;
+use rec_core::media::{VideoCodec, VideoColor};
 use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Media::MediaFoundation::{
@@ -15,25 +16,29 @@ use windows::Win32::Media::MediaFoundation::{
     MF_E_NOTACCEPTING, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_EVENT_TYPE,
     MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
     MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
-    MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES,
-    MF_MT_YUV_MATRIX, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
-    MFCreateAttributes, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFMediaType_Video, MFNominalRange_16_235, MFSampleExtension_CleanPoint,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
-    MFVideoTransferMatrix_BT709, eAVEncCommonRateControlMode_CBR,
+    MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_CHROMA_SITING, MF_MT_VIDEO_NOMINAL_RANGE,
+    MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC,
+    MF_TRANSFORM_ASYNC_UNLOCK, MFCreateAttributes, MFCreateDXGIDeviceManager, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFNominalRange_16_235,
+    MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFVideoChromaSubsampling_MPEG2,
+    MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
+    MFVideoFormat_P010, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
+    MFVideoPrimaries_BT2020, MFVideoTransFunc_709, MFVideoTransFunc_2084,
+    MFVideoTransferMatrix_BT709, MFVideoTransferMatrix_BT2020_10, eAVEncAV1VProfile_Main_420_8,
+    eAVEncAV1VProfile_Main_420_10, eAVEncCommonRateControlMode_CBR,
     eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_High,
-    eAVEncH265VProfile_Main_420_8,
+    eAVEncH265VProfile_Main_420_8, eAVEncH265VProfile_Main_420_10,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, Interface, PWSTR};
 
+use crate::geometry::align_up;
 use crate::util::{Context, win_err};
 use crate::{CodecPreference, VideoError};
 
@@ -51,6 +56,10 @@ pub(crate) struct Encoder {
     peak_bps: u32,
     pub name: String,
     pub codec: VideoCodec,
+    /// Size of the encoded frames: the requested size, or larger where the
+    /// hardware needs alignment (see [`coded_size`]).
+    pub width: u32,
+    pub height: u32,
     /// Rate-control description as read back right after configuration; it
     /// is not updated by [`Encoder::set_bitrate`].
     pub rate_control: String,
@@ -76,18 +85,45 @@ impl std::fmt::Debug for Encoder {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct EncoderParams {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// SDR takes NV12 input, HDR10 P010.
+    pub color: VideoColor,
 }
 
 fn subtype(codec: VideoCodec) -> GUID {
     match codec {
+        VideoCodec::H264 => MFVideoFormat_H264,
         VideoCodec::Hevc => MFVideoFormat_HEVC,
-        _ => MFVideoFormat_H264,
+        VideoCodec::Av1 => MFVideoFormat_AV1,
     }
+}
+
+fn input_subtype(color: VideoColor) -> GUID {
+    if color.is_hdr() {
+        MFVideoFormat_P010
+    } else {
+        MFVideoFormat_NV12
+    }
+}
+
+/// `MF_MT_MPEG2_PROFILE` (alias `MF_MT_VIDEO_PROFILE`) for the codec and
+/// bit depth; `None` for a combination hardware encoders do not offer.
+pub(crate) fn profile(codec: VideoCodec, color: VideoColor) -> Option<u32> {
+    let hdr = color.is_hdr();
+    let p = match codec {
+        VideoCodec::H264 if hdr => return None,
+        VideoCodec::H264 => eAVEncH264VProfile_High.0,
+        VideoCodec::Hevc if hdr => eAVEncH265VProfile_Main_420_10.0,
+        VideoCodec::Hevc => eAVEncH265VProfile_Main_420_8.0,
+        VideoCodec::Av1 if hdr => eAVEncAV1VProfile_Main_420_10.0,
+        VideoCodec::Av1 => eAVEncAV1VProfile_Main_420_8.0,
+    };
+    Some(p as u32)
 }
 
 fn pack(hi: u32, lo: u32) -> u64 {
@@ -95,11 +131,18 @@ fn pack(hi: u32, lo: u32) -> u64 {
 }
 
 /// Hardware encoder activates for `codec` on the adapter `luid`, best first.
-fn enumerate(codec: VideoCodec, luid: LUID) -> Result<Vec<IMFActivate>, VideoError> {
-    let input = MFT_REGISTER_TYPE_INFO {
+/// For 10-bit any input type matches here: drivers do not always register
+/// P010 as an input, and `SetInputType` is the real test.
+fn enumerate(
+    codec: VideoCodec,
+    luid: LUID,
+    color: VideoColor,
+) -> Result<Vec<IMFActivate>, VideoError> {
+    let nv12 = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
     };
+    let input = (!color.is_hdr()).then_some(&nv12);
     let output = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: subtype(codec),
@@ -121,7 +164,7 @@ fn enumerate(codec: VideoCodec, luid: LUID) -> Result<Vec<IMFActivate>, VideoErr
         windows::Win32::Media::MediaFoundation::MFTEnum2(
             MFT_CATEGORY_VIDEO_ENCODER,
             MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-            Some(&input),
+            input.map(|i| i as *const _),
             Some(&output),
             &attributes,
             &mut list,
@@ -168,12 +211,37 @@ fn friendly_name(activate: &IMFActivate) -> String {
     name
 }
 
+/// Frame size `name`'s encoder can take for `codec`. AMD's AV1 MFT
+/// (RDNA3, driver 32.0.31041) needs a width that is a multiple of 64 and a
+/// height that is a multiple of 16: other sizes are accepted and then the
+/// MFT hangs after its first input, and 1080 lines come out as 1082. Media
+/// Foundation cannot signal a crop, so the frame is padded and the picture
+/// centred in it (a few black lines or columns).
+fn coded_size(codec: VideoCodec, name: &str, width: u32, height: u32) -> (u32, u32) {
+    if codec == VideoCodec::Av1 && name.starts_with("AMD") {
+        (align_up(width, 64), align_up(height, 16))
+    } else {
+        (width, height)
+    }
+}
+
 /// Codecs to try for a preference, in order.
 fn candidates(pref: CodecPreference) -> &'static [VideoCodec] {
     match pref {
         CodecPreference::Auto => &[VideoCodec::Hevc, VideoCodec::H264],
         CodecPreference::Hevc => &[VideoCodec::Hevc],
         CodecPreference::H264 => &[VideoCodec::H264],
+        CodecPreference::Av1 => &[VideoCodec::Av1],
+    }
+}
+
+/// Display name of what a preference asks for, for errors.
+pub(crate) fn preference_name(pref: CodecPreference) -> &'static str {
+    match pref {
+        CodecPreference::H264 => "H.264",
+        CodecPreference::Hevc => "HEVC",
+        CodecPreference::Av1 => "AV1",
+        CodecPreference::Auto => "HEVC or H.264",
     }
 }
 
@@ -230,7 +298,10 @@ impl Encoder {
     ) -> Result<Self, VideoError> {
         let mut last_err = None;
         for &codec in candidates(pref) {
-            for activate in enumerate(codec, luid)? {
+            if profile(codec, params.color).is_none() {
+                continue;
+            }
+            for activate in enumerate(codec, luid, params.color)? {
                 match Self::from_activate(device, &activate, codec, params) {
                     Ok(encoder) => return Ok(encoder),
                     Err(e) => {
@@ -242,11 +313,7 @@ impl Encoder {
             }
         }
         Err(last_err.unwrap_or(VideoError::NoEncoder {
-            codec: match pref {
-                CodecPreference::H264 => "H.264",
-                CodecPreference::Hevc => "HEVC",
-                CodecPreference::Auto => "HEVC or H.264",
-            },
+            codec: preference_name(pref),
             adapter: adapter_name.to_string(),
         }))
     }
@@ -258,6 +325,12 @@ impl Encoder {
         params: &EncoderParams,
     ) -> Result<Self, VideoError> {
         let name = friendly_name(activate);
+        let (width, height) = coded_size(codec, &name, params.width, params.height);
+        let params = &EncoderParams {
+            width,
+            height,
+            ..*params
+        };
         // SAFETY: creates the MFT; we own the returned reference.
         let transform: IMFTransform =
             unsafe { activate.ActivateObject() }.ctx("IMFActivate::ActivateObject")?;
@@ -303,10 +376,9 @@ impl Encoder {
         apply_codec_settings(&api, params);
 
         let out_type = media_type(subtype(codec), params)?;
-        let profile = match codec {
-            VideoCodec::Hevc => eAVEncH265VProfile_Main_420_8.0 as u32,
-            _ => eAVEncH264VProfile_High.0 as u32,
-        };
+        let profile = profile(codec, params.color).ok_or_else(|| {
+            VideoError::Other(format!("{} has no 10-bit hardware profile", codec.name()))
+        })?;
         // SAFETY: attribute writes on our own media type.
         unsafe {
             out_type
@@ -319,9 +391,14 @@ impl Encoder {
         // SAFETY: valid type; stream id from the MFT.
         unsafe { transform.SetOutputType(output_id, &out_type, 0) }.ctx("SetOutputType")?;
 
-        let in_type = media_type(MFVideoFormat_NV12, params)?;
+        let in_type = media_type(input_subtype(params.color), params)?;
+        let context = if params.color.is_hdr() {
+            "SetInputType(P010)"
+        } else {
+            "SetInputType(NV12)"
+        };
         // SAFETY: as above.
-        unsafe { transform.SetInputType(input_id, &in_type, 0) }.ctx("SetInputType(NV12)")?;
+        unsafe { transform.SetInputType(input_id, &in_type, 0) }.ctx(context)?;
 
         let rate_control = apply_codec_settings(&api, params);
         let (mean_bps, peak_bps) = bitrate_bps(params.bitrate_kbps);
@@ -357,6 +434,8 @@ impl Encoder {
             peak_bps,
             name,
             codec,
+            width,
+            height,
             rate_control,
             sequence_header,
             input_id,
@@ -593,9 +672,23 @@ fn stream_ids(transform: &IMFTransform) -> (u32, u32) {
     }
 }
 
-/// A video media type with the size, rate and BT.709 limited-range colour
-/// description shared by the input and output types.
+/// A video media type with the size, rate and limited-range colour
+/// description (BT.709, or BT.2020 PQ for HDR10) shared by the input and
+/// output types; encoders copy it into the bitstream's colour description.
 fn media_type(subtype: GUID, p: &EncoderParams) -> Result<IMFMediaType, VideoError> {
+    let (primaries, transfer, matrix) = if p.color.is_hdr() {
+        (
+            MFVideoPrimaries_BT2020,
+            MFVideoTransFunc_2084,
+            MFVideoTransferMatrix_BT2020_10,
+        )
+    } else {
+        (
+            MFVideoPrimaries_BT709,
+            MFVideoTransFunc_709,
+            MFVideoTransferMatrix_BT709,
+        )
+    };
     // SAFETY: plain factory call and attribute writes on our own object.
     unsafe {
         let t = MFCreateMediaType().ctx("MFCreateMediaType")?;
@@ -610,12 +703,18 @@ fn media_type(subtype: GUID, p: &EncoderParams) -> Result<IMFMediaType, VideoErr
             .ctx("MF_MT_PIXEL_ASPECT_RATIO")?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
             .ctx("MF_MT_INTERLACE_MODE")?;
-        t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)
+        t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, primaries.0 as u32)
             .ctx("MF_MT_VIDEO_PRIMARIES")?;
-        t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)
+        t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, transfer.0 as u32)
             .ctx("MF_MT_TRANSFER_FUNCTION")?;
-        t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)
+        t.SetUINT32(&MF_MT_YUV_MATRIX, matrix.0 as u32)
             .ctx("MF_MT_YUV_MATRIX")?;
+        // Left-sited chroma (MPEG-2 style), which the converters produce.
+        t.SetUINT32(
+            &MF_MT_VIDEO_CHROMA_SITING,
+            MFVideoChromaSubsampling_MPEG2.0 as u32,
+        )
+        .ctx("MF_MT_VIDEO_CHROMA_SITING")?;
         t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)
             .ctx("MF_MT_VIDEO_NOMINAL_RANGE")?;
         Ok(t)

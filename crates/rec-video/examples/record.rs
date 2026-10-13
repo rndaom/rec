@@ -3,10 +3,15 @@
 //!
 //! ```text
 //! cargo run --release -p rec-video --example record -- --seconds 10 --fps 60 \
-//!     [--monitor N | --window-title "<substring>"] [--codec h264|hevc|auto] \
+//!     [--monitor N | --window-title "<substring>"] [--codec h264|hevc|av1|auto] \
+//!     [--encoder auto|amf|mf] [--hdr auto|tonemap|off] [--assume-hdr] \
 //!     [--bitrate KBPS] [--max-height N] [--no-cursor] [--request-borderless] \
 //!     --out out.h265
 //! ```
+//!
+//! `--assume-hdr` runs the HDR path (FP16 capture, HDR10 or tone-mapped
+//! output) on an SDR display. AV1 is written as a low-overhead OBU stream
+//! (`ffprobe -f obu out.obu`).
 
 #[cfg(not(windows))]
 fn main() {
@@ -29,7 +34,8 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use rec_video::{
-        CaptureSource, CodecPreference, Packet, VideoCapture, VideoCaptureConfig, annexb,
+        CaptureSource, CodecPreference, EncoderBackend, HdrMode, Packet, VideoCapture,
+        VideoCaptureConfig, annexb, obu,
     };
     use windows::Win32::Foundation::{
         CloseHandle, FILETIME, HLOCAL, HWND, LPARAM, LocalFree, RECT,
@@ -61,6 +67,9 @@ mod imp {
         monitor: Option<usize>,
         window_title: Option<String>,
         codec: CodecPreference,
+        encoder: EncoderBackend,
+        hdr: HdrMode,
+        assume_hdr: bool,
         bitrate: u32,
         max_height: Option<u32>,
         cursor: bool,
@@ -90,10 +99,28 @@ mod imp {
                     a.codec = match value()?.as_str() {
                         "h264" => CodecPreference::H264,
                         "hevc" | "h265" => CodecPreference::Hevc,
+                        "av1" => CodecPreference::Av1,
                         "auto" => CodecPreference::Auto,
                         other => return Err(format!("unknown codec {other}")),
                     }
                 }
+                "--encoder" => {
+                    a.encoder = match value()?.as_str() {
+                        "auto" => EncoderBackend::Auto,
+                        "amf" => EncoderBackend::Amf,
+                        "mf" => EncoderBackend::MediaFoundation,
+                        other => return Err(format!("unknown encoder {other}")),
+                    }
+                }
+                "--hdr" => {
+                    a.hdr = match value()?.as_str() {
+                        "auto" => HdrMode::Auto,
+                        "tonemap" => HdrMode::Tonemap,
+                        "off" => HdrMode::Off,
+                        other => return Err(format!("unknown HDR mode {other}")),
+                    }
+                }
+                "--assume-hdr" => a.assume_hdr = true,
                 "--bitrate" => a.bitrate = num(value()?)? as u32,
                 "--max-height" => a.max_height = Some(num(value()?)? as u32),
                 "--no-cursor" => a.cursor = false,
@@ -272,6 +299,9 @@ mod imp {
             fps: args.fps,
             max_height: args.max_height,
             codec: args.codec,
+            encoder: args.encoder,
+            hdr: args.hdr,
+            assume_hdr_display: args.assume_hdr,
             bitrate_kbps: args.bitrate,
             cursor: args.cursor,
             ..VideoCaptureConfig::new(source)
@@ -296,8 +326,10 @@ mod imp {
             if p.keyframe {
                 t.keyframes += 1;
                 t.keyframe_pts.push(p.pts);
+                // OBU type 1 is the AV1 sequence header.
                 let with = annexb::has_parameter_sets(rec_video::VideoCodec::Hevc, &p.data)
-                    || annexb::has_parameter_sets(rec_video::VideoCodec::H264, &p.data);
+                    || annexb::has_parameter_sets(rec_video::VideoCodec::H264, &p.data)
+                    || obu::split_obus(&p.data).is_ok_and(|obus| obus.iter().any(|o| o.kind == 1));
                 if with {
                     t.keyframes_with_params += 1;
                 }
@@ -327,6 +359,11 @@ mod imp {
             info.source_width,
             info.source_height
         );
+        println!("colour: {:?}", info.format.color);
+        println!("display in HDR mode: {}", info.display_hdr);
+        for note in &info.notes {
+            println!("note: {note}");
+        }
         println!("rate control: {}", info.rate_control);
         println!(
             "border required: {:?}, min update interval: {:?} hns",
