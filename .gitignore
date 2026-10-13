@@ -11,6 +11,9 @@
 *.mkv
 *.log
 
+# Benchmark output: summaries are kept, raw PresentMon CSVs are large
+bench/results/**/raw/
+
 # Editors / OS
 .vscode/
 .idea/

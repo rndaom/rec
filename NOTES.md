@@ -16,9 +16,10 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 | `rec-mux` | Fragmented MP4 |
 | `recd` | Tray service |
 | `rec-cli` | `rec` |
+| `rec-bench` | Benchmark harness: PresentMon off/on runs, `recd` idle cost (see `bench/README.md`) |
 
 **Next step:** M2. Suggested order:
-1. Benchmark harness, to lock in the performance budget early
+1. Benchmark harness, to lock in the performance budget early (harness done; the first published run is still to do)
 2. Per-process audio tracks
 3. Black-frame / exclusive-fullscreen detection
 4. Pipeline recovery (device lost, resolution change), using new `segment` numbers
@@ -36,6 +37,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
   - The MF AAC encoder has zero effective priming delay (measured).
   - WASAPI `AUTOCONVERTPCM` handles all format conversion.
 - Memory: `recd` uses ~127 MB private while recording at 1080p60. About 54 MB of that is driver / Media Foundation pipeline allocations and the rest is the buffer.
+- Bench: `rec-bench` was tested end to end only against stand-in `recd` and PresentMon scripts. The first real run (needs admin or the Performance Log Users group) may show PresentMon CLI differences. Rust `Command` children inherit the parent's std handles, so `rec-bench` clears the inherit flag before restarting the user's `recd`; otherwise `rec-bench | tee` never ends.
 - Logs: `%LOCALAPPDATA%\rec\recd.log`. Config: `%APPDATA%\rec\config.toml`.
 - Testing: set `REC_DEBUG_CAPTURE_UI=1` to make toasts visible in screenshots.
 

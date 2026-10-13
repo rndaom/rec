@@ -1,11 +1,7 @@
 //! `rec`: control the rec background service from a terminal, script or
 //! macro tool.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
 use std::process::ExitCode;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use rec_core::config;
 use rec_core::ipc::{self, RecorderState, Request, Response};
@@ -21,9 +17,6 @@ usage:
   rec reload            reload the config file
   rec quit              stop the background service
   rec config            print the config file path";
-
-/// Windows `ERROR_PIPE_BUSY`: every pipe instance is serving another client.
-const ERROR_PIPE_BUSY: i32 = 231;
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -59,35 +52,6 @@ fn parse(args: &[String]) -> Result<Command, String> {
         Some(extra) => Err(format!("unexpected argument `{extra}`")),
         None => Ok(command),
     }
-}
-
-fn connect() -> io::Result<File> {
-    let name = ipc::pipe_name();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match OpenOptions::new().read(true).write(true).open(&name) {
-            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            result => return result,
-        }
-    }
-}
-
-fn send(request: &Request) -> Result<Response, String> {
-    let mut pipe = connect().map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => "rec is not running (start recd first)".to_string(),
-        _ => format!("could not connect to rec: {e}"),
-    })?;
-    pipe.write_all(ipc::encode_line(request).as_bytes())
-        .and_then(|()| pipe.flush())
-        .map_err(|e| format!("could not send request: {e}"))?;
-
-    let mut line = String::new();
-    BufReader::new(&pipe)
-        .read_line(&mut line)
-        .map_err(|e| format!("could not read response: {e}"))?;
-    ipc::decode_line(&line).map_err(|e| format!("invalid response from rec: {e}"))
 }
 
 fn report(response: Response) -> ExitCode {
@@ -143,7 +107,7 @@ fn main() -> ExitCode {
             println!("{}", config::default_config_path().display());
             ExitCode::SUCCESS
         }
-        Ok(Command::Send(request)) => match send(&request) {
+        Ok(Command::Send(request)) => match ipc::send(&request) {
             Ok(response) => report(response),
             Err(message) => {
                 eprintln!("rec: {message}");
