@@ -289,6 +289,15 @@ impl ParameterSets {
     }
 }
 
+/// `data` with `insert` spliced in at offset `at`; the buffer is copied once.
+pub(crate) fn splice(data: &[u8], at: usize, insert: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + insert.len());
+    out.extend_from_slice(&data[..at]);
+    out.extend_from_slice(insert);
+    out.extend_from_slice(&data[at..]);
+    out
+}
+
 /// Drops trailing zero bytes (`trailing_zero_8bits`), which belong to the
 /// stream rather than to the NAL unit.
 fn trim_trailing_zeros(nal: &[u8]) -> &[u8] {
