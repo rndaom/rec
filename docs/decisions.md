@@ -23,7 +23,7 @@ Features are checked at runtime, never by OS version string alone:
 | Windows.Graphics.Capture (WGC) | Win10 1903+ | Desktop Duplication (DDA) |
 | Borderless WGC (`IsBorderRequired = false`) | Win11 (build 20348+) | Win10 uses DDA display capture cropped to the game window, so no yellow border is shown around the game |
 | `MinUpdateInterval` (cap the capture rate) | Win11 24H2 (26100+) | Drop surplus frames on our fixed encode tick |
-| Per-process audio loopback | Documented for 20348+; known to work on Win10 2004+ | Endpoint loopback (all system audio) on one track |
+| Per-process audio loopback | Documented for 20348+; works on Win10 2004+ (build 19041), which is what rec checks | Endpoint loopback (all system audio) on one track |
 | `WDA_EXCLUDEFROMCAPTURE` (hide our overlay from clips) | Win10 2004+ | n/a |
 | Media Foundation | All, **except "N" editions without the Media Feature Pack** | Detect it and tell the user how to install the pack |
 
@@ -42,6 +42,8 @@ Capture uses only OS compositor APIs (WGC, DDA). We do no DLL injection, no grap
 3. The software fallback is Microsoft's built-in H.264 encoder, opt-in only.
 
 **Audio encode:** Media Foundation AAC, built into Windows. Input is always 48 kHz 16-bit stereo, produced by WASAPI's own `AUTOCONVERTPCM` conversion, so a device change never changes the track format.
+
+**Audio tracks:** each source gets its own track: the game, voice chat apps and "other apps" through process loopback (by process tree, include or exclude), and the microphone. A mixed track (what a viewer should hear) comes first, so players that only play one track play the mix. We mix ourselves, on the QPC sample grid every input's timeline already uses, rather than relying on the OS. A silent track repeats one cached silent AAC packet instead of encoding; it stays a few frames behind the silence so the packets that overlap returning audio still come from the encoder.
 
 **Muxing:** our own fragmented-MP4 writer (and later MKV). It is a few hundred lines with full control over crash safety, multiple audio tracks and segment changes.
 

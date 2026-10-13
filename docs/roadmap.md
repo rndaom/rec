@@ -48,7 +48,7 @@ Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a liv
 
 ## M2: It's good
 - [ ] Benchmark harness: PresentMon/CapFrameX runs with and without `recd`, results in `bench/` and the README
-- [ ] Per-process audio tracks (game, voice chat, mic, other apps) + mixed track (`AudioSource::ProcessLoopback`)
+- [x] Per-process audio tracks (game, voice chat, mic, other apps) + mixed track (`AudioSource::Process`)
 - [ ] Native NVENC / AMF / oneVPL backends; AV1; encoder capability probing and fallback chain
 - [ ] HDR: FP16 capture → HEVC Main10 PQ with HDR10 metadata, or tone-map to SDR
 - [ ] Quick-panel overlay (DirectComposition, excluded from capture), keyboard and mouse navigation
@@ -58,7 +58,7 @@ Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a liv
 - [ ] Exclusive-fullscreen black-frame detection with a "switch to borderless" hint
 - [ ] Hybrid-GPU handling; device-lost / driver-update / resolution-change recovery without losing the buffer
 - [ ] Adaptive GPU priority when frames drop under full GPU load
-- [ ] Cached silent AAC packet instead of encoding silence
+- [x] Cached silent AAC packet instead of encoding silence
 
 ## M3: Library
 - [ ] `rec-ui` (Tauri 2 + Svelte 5): settings, clip library, lossless trim, star / delete (Recycle Bin)

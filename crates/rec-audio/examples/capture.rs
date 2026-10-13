@@ -1,11 +1,16 @@
-//! Captures audio to an ADTS `.aac` file and prints stats and CPU cost.
+//! Captures audio to ADTS `.aac` files (one per track) and prints stats and
+//! CPU cost.
 //!
 //! ```text
-//! cargo run --release -p rec-audio --example capture -- <loopback|mic|mic:ID> <seconds> <out.aac>
+//! cargo run --release -p rec-audio --example capture -- [--mix] <input>... <seconds> <out-prefix>
 //! ```
 //!
-//! `mic` records the default communications capture device, `mic:ID` a fixed
-//! endpoint id (a missing id records silence, like an unplugged device).
+//! Inputs: `loopback` (all system audio), `mic` (default communications
+//! capture device), `mic:ID` (a fixed endpoint id; a missing id records
+//! silence, like an unplugged device), `pid:N` (what process N and its
+//! children play), `app:NAME.exe` (follows that app, e.g. `app:Discord.exe`),
+//! `not:N` (everything except process N). Each input gets its own track
+//! (`<out-prefix>-<track>.aac`); `--mix` adds a mixed track 1 of all inputs.
 
 #[cfg(not(windows))]
 fn main() {
@@ -24,31 +29,74 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(windows)]
+fn parse_source(spec: &str) -> Result<rec_audio::AudioSource, String> {
+    use rec_audio::{AudioSource, ProcessTarget};
+
+    let pid = |s: &str| s.parse::<u32>().map_err(|e| format!("{spec}: {e}"));
+    Ok(match spec {
+        "loopback" => AudioSource::SystemLoopback,
+        "mic" => AudioSource::Microphone { device_id: None },
+        _ => match spec.split_once(':') {
+            Some(("mic", id)) => AudioSource::Microphone {
+                device_id: Some(id.to_owned()),
+            },
+            Some(("pid", n)) => AudioSource::Process {
+                target: ProcessTarget::Pid(pid(n)?),
+                exclude: false,
+            },
+            Some(("not", n)) => AudioSource::Process {
+                target: ProcessTarget::Pid(pid(n)?),
+                exclude: true,
+            },
+            Some(("app", exe)) => AudioSource::Process {
+                target: ProcessTarget::Executables(vec![exe.to_owned()]),
+                exclude: false,
+            },
+            _ => return Err(format!("unknown input {spec:?}")),
+        },
+    })
+}
+
+#[cfg(windows)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use rec_audio::{AudioCapture, AudioCaptureConfig, AudioSource, aac};
+    use rec_audio::{AudioCapture, AudioCaptureConfig, AudioInput, AudioSource, aac};
     use rec_core::time::{as_secs_f64, qpc_now};
     use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_LITE, MFStartup};
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let [source, seconds, out] = args.as_slice() else {
-        return Err("usage: capture <loopback|mic|mic:ID> <seconds> <out.aac>".into());
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mix = args.first().is_some_and(|a| a == "--mix");
+    if mix {
+        args.remove(0);
+    }
+    let usage = "usage: capture [--mix] <input>... <seconds> <out-prefix>";
+    let [specs @ .., seconds, out] = args.as_slice() else {
+        return Err(usage.into());
     };
-    let source = match source.as_str() {
-        "loopback" => AudioSource::SystemLoopback,
-        "mic" => AudioSource::Microphone { device_id: None },
-        other => match other.strip_prefix("mic:") {
-            Some(id) => AudioSource::Microphone {
-                device_id: Some(id.to_owned()),
-            },
-            None => return Err(format!("unknown source {other:?}").into()),
-        },
-    };
+    if specs.is_empty() {
+        return Err(usage.into());
+    }
     let seconds: f64 = seconds.parse()?;
+    let first_track = if mix { 2 } else { 1 };
+    let inputs = specs
+        .iter()
+        .zip(first_track..)
+        .map(|(spec, track)| {
+            Ok(AudioInput {
+                source: parse_source(spec)?,
+                track: Some(track),
+                mix,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
-    if matches!(source, AudioSource::Microphone { .. }) {
+    if inputs
+        .iter()
+        .any(|i| matches!(i.source, AudioSource::Microphone { .. }))
+    {
         for d in rec_audio::list_microphones()? {
             println!(
                 "mic: {}{}",
@@ -57,6 +105,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    println!(
+        "process loopback supported: {}",
+        rec_audio::process_loopback_supported()
+    );
 
     // SAFETY: once per process, before any Media Foundation use.
     unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) }?;
@@ -65,8 +117,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let start_qpc = qpc_now();
     let capture = AudioCapture::start(
         AudioCaptureConfig {
-            source,
-            track: 1,
+            inputs,
+            mix_track: mix.then_some(1),
             bitrate_kbps: 160,
         },
         Box::new(move |p| {
@@ -75,11 +127,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let format = capture.format().clone();
     println!(
-        "format: AAC-LC {} Hz, {} ch, {} kbit/s, AudioSpecificConfig {:02x?}",
+        "format: AAC-LC {} Hz, {} ch, {} kbit/s, AudioSpecificConfig {:02x?}, tracks {:?}",
         format.sample_rate,
         format.channels,
         capture.bitrate_kbps(),
-        format.codec_config
+        format.codec_config,
+        capture.tracks(),
     );
 
     let cpu0 = cpu_time();
@@ -94,35 +147,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     capture.stop();
     let stop_qpc = qpc_now();
 
-    let packets: Vec<_> = rx.try_iter().collect();
-    let mut file = Vec::new();
-    let mut gaps = 0;
-    for (i, p) in packets.iter().enumerate() {
-        if let Some(next) = packets.get(i + 1) {
-            if next.pts != p.pts + p.duration {
+    let mut tracks: BTreeMap<u8, Vec<rec_core::replay::Packet>> = BTreeMap::new();
+    for p in rx.try_iter() {
+        tracks.entry(p.track).or_default().push(p);
+    }
+    println!("stats: {stats:#?}");
+    for (track, packets) in &tracks {
+        let mut file = Vec::new();
+        let mut gaps = 0;
+        for (i, p) in packets.iter().enumerate() {
+            if packets
+                .get(i + 1)
+                .is_some_and(|next| next.pts != p.pts + p.duration)
+            {
                 gaps += 1;
             }
+            file.extend_from_slice(
+                &aac::adts_header(48_000, 2, p.len()).ok_or("packet too large")?,
+            );
+            file.extend_from_slice(&p.data);
         }
-        file.extend_from_slice(&aac::adts_header(48_000, 2, p.len()).ok_or("packet too large")?);
-        file.extend_from_slice(&p.data);
+        let path = format!("{out}-{track}.aac");
+        std::fs::write(&path, &file)?;
+        if let (Some(first), Some(last)) = (packets.first(), packets.last()) {
+            println!(
+                "track {track}: {} packets, {} bytes, timestamp gaps: {gaps}, {:.3} s (first pts {:+.3} s after start, end {:+.3} s vs stop) -> {path}",
+                packets.len(),
+                file.len(),
+                as_secs_f64(last.pts + last.duration - first.pts),
+                as_secs_f64(first.pts - start_qpc),
+                as_secs_f64(last.pts + last.duration - stop_qpc),
+            );
+        }
     }
-    std::fs::write(out, &file)?;
-
-    println!("stats: {stats:#?}");
-    if let (Some(first), Some(last)) = (packets.first(), packets.last()) {
-        println!(
-            "packets: {}, {} bytes, timestamp gaps: {gaps}",
-            packets.len(),
-            file.len()
-        );
-        println!(
-            "track: {:.3} s (first pts {:+.3} s after start, end {:+.3} s vs stop); capture ran {:.3} s",
-            as_secs_f64(last.pts + last.duration - first.pts),
-            as_secs_f64(first.pts - start_qpc),
-            as_secs_f64(last.pts + last.duration - stop_qpc),
-            as_secs_f64(stop_qpc - start_qpc),
-        );
-    }
+    println!("capture ran {:.3} s", as_secs_f64(stop_qpc - start_qpc));
     // GetProcessTimes is charged per scheduler tick (15.6 ms), so short runs are
     // noisy; QueryProcessCycleTime counts TSC cycles exactly.
     let cycle_secs = cycles as f64 / tsc_hz;
@@ -137,7 +195,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         cpu.as_secs_f64() * 1e3,
         100.0 * cpu.as_secs_f64() / wall.as_secs_f64()
     );
-    println!("wrote {out}");
     Ok(())
 }
 

@@ -3,8 +3,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use rec_audio::{AudioCapture, AudioCaptureConfig, AudioSource};
-use rec_core::config::{Codec, Config, Quality};
+use rec_audio::{AudioCapture, AudioCaptureConfig, AudioInput, AudioSource, ProcessTarget};
+use rec_core::config::{AudioConfig, Codec, Config, Quality};
 use rec_core::media::{TrackInfo, TrackKind, VIDEO_TRACK};
 use rec_core::replay::{Limits, Packet, ReplayBuffer, TrackId};
 use rec_core::time::secs;
@@ -28,6 +28,8 @@ pub struct Target {
     /// Friendly name used for folders and file names.
     pub game: String,
     pub exe_name: String,
+    /// The game's process id; 0 for desktop recording.
+    pub pid: u32,
     /// Record the whole display instead of just the window.
     pub display: bool,
 }
@@ -47,7 +49,7 @@ pub struct Session {
     description: String,
     // Video is declared before audio so it stops first when dropped.
     video: VideoCapture,
-    _audio: Vec<AudioCapture>,
+    _audio: Option<AudioCapture>,
 }
 
 /// Seconds kept beyond the requested clip length: room for keyframe
@@ -85,6 +87,92 @@ pub fn default_bitrate_kbps(
         Codec::Auto | Codec::Hevc | Codec::Av1 => 1.0,
     };
     (base * pixels.powf(0.75) * rate.powf(0.6) * codec).clamp(3_000.0, 150_000.0) as u32
+}
+
+/// The audio inputs and tracks a session records, with each track's name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioPlan {
+    pub config: AudioCaptureConfig,
+    /// `(track, name)` in track order, mixed track first.
+    pub names: Vec<(TrackId, &'static str)>,
+}
+
+/// Turns the audio settings into inputs and tracks (video is track 0).
+///
+/// With per-app capture (`game_pid` known and process loopback supported):
+/// the game, voice chat apps and "other apps" (everything except the game)
+/// each get a track. Without it, one system-loopback track stands in for all
+/// three. The microphone is always its own track. The mixed track sums what
+/// a viewer should hear: game, voice chat (or "other apps", which already
+/// contains voice chat) and the microphone; it is only written when it would
+/// differ from a single track.
+pub fn plan_audio(a: &AudioConfig, game_pid: Option<u32>, per_app: bool) -> Option<AudioPlan> {
+    let process = |target: ProcessTarget, exclude: bool| AudioSource::Process { target, exclude };
+    // (source, name, in the mix)
+    let mut inputs: Vec<(AudioSource, &'static str, bool)> = Vec::new();
+    match game_pid.filter(|_| per_app) {
+        Some(pid) => {
+            if a.game {
+                inputs.push((process(ProcessTarget::Pid(pid), false), "Game", true));
+            }
+            if a.voice_chat && !a.voice_chat_apps.is_empty() {
+                let apps = ProcessTarget::Executables(a.voice_chat_apps.clone());
+                inputs.push((process(apps, false), "Voice chat", !a.other_apps));
+            }
+            if a.other_apps {
+                inputs.push((process(ProcessTarget::Pid(pid), true), "Other apps", true));
+            }
+        }
+        None => {
+            if a.game || a.voice_chat || a.other_apps {
+                let name = if game_pid.is_some() {
+                    "Game & system audio"
+                } else {
+                    "System audio"
+                };
+                inputs.push((AudioSource::SystemLoopback, name, true));
+            }
+        }
+    }
+    if a.microphone {
+        let mic = AudioSource::Microphone {
+            device_id: a.microphone_device.clone(),
+        };
+        inputs.push((mic, "Microphone", true));
+    }
+    if inputs.is_empty() {
+        return None;
+    }
+
+    let mixed = inputs.iter().filter(|(_, _, mix)| *mix).count();
+    let mix = a.mixed_track && mixed >= 2;
+    let mut names = Vec::new();
+    let mut next: TrackId = VIDEO_TRACK + 1;
+    let mix_track = mix.then(|| {
+        names.push((next, "Mixed"));
+        next += 1;
+        next - 1
+    });
+    let inputs = inputs
+        .into_iter()
+        .map(|(source, name, in_mix)| {
+            names.push((next, name));
+            next += 1;
+            AudioInput {
+                source,
+                track: Some(next - 1),
+                mix: mix && in_mix,
+            }
+        })
+        .collect();
+    Some(AudioPlan {
+        config: AudioCaptureConfig {
+            inputs,
+            mix_track,
+            bitrate_kbps: a.bitrate_kbps,
+        },
+        names,
+    })
 }
 
 /// Output size after the `max_height` cap, keeping the aspect ratio.
@@ -236,47 +324,29 @@ impl Session {
         }];
 
         // ---- audio ----
-        // Per-app tracks (game / voice chat / other apps) arrive with process
-        // loopback; until then everything the PC plays shares one track.
-        let a = &config.audio;
-        let mut sources: Vec<(AudioSource, &str)> = Vec::new();
-        if a.game || a.voice_chat || a.other_apps {
-            sources.push((AudioSource::SystemLoopback, "Game & system audio"));
-        }
-        if a.microphone {
-            sources.push((
-                AudioSource::Microphone {
-                    device_id: a.microphone_device.clone(),
-                },
-                "Microphone",
-            ));
-        }
-        let mut audio = Vec::new();
-        for (id, (source, name)) in (1 as TrackId..).zip(sources) {
-            let audio_config = AudioCaptureConfig {
-                source,
-                track: id,
-                bitrate_kbps: a.bitrate_kbps,
-            };
-            match AudioCapture::start(audio_config, sink(&buffer)) {
+        let per_app = rec_audio::process_loopback_supported();
+        let game_pid = (target.pid != 0).then_some(target.pid);
+        let mut audio = None;
+        if let Some(plan) = plan_audio(&config.audio, game_pid, per_app) {
+            match AudioCapture::start(plan.config, sink(&buffer)) {
                 Ok(capture) => {
-                    tracks.push(TrackInfo {
-                        id,
-                        name: name.into(),
-                        kind: TrackKind::Audio(capture.format().clone()),
-                    });
-                    audio.push(capture);
+                    for &(id, name) in &plan.names {
+                        tracks.push(TrackInfo {
+                            id,
+                            name: name.into(),
+                            kind: TrackKind::Audio(capture.format().clone()),
+                        });
+                    }
+                    audio = Some(capture);
                 }
-                Err(e) => warning!("{name} unavailable, recording without it: {e}"),
+                Err(e) => warning!("audio unavailable, recording without it: {e}"),
             }
         }
+        let audio_tracks = tracks.len() - 1;
 
         info!(
             "session: {description}, encoder {}, rate control {}, {} audio track(s), buffer {seconds} s / {} MB",
-            info.encoder_name,
-            info.rate_control,
-            audio.len(),
-            replay.max_memory_mb
+            info.encoder_name, info.rate_control, audio_tracks, replay.max_memory_mb
         );
         Ok(Self {
             target,
@@ -330,6 +400,112 @@ mod tests {
         assert!(b(Quality::Performance, Codec::Hevc, 1920, 1080, 30) < 10_000);
         assert_eq!(b(Quality::Quality, Codec::H264, 7680, 4320, 240), 150_000);
         assert_eq!(b(Quality::Performance, Codec::Hevc, 320, 240, 10), 3_000);
+    }
+
+    fn kinds(plan: &AudioPlan) -> Vec<(TrackId, &'static str, bool)> {
+        plan.names
+            .iter()
+            .map(|&(id, name)| {
+                let mixed = plan
+                    .config
+                    .inputs
+                    .iter()
+                    .find(|i| i.track == Some(id))
+                    .is_some_and(|i| i.mix);
+                (id, name, mixed)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_audio_is_game_and_voice_plus_a_mix() {
+        let plan = plan_audio(&AudioConfig::default(), Some(42), true).unwrap();
+        assert_eq!(
+            kinds(&plan),
+            vec![
+                (1, "Mixed", false),
+                (2, "Game", true),
+                (3, "Voice chat", true)
+            ]
+        );
+        assert_eq!(plan.config.mix_track, Some(1));
+        assert_eq!(
+            plan.config.inputs[0].source,
+            AudioSource::Process {
+                target: ProcessTarget::Pid(42),
+                exclude: false
+            }
+        );
+    }
+
+    #[test]
+    fn other_apps_replaces_voice_chat_in_the_mix() {
+        let a = AudioConfig {
+            other_apps: true,
+            microphone: true,
+            ..AudioConfig::default()
+        };
+        let plan = plan_audio(&a, Some(42), true).unwrap();
+        assert_eq!(
+            kinds(&plan),
+            vec![
+                (1, "Mixed", false),
+                (2, "Game", true),
+                (3, "Voice chat", false),
+                (4, "Other apps", true),
+                (5, "Microphone", true)
+            ]
+        );
+    }
+
+    #[test]
+    fn without_per_app_audio_one_loopback_track_stands_in() {
+        let plan = plan_audio(&AudioConfig::default(), Some(42), false).unwrap();
+        assert_eq!(kinds(&plan), vec![(1, "Game & system audio", false)]);
+        assert_eq!(plan.config.mix_track, None);
+        let desktop = plan_audio(
+            &AudioConfig {
+                microphone: true,
+                ..AudioConfig::default()
+            },
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            kinds(&desktop),
+            vec![
+                (1, "Mixed", false),
+                (2, "System audio", true),
+                (3, "Microphone", true)
+            ]
+        );
+    }
+
+    #[test]
+    fn single_input_or_mix_off_writes_no_mix() {
+        let a = AudioConfig {
+            voice_chat: false,
+            ..AudioConfig::default()
+        };
+        assert_eq!(
+            kinds(&plan_audio(&a, Some(1), true).unwrap()),
+            vec![(1, "Game", false)]
+        );
+        let a = AudioConfig {
+            mixed_track: false,
+            ..AudioConfig::default()
+        };
+        assert_eq!(
+            kinds(&plan_audio(&a, Some(1), true).unwrap()),
+            vec![(1, "Game", false), (2, "Voice chat", false)]
+        );
+        let none = AudioConfig {
+            game: false,
+            voice_chat: false,
+            ..AudioConfig::default()
+        };
+        assert_eq!(plan_audio(&none, Some(1), true), None);
     }
 
     #[test]

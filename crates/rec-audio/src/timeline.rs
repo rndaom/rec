@@ -178,6 +178,12 @@ impl Timeline {
         }
     }
 
+    /// The first index after `index` where the sample-to-time mapping jumps
+    /// (a long gap), if any. Samples from `index` up to it are evenly spaced.
+    pub fn mapping_break_after(&self, index: i64) -> Option<i64> {
+        (index < self.anchor.index).then_some(self.anchor.index)
+    }
+
     /// Time of the next sample to be fed.
     pub fn position(&self) -> Hns {
         self.time_of(self.written)
@@ -514,6 +520,8 @@ mod tests {
         let jump = w0 + (LONG_GAP_FILL / 2) as i64;
         assert_eq!(t.duration_of(jump - 512, 1024), 213_333);
         assert!(t.time_of(jump) - t.time_of(jump - 1) > 3_000 * HNS_PER_SEC);
+        assert_eq!(t.mapping_break_after(w0), Some(jump));
+        assert_eq!(t.mapping_break_after(jump), None);
         // Normal operation resumes afterwards.
         let p = t.on_data(Some(now - ms(70)), 480, now);
         assert_eq!(p.silence_before, u64::from(samples(30)));

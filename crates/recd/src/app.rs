@@ -493,6 +493,7 @@ impl App {
                         hwnd: Hwnd::default(),
                         game: "Desktop".into(),
                         exe_name: String::new(),
+                        pid: 0,
                         display: true,
                     });
                 }
@@ -533,6 +534,7 @@ impl App {
             hwnd: Hwnd(info.hwnd),
             game: detect::display_name(&info.exe_path, &info.title),
             exe_name: info.exe_name,
+            pid: info.pid,
             display: self.config.video.target == CaptureTarget::Display,
         };
         self.start_session(target);

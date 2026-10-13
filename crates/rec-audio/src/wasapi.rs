@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
-use rec_core::time::Hns;
+use rec_core::time::{Hns, millis};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::PROPERTYKEY;
+use windows::Win32::Media::Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
@@ -15,16 +16,31 @@ use windows::Win32::Media::Audio::{
     IMMNotificationClient_Impl, MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX, eCapture,
     eCommunications, eConsole, eRender,
 };
-use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
+use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
 use windows::core::{HSTRING, PCWSTR, implement};
 
+use crate::process::{self, Followed};
 use crate::sys::{ComGuard, Event};
+use crate::timeline::samples_to_hns;
 use crate::{AudioDevice, AudioError, AudioSource, CHANNELS, Context, SAMPLE_RATE};
 
 /// Shared-mode buffer length. Generous so a delayed wake-up never overflows
 /// it; it does not add latency (we read whatever is available).
 const BUFFER_DURATION: Hns = 2_000_000; // 200 ms
+
+/// Process loopback reports no device position, so a timestamp this far from
+/// where the previous packet ended marks a discontinuity (the stream jumps by
+/// 15-50 ms when the app starts or stops playing; packet jitter is far below
+/// this).
+const TIMESTAMP_JUMP: Hns = millis(3);
+
+/// Process loopback stamps the same sound this much later than endpoint
+/// loopback does (measured by cross-correlating both captures of one app:
+/// 19.6-21.7 ms over four runs, Windows 11 26200, USB headset). Endpoint
+/// loopback stamps are presentation times, when the sound is heard, which is
+/// what clips need, so process loopback timestamps are moved back by this.
+const PROCESS_LOOPBACK_LATE: Hns = millis(21);
 
 pub(crate) fn enumerator() -> Result<IMMDeviceEnumerator, AudioError> {
     // SAFETY: COM is initialised on the calling thread.
@@ -32,10 +48,12 @@ pub(crate) fn enumerator() -> Result<IMMDeviceEnumerator, AudioError> {
         .context("create IMMDeviceEnumerator")
 }
 
-/// Data flow and role of the default device a source follows.
+/// Data flow and role of the default device a source follows. Process
+/// loopback follows the default render device too: it is reopened when that
+/// changes.
 fn default_role(source: &AudioSource) -> (EDataFlow, ERole) {
     match source {
-        AudioSource::SystemLoopback => (eRender, eConsole),
+        AudioSource::SystemLoopback | AudioSource::Process { .. } => (eRender, eConsole),
         AudioSource::Microphone { .. } => (eCapture, eCommunications),
     }
 }
@@ -83,18 +101,17 @@ fn friendly_name(device: &IMMDevice) -> Option<String> {
 }
 
 fn property_string(device: &IMMDevice, key: &PROPERTYKEY) -> Option<String> {
-    // SAFETY: the PROPVARIANT is cleared after use and the string returned by
+    // SAFETY: the PROPVARIANT is cleared when dropped (windows-rs implements
+    // Drop with PropVariantClear) and the string returned by
     // PropVariantToStringAlloc is freed after copying.
     unsafe {
         let store = device.OpenPropertyStore(STGM_READ).ok()?;
-        let mut value = store.GetValue(key).ok()?;
-        let s = PropVariantToStringAlloc(&value).ok().and_then(|p| {
+        let value = store.GetValue(key).ok()?;
+        PropVariantToStringAlloc(&value).ok().and_then(|p| {
             let s = p.to_string().ok();
             CoTaskMemFree(Some(p.0 as *const _));
             s
-        });
-        let _ = PropVariantClear(&mut value);
-        s
+        })
     }
 }
 
@@ -136,25 +153,72 @@ pub(crate) struct Chunk<'a> {
     pub(crate) discontinuity: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Capture,
+    Loopback,
+    /// Process loopback: no device position, event-driven.
+    Process,
+}
+
 /// A started shared-mode capture stream delivering 48 kHz / 16-bit / stereo.
 pub(crate) struct Stream {
     client: IAudioClient,
     capture: IAudioCaptureClient,
+    /// The endpoint captured; for process loopback, the default render
+    /// endpoint when the stream was opened.
     pub(crate) id: String,
     pub(crate) name: Option<String>,
+    /// Signalled when data is ready (process loopback only; endpoint streams
+    /// are polled, see `capture.rs`).
+    pub(crate) event: Option<Event>,
     next_position: Option<u64>,
+    /// Process loopback: continuity is judged from timestamps.
+    next_time: Option<Hns>,
+    position_reliable: bool,
 }
 
 impl Stream {
-    /// Opens and starts a polled capture stream for `source` (no event
-    /// handle; see `capture.rs` for why).
+    /// Opens and starts a capture stream for `source`. Process loopback needs
+    /// the process to follow (`followed`) and is event-driven; endpoint
+    /// streams are polled.
     pub(crate) fn open(
         enumr: &IMMDeviceEnumerator,
         source: &AudioSource,
+        followed: Option<&Followed>,
     ) -> Result<Self, AudioError> {
+        if let AudioSource::Process { exclude, .. } = source {
+            let followed =
+                followed.ok_or_else(|| AudioError::Device("the app is not running".into()))?;
+            let client = process::activate(followed.pid, *exclude)?;
+            // Only used to notice default-device changes.
+            let id = current_device_id(enumr, source).unwrap_or_default();
+            let name = if *exclude {
+                format!("everything except {}", followed.describe())
+            } else {
+                followed.describe()
+            };
+            return Self::start(client, id, Some(name), Kind::Process);
+        }
         let device = resolve(enumr, source)?;
         let id = device_id(&device)?;
         let name = friendly_name(&device);
+        // SAFETY: valid device.
+        let client: IAudioClient =
+            unsafe { device.Activate(CLSCTX_ALL, None) }.context("activate IAudioClient")?;
+        let kind = match source {
+            AudioSource::SystemLoopback => Kind::Loopback,
+            _ => Kind::Capture,
+        };
+        Self::start(client, id, name, kind)
+    }
+
+    fn start(
+        client: IAudioClient,
+        id: String,
+        name: Option<String>,
+        kind: Kind,
+    ) -> Result<Self, AudioError> {
         let block_align = CHANNELS * 2;
         let format = WAVEFORMATEX {
             wFormatTag: WAVE_FORMAT_PCM as u16,
@@ -169,14 +233,21 @@ impl Stream {
         // channel layout or sample type) to `format`.
         let mut flags =
             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-        if matches!(source, AudioSource::SystemLoopback) {
-            flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
+        match kind {
+            Kind::Capture => {}
+            Kind::Loopback => flags |= AUDCLNT_STREAMFLAGS_LOOPBACK,
+            Kind::Process => {
+                flags |= AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+            }
         }
-        // SAFETY: valid device; `format` outlives Initialize.
+        let event = match kind {
+            Kind::Process => Some(Event::new()?),
+            _ => None,
+        };
+        // SAFETY: valid client; `format` outlives Initialize; the event
+        // handle outlives the client (both are owned by the new Stream, and
+        // the client is stopped in Drop before the event closes).
         unsafe {
-            let client: IAudioClient = device
-                .Activate(CLSCTX_ALL, None)
-                .context("activate IAudioClient")?;
             client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
@@ -187,6 +258,11 @@ impl Stream {
                     None,
                 )
                 .context("IAudioClient::Initialize")?;
+            if let Some(event) = &event {
+                client
+                    .SetEventHandle(event.handle())
+                    .context("IAudioClient::SetEventHandle")?;
+            }
             let capture: IAudioCaptureClient =
                 client.GetService().context("IAudioClient::GetService")?;
             client.Start().context("IAudioClient::Start")?;
@@ -195,7 +271,10 @@ impl Stream {
                 capture,
                 id,
                 name,
+                event,
                 next_position: None,
+                next_time: None,
+                position_reliable: kind != Kind::Process,
             })
         }
     }
@@ -233,16 +312,27 @@ impl Stream {
                 unsafe { self.capture.ReleaseBuffer(0) }.context("ReleaseBuffer")?;
                 return Ok(());
             }
-            let discontinuity = flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0
-                || self.next_position.is_some_and(|p| p != position);
+            let late = if self.position_reliable {
+                0
+            } else {
+                PROCESS_LOOPBACK_LATE
+            };
+            let time = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc != 0)
+                .then_some(qpc as Hns - late);
+            let jumped = if self.position_reliable {
+                self.next_position.is_some_and(|p| p != position)
+            } else {
+                matches!((self.next_time, time), (Some(e), Some(t)) if (t - e).abs() > TIMESTAMP_JUMP)
+            };
+            let discontinuity =
+                flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 || jumped;
             self.next_position = Some(position + u64::from(frames));
+            self.next_time = time.map(|t| t + samples_to_hns(frames.into()));
             let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0
                 || data.is_null()
                 // Never happens (engine buffers are 16-byte aligned), but an
                 // unaligned pointer must not become an `&[i16]`.
                 || data as usize % std::mem::align_of::<i16>() != 0;
-            let time = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc != 0)
-                .then_some(qpc as Hns);
             let pcm = (!silent).then(|| {
                 // SAFETY: GetBuffer returned `frames` frames of the format we
                 // asked for (2 x i16 each), valid until ReleaseBuffer, and the
@@ -281,8 +371,8 @@ impl Drop for Stream {
 #[implement(IMMNotificationClient)]
 struct Notifier {
     event: Arc<Event>,
-    flow: EDataFlow,
-    role: ERole,
+    /// Default devices whose change matters.
+    roles: Vec<(EDataFlow, ERole)>,
 }
 
 impl IMMNotificationClient_Impl for Notifier_Impl {
@@ -311,7 +401,7 @@ impl IMMNotificationClient_Impl for Notifier_Impl {
         role: ERole,
         _id: &PCWSTR,
     ) -> windows::core::Result<()> {
-        if flow == self.flow && role == self.role {
+        if self.roles.contains(&(flow, role)) {
             self.event.set();
         }
         Ok(())
@@ -333,13 +423,19 @@ pub(crate) struct Notifications {
 }
 
 impl Notifications {
-    pub(crate) fn register(
+    /// Signals `event` when a device the `sources` may use changes.
+    pub(crate) fn register<'a>(
         enumr: &IMMDeviceEnumerator,
-        source: &AudioSource,
+        sources: impl IntoIterator<Item = &'a AudioSource>,
         event: Arc<Event>,
     ) -> Result<Self, AudioError> {
-        let (flow, role) = default_role(source);
-        let client: IMMNotificationClient = Notifier { event, flow, role }.into();
+        let mut roles: Vec<(EDataFlow, ERole)> = Vec::new();
+        for role in sources.into_iter().map(default_role) {
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
+        }
+        let client: IMMNotificationClient = Notifier { event, roles }.into();
         // SAFETY: valid enumerator and client; unregistered in Drop.
         unsafe { enumr.RegisterEndpointNotificationCallback(&client) }
             .context("RegisterEndpointNotificationCallback")?;
