@@ -34,6 +34,7 @@ pub enum Look {
 pub enum MenuCommand {
     SaveClip = 1,
     TogglePause,
+    QuickPanel,
     OpenClips,
     OpenConfig,
     OpenLog,
@@ -45,6 +46,7 @@ impl MenuCommand {
         [
             Self::SaveClip,
             Self::TogglePause,
+            Self::QuickPanel,
             Self::OpenClips,
             Self::OpenConfig,
             Self::OpenLog,
@@ -177,7 +179,8 @@ impl Tray {
     }
 
     /// Shows the context menu at the cursor and returns the chosen command.
-    pub fn menu(&self, status: &str, paused: bool) -> Option<MenuCommand> {
+    /// `panel_hotkey` is shown next to the quick panel entry.
+    pub fn menu(&self, status: &str, paused: bool, panel_hotkey: &str) -> Option<MenuCommand> {
         // SAFETY: the menu is created, used modally and destroyed here; all
         // strings outlive the calls that read them.
         unsafe {
@@ -202,6 +205,11 @@ impl Tray {
                 } else {
                     "Pause recording"
                 },
+            );
+            add(
+                MF_STRING,
+                Some(MenuCommand::QuickPanel),
+                &format!("Quick panel\t{panel_hotkey}"),
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             add(MF_STRING, Some(MenuCommand::OpenClips), "Open clips folder");

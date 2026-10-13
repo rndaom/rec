@@ -86,9 +86,11 @@ Closing the UI can never stop the recording.
 
 ## D8. In-game overlay without injection
 
-- **Overlay:** a topmost, non-activating (`WS_EX_NOACTIVATE`), click-through-when-hidden DirectComposition window drawn with Direct2D. It is marked `WDA_EXCLUDEFROMCAPTURE` so it never shows up in clips.
-- **Limits:** it works over borderless and Fullscreen-Optimized games. Over true exclusive fullscreen, rec falls back to sound cues.
-- **Lifetime:** shown only briefly, to avoid knocking the game out of independent flip.
+- **Overlay:** the quick panel is a topmost DirectComposition window drawn with Direct2D and DirectWrite (on WARP, so its drawing never touches the game's GPU queue). It is marked `WDA_EXCLUDEFROMCAPTURE` so it never shows up in clips. Toasts stay small click-through, non-activating layered windows.
+- **Focus:** the panel takes focus while open. Without injection or a keyboard hook, that is the only way to read its keys without the game also acting on them (Esc would open the game's menu). NVIDIA, AMD and Xbox Game Bar overlays do the same. Closing it (Esc, the hotkey, or clicking elsewhere) gives focus back to the game.
+- **Limits:** it works over borderless and Fullscreen-Optimized games. Over true exclusive fullscreen (detected from black capture, see `recd/src/watch.rs`) the panel does not open, because taking focus would minimize the game; rec falls back to sound cues.
+- **Lifetime:** created on open and released on close, so it costs nothing while gaming and only breaks the game's independent flip while the user is in it.
+- **Changes never cost the buffer:** clip length resizes the buffer in place, quality changes the encoder's bitrate in place (the clip stays one segment), audio switches mute the input. All are saved to `config.toml` without rewriting the rest of the file.
 
 ## D9. Settings & library UI: Tauri 2 + Svelte 5 + TypeScript
 

@@ -20,6 +20,7 @@
 //! opened event-driven, and the thread also wakes on their events; every
 //! wake-up drains every input.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -64,6 +65,8 @@ pub struct AudioCapture {
     bitrate_kbps: u32,
     tracks: Vec<TrackId>,
     stats: Arc<Mutex<AudioStats>>,
+    /// One flag per input, in config order.
+    muted: Vec<Arc<AtomicBool>>,
     stop: Arc<Event>,
     thread: Option<JoinHandle<()>>,
 }
@@ -76,6 +79,11 @@ impl AudioCapture {
     pub fn start(config: AudioCaptureConfig, sink: Sink) -> Result<Self, AudioError> {
         config.validate()?;
         let tracks = config.tracks();
+        let muted: Vec<_> = config
+            .inputs
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
         let stop = Arc::new(Event::new()?);
         let stats = Arc::new(Mutex::new(AudioStats {
             running: true,
@@ -88,10 +96,11 @@ impl AudioCapture {
             .spawn({
                 let stop = Arc::clone(&stop);
                 let stats = Arc::clone(&stats);
+                let muted = muted.clone();
                 move || {
                     // Clears `running` however the thread ends, panics included.
                     let _running = Running(&stats);
-                    let result = run(config, sink, &stop, &stats, &ready_tx);
+                    let result = run(config, sink, &muted, &stop, &stats, &ready_tx);
                     if let Err(e) = result {
                         lock(&stats).last_error = Some(e.to_string());
                         // Only delivered if start() is still waiting.
@@ -106,6 +115,7 @@ impl AudioCapture {
                 bitrate_kbps,
                 tracks,
                 stats,
+                muted,
                 stop,
                 thread: Some(thread),
             }),
@@ -141,6 +151,22 @@ impl AudioCapture {
 
     pub fn stats(&self) -> AudioStats {
         lock(&self.stats).clone()
+    }
+
+    /// Mutes or unmutes input `input` (an index into
+    /// [`AudioCaptureConfig::inputs`]) from its next chunk on: a muted input
+    /// carries silence on its own track and adds nothing to the mix, so its
+    /// track and the timeline stay intact and nothing has to restart.
+    pub fn set_muted(&self, input: usize, muted: bool) {
+        if let Some(flag) = self.muted.get(input) {
+            flag.store(muted, Ordering::Relaxed);
+        }
+    }
+
+    pub fn is_muted(&self, input: usize) -> bool {
+        self.muted
+            .get(input)
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     /// Stops capture, flushes the encoders into the sink and joins the thread.
@@ -183,6 +209,7 @@ fn grid_index(t: Hns, epoch: Hns) -> i64 {
 fn run(
     config: AudioCaptureConfig,
     mut sink: Sink,
+    muted: &[Arc<AtomicBool>],
     stop: &Event,
     stats: &Mutex<AudioStats>,
     ready: &Ready,
@@ -205,7 +232,7 @@ fn run(
         .transpose()?;
     let mut inputs = Vec::with_capacity(config.inputs.len());
     let mut slot = 0;
-    for input in config.inputs {
+    for (input, muted) in config.inputs.into_iter().zip(muted) {
         let track = input
             .track
             .map(|t| Track::new(t, config.bitrate_kbps))
@@ -214,7 +241,13 @@ fn run(
             slot += 1;
             slot - 1
         });
-        inputs.push(Input::new(input.source, track, mix_slot, epoch));
+        inputs.push(Input::new(
+            input.source,
+            track,
+            mix_slot,
+            epoch,
+            muted.clone(),
+        ));
     }
     let encoder = inputs
         .iter()
@@ -587,6 +620,8 @@ struct Downstream {
     track: Option<Track>,
     mix_slot: Option<usize>,
     epoch: Hns,
+    /// Set from [`AudioCapture::set_muted`].
+    muted: Arc<AtomicBool>,
 }
 
 impl Downstream {
@@ -603,8 +638,9 @@ impl Downstream {
             return Ok(());
         }
         // Near-silence is passed on as true silence: the track can repeat a
-        // silent packet and the mix stays silent.
-        let pcm = pcm.filter(|pcm| !is_silent(pcm));
+        // silent packet and the mix stays silent. A muted input is silence.
+        let muted = self.muted.load(Ordering::Relaxed);
+        let pcm = pcm.filter(|pcm| !muted && !is_silent(pcm));
         let first = self.fed;
         let end = first + frames as i64;
         self.fed = end;
@@ -651,7 +687,13 @@ struct Input {
 }
 
 impl Input {
-    fn new(source: AudioSource, track: Option<Track>, mix_slot: Option<usize>, epoch: Hns) -> Self {
+    fn new(
+        source: AudioSource,
+        track: Option<Track>,
+        mix_slot: Option<usize>,
+        epoch: Hns,
+        muted: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             source,
             followed: None,
@@ -666,6 +708,7 @@ impl Input {
                 track,
                 mix_slot,
                 epoch,
+                muted,
             },
         }
     }

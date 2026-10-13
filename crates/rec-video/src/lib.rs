@@ -121,12 +121,7 @@ impl VideoCaptureConfig {
                 self.fps
             )));
         }
-        if self.bitrate_kbps == 0 || self.bitrate_kbps > 1_000_000 {
-            return Err(VideoError::InvalidConfig(format!(
-                "bitrate {} kbit/s is outside 1..=1000000",
-                self.bitrate_kbps
-            )));
-        }
+        validate_bitrate(self.bitrate_kbps)?;
         if self.max_height.is_some_and(|h| h < 16) {
             return Err(VideoError::InvalidConfig(
                 "max_height must be at least 16".into(),
@@ -134,6 +129,15 @@ impl VideoCaptureConfig {
         }
         Ok(())
     }
+}
+
+fn validate_bitrate(kbps: u32) -> Result<(), VideoError> {
+    if kbps == 0 || kbps > 1_000_000 {
+        return Err(VideoError::InvalidConfig(format!(
+            "bitrate {kbps} kbit/s is outside 1..=1000000"
+        )));
+    }
+    Ok(())
 }
 
 /// Counters for monitoring the pipeline. Cheap to take at any time.
@@ -174,7 +178,11 @@ pub struct VideoStats {
     pub last_error: Option<String>,
 }
 
-/// Facts about the running pipeline, fixed for the session.
+/// Facts about the running pipeline, as they were when it started. Almost
+/// everything is fixed for the session; the exception is the bit rate, which
+/// [`VideoCapture::set_bitrate`] can change: the mean/max in
+/// [`rate_control`](Self::rate_control) then describe the start state, and
+/// the current mean is what `set_bitrate` last returned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoInfo {
     pub format: VideoFormat,
@@ -187,7 +195,8 @@ pub struct VideoInfo {
     /// The adapter's LUID; compare with [`adapter_for`] to notice that the
     /// source moved to another GPU.
     pub adapter_luid: i64,
-    /// Rate-control mode the encoder reported after configuration.
+    /// Rate-control mode (with the mean/max bit rate) the encoder reported
+    /// after configuration; not updated by `set_bitrate`.
     pub rate_control: String,
     /// Source size when the session started.
     pub source_width: u32,
@@ -280,6 +289,10 @@ pub type PacketSink = Box<dyn FnMut(Packet) + Send>;
 /// detaching it (only a hung driver call could take this long).
 pub const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long [`VideoCapture::set_bitrate`] waits for the encode thread.
+#[cfg(windows)]
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A running capture → encode pipeline. Dropping it stops and joins it.
 #[derive(Debug)]
 pub struct VideoCapture {
@@ -289,6 +302,9 @@ pub struct VideoCapture {
     stop: Arc<util::Event>,
     /// Signalled (or disconnected) when the encode thread has finished.
     done: Option<std::sync::mpsc::Receiver<()>>,
+    /// Requests to the encode thread; see [`VideoCapture::set_bitrate`].
+    #[cfg(windows)]
+    commands: std::sync::mpsc::Sender<pipeline::Command>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -306,12 +322,15 @@ impl VideoCapture {
         let stop = Arc::new(util::Event::new()?);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
         let thread = {
             let stats = stats.clone();
             let stop = stop.clone();
             std::thread::Builder::new()
                 .name("rec-video-encode".into())
-                .spawn(move || pipeline::run(config, sink, stats, stop, ready_tx, done_tx))
+                .spawn(move || {
+                    pipeline::run(config, sink, stats, stop, ready_tx, done_tx, command_rx)
+                })
                 .map_err(|e| VideoError::Other(format!("cannot spawn encode thread: {e}")))?
         };
         match ready_rx.recv() {
@@ -320,6 +339,7 @@ impl VideoCapture {
                 stats,
                 stop,
                 done: Some(done_rx),
+                commands: command_tx,
                 thread: Some(thread),
             }),
             Ok(Err(err)) => {
@@ -358,6 +378,51 @@ impl VideoCapture {
 
     pub fn stats(&self) -> VideoStats {
         self.stats.snapshot()
+    }
+
+    /// Changes the encoder's mean bit rate to `kbps` kbit/s (peak 1.5 x mean)
+    /// while the pipeline keeps running: no restart, so the segment and the
+    /// packet stream (timestamps, IDR every second) continue unbroken and a
+    /// replay buffer keeps its history. Returns the mean bit rate in kbit/s
+    /// the encoder reports afterwards (`kbps` if it does not report one).
+    ///
+    /// Synchronous: the encode thread applies the change at its next tick,
+    /// so normally this takes at most about one frame period. It fails if
+    /// `kbps` is outside 1..=1000000, the encoder refuses the change, the
+    /// pipeline is not running, or the encode thread does not answer within
+    /// one second (the change may still be applied late). Treat any error as
+    /// "restart the pipeline instead".
+    ///
+    /// [`VideoInfo::rate_control`] keeps describing the start state.
+    pub fn set_bitrate(&self, kbps: u32) -> Result<u32, VideoError> {
+        validate_bitrate(kbps)?;
+        self.set_bitrate_impl(kbps)
+    }
+
+    #[cfg(windows)]
+    fn set_bitrate_impl(&self, kbps: u32) -> Result<u32, VideoError> {
+        use std::sync::mpsc::RecvTimeoutError;
+        const NOT_RUNNING: &str = "video pipeline is not running";
+        if !self.stats.running.load(Ordering::Acquire) {
+            return Err(VideoError::Other(NOT_RUNNING.into()));
+        }
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .send(pipeline::Command::SetBitrate { kbps, reply })
+            .map_err(|_| VideoError::Other(NOT_RUNNING.into()))?;
+        match answer.recv_timeout(COMMAND_TIMEOUT) {
+            Ok(result) => result,
+            // The thread dropped the request unanswered: it is exiting.
+            Err(RecvTimeoutError::Disconnected) => Err(VideoError::Other(NOT_RUNNING.into())),
+            Err(RecvTimeoutError::Timeout) => Err(VideoError::Other(
+                "encode thread did not answer the bit rate change in time".into(),
+            )),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn set_bitrate_impl(&self, _kbps: u32) -> Result<u32, VideoError> {
+        Err(VideoError::CaptureUnsupported)
     }
 
     /// Stops capture and encoding and joins the encode thread. Packets still
@@ -462,5 +527,13 @@ mod tests {
         ] {
             assert!(matches!(bad.validate(), Err(VideoError::InvalidConfig(_))));
         }
+    }
+
+    #[test]
+    fn bitrate_validation() {
+        assert!(validate_bitrate(1).is_ok());
+        assert!(validate_bitrate(1_000_000).is_ok());
+        assert!(validate_bitrate(0).is_err());
+        assert!(validate_bitrate(1_000_001).is_err());
     }
 }

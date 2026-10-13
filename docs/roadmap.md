@@ -52,7 +52,7 @@ Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a liv
 - [x] Per-process audio tracks (game, voice chat, mic, other apps) + mixed track (`AudioSource::Process`)
 - [ ] Native NVENC / AMF / oneVPL backends; AV1; encoder capability probing and fallback chain
 - [ ] HDR: FP16 capture → HEVC Main10 PQ with HDR10 metadata, or tone-map to SDR
-- [ ] Quick-panel overlay (DirectComposition, excluded from capture), keyboard and mouse navigation
+- [x] Quick-panel overlay (DirectComposition, excluded from capture), keyboard and mouse navigation
 - [ ] Per-game profiles; extra clip-length hotkeys in the UI; marker hotkey; controller combo
 - [ ] Storage quota with auto-prune (starred clips kept)
 - [ ] Windows 10 path: DDA fallback (monitor capture without the yellow border)

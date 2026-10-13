@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
-use rec_core::config::{self, CaptureTarget, Config, MAX_REPLAY_SECONDS, RecordWhen};
+use rec_core::config::{self, CaptureTarget, Config, MAX_REPLAY_SECONDS, Quality, RecordWhen};
 use rec_core::ipc::{PROTOCOL_VERSION, RecorderState, Request, Response, Status};
 use rec_core::time::{as_secs_f64, qpc_now, secs};
 use windows::Win32::Foundation::{
@@ -42,9 +42,11 @@ use crate::feedback::{self, Kind, Toast};
 use crate::hotkeys::{Action, Hotkeys};
 use crate::ipc_server::IpcServer;
 use crate::log::{error, info, warning};
+use crate::overlay::{self, Overlay};
+use crate::panel::{self, AudioRow, AudioTarget, Command, QualityChoice, View};
 use crate::paths::{self, Stamp};
 use crate::saver::{self, SaveJob};
-use crate::session::{Health, Session, Target};
+use crate::session::{AudioSwitch, Health, Session, Target, default_bitrate_kbps};
 use crate::tray::{Look, MenuCommand, Tray, WM_TRAY};
 use crate::win::{Hwnd, wide};
 
@@ -52,7 +54,10 @@ const WM_WAKE: u32 = WM_APP + 2;
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 const TIMER_HEALTH: usize = 1;
 const TIMER_TOAST: usize = 2;
+/// Refreshes the open quick panel (buffer fill).
+const TIMER_PANEL: usize = 3;
 const HEALTH_INTERVAL_MS: u32 = 2000;
+const PANEL_REFRESH_MS: u32 = 500;
 const TOAST_MS: u32 = 2500;
 /// Don't retry a target that failed to start more often than this.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -103,6 +108,10 @@ pub enum Event {
         game: String,
         reply: Option<Sender<Response>>,
     },
+    /// Input for the open quick panel.
+    Panel(overlay::Input),
+    /// The folder picker closed: the chosen folder, or `None`.
+    FolderPicked(Option<PathBuf>),
     Shutdown,
 }
 
@@ -127,7 +136,8 @@ thread_local! {
 }
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
-fn post(event: Event) {
+/// Sends an event to the main thread from a window procedure on it.
+pub(crate) fn post(event: Event) {
     EVENTS.with(|events| {
         if let Some(events) = &*events.borrow() {
             events.send(event);
@@ -297,6 +307,8 @@ struct App {
     media_foundation: bool,
     tray: Tray,
     toast: Option<Toast>,
+    /// The quick panel, while open.
+    overlay: Option<Overlay>,
     hotkeys: Hotkeys,
     ipc: Option<IpcServer>,
     session: Option<Session>,
@@ -339,6 +351,7 @@ impl App {
             media_foundation,
             tray: Tray::new(hwnd),
             toast,
+            overlay: None,
             hotkeys: Hotkeys::default(),
             ipc,
             session: None,
@@ -384,6 +397,7 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        self.close_panel(true);
         // Nothing answers requests any more: refuse them right away.
         if let Some(ipc) = &self.ipc {
             ipc.close();
@@ -438,6 +452,12 @@ impl App {
         };
         let tip = format!("rec · {}", self.headline());
         self.tray.show(look, &tip);
+        if self.overlay.is_some() {
+            let view = self.panel_view();
+            if let Some(overlay) = &mut self.overlay {
+                overlay.update(view);
+            }
+        }
     }
 
     fn status(&self) -> Status {
@@ -778,13 +798,7 @@ impl App {
                     };
                     self.notify(Kind::Info, title, &self.headline());
                 }
-                Some(Action::ToggleOverlay) => {
-                    let detail = self
-                        .session
-                        .as_ref()
-                        .map_or_else(String::new, Session::describe);
-                    self.notify(Kind::Info, &self.headline(), &detail);
-                }
+                Some(Action::ToggleOverlay) => self.toggle_panel(),
                 Some(Action::AddMarker) => {
                     self.notify(Kind::Info, "Markers", "Coming in a later version")
                 }
@@ -792,7 +806,8 @@ impl App {
             },
             Event::Tray(code) => {
                 if [WM_CONTEXTMENU, NIN_SELECT, NIN_KEYSELECT, WM_RBUTTONUP].contains(&code) {
-                    let command = self.tray.menu(&self.headline(), self.paused);
+                    let hotkey = self.config.hotkeys.toggle_overlay.to_string();
+                    let command = self.tray.menu(&self.headline(), self.paused, &hotkey);
                     if let Some(command) = command {
                         return self.menu(command);
                     }
@@ -810,6 +825,7 @@ impl App {
                     toast.hide();
                 }
             }
+            Event::Timer(TIMER_PANEL) => self.refresh(),
             Event::Timer(_) => {}
             Event::Foreground(hwnd) => {
                 self.consider(hwnd);
@@ -821,9 +837,277 @@ impl App {
                 game,
                 reply,
             } => self.saved(result, seconds, &game, reply),
+            Event::Panel(input) => {
+                let command = self.overlay.as_mut().and_then(|o| o.input(input));
+                if let Some(command) = command {
+                    self.panel_command(command);
+                }
+            }
+            Event::FolderPicked(path) => self.folder_picked(path),
             Event::Shutdown => return Flow::Quit,
         }
         Flow::Continue
+    }
+
+    // ---- quick panel -------------------------------------------------------------
+
+    fn toggle_panel(&mut self) {
+        if self.overlay.is_some() {
+            self.close_panel(true);
+        } else {
+            self.open_panel();
+        }
+    }
+
+    fn open_panel(&mut self) {
+        if self.overlay.is_some() {
+            return;
+        }
+        if self.session.as_ref().is_some_and(Session::exclusive) {
+            // Nothing can be drawn over it, and taking focus would
+            // minimize the game. Toasts can't show there either.
+            info!("quick panel not shown: the game runs in exclusive fullscreen");
+            feedback::play(Kind::Error);
+            return;
+        }
+        let monitor = self.session.as_ref().and_then(|s| {
+            // SAFETY: MonitorFromWindow accepts stale handles.
+            let m: HMONITOR =
+                unsafe { MonitorFromWindow(s.target.hwnd.get(), MONITOR_DEFAULTTOPRIMARY) };
+            (s.target.hwnd.0 != 0 && !m.is_invalid()).then_some(m)
+        });
+        let started = Instant::now();
+        match Overlay::open(self.panel_view(), monitor) {
+            Ok(overlay) => {
+                info!("quick panel opened in {} ms", started.elapsed().as_millis());
+                self.overlay = Some(overlay);
+                // SAFETY: periodic timer on our own window.
+                unsafe { SetTimer(Some(self.hwnd.get()), TIMER_PANEL, PANEL_REFRESH_MS, None) };
+            }
+            Err(e) => {
+                error!("quick panel unavailable: {e}");
+                self.notify(Kind::Error, "Quick panel unavailable", &e.to_string());
+            }
+        }
+    }
+
+    /// Closes the panel; `restore` gives focus back to the window that had
+    /// it (the game), unless something else took it already.
+    fn close_panel(&mut self, restore: bool) {
+        if let Some(overlay) = self.overlay.take() {
+            overlay.close(restore);
+            // SAFETY: stopping our own timer.
+            let _ = unsafe { KillTimer(Some(self.hwnd.get()), TIMER_PANEL) };
+        }
+    }
+
+    /// What the quick panel shows, from the current state.
+    fn panel_view(&self) -> View {
+        let (state, reason) = self.state();
+        let session = self.session.as_ref();
+        let title = match (state, session) {
+            (RecorderState::Recording, Some(s)) => format!("Recording {}", s.target.game),
+            (RecorderState::Paused, _) => "Paused".into(),
+            (RecorderState::Error, _) => "Not recording".into(),
+            _ => reason.clone().unwrap_or_else(|| "rec".into()),
+        };
+        let (status, alert) = match (state, session) {
+            (RecorderState::Recording, Some(s)) => match s.warning() {
+                Some(w) => (capitalize(w), true),
+                None => {
+                    let buffered = s
+                        .buffer()
+                        .lock()
+                        .map(|b| as_secs_f64(b.buffered_duration()))
+                        .unwrap_or_default();
+                    let buffered = (buffered.round() as u32).min(self.config.replay.seconds);
+                    (
+                        format!(
+                            "{} buffered · {}",
+                            panel::format_seconds(buffered),
+                            s.describe()
+                        ),
+                        false,
+                    )
+                }
+            },
+            (RecorderState::Error, _) => (reason.unwrap_or_default(), true),
+            (RecorderState::Paused, _) => ("Resume to start the buffer again".into(), false),
+            _ => ("Clips can be saved once a game is recording".into(), false),
+        };
+        let v = &self.config.video;
+        let quality = match v.bitrate_kbps {
+            Some(_) => QualityChoice::Custom,
+            None => QualityChoice::Preset(v.quality),
+        };
+        let bitrate_kbps = session
+            .map(Session::bitrate_kbps)
+            .or(v.bitrate_kbps)
+            .or_else(|| Some(default_bitrate_kbps(v.quality, v.codec, 1920, 1080, v.fps)));
+        View {
+            title,
+            status,
+            alert,
+            recording: session.is_some() && !self.paused,
+            paused: self.paused,
+            seconds: self.config.replay.seconds,
+            quality,
+            bitrate_kbps,
+            memory_cap_mb: self.config.replay.max_memory_mb,
+            audio: self.audio_rows(),
+            folder: paths::clips_dir(&self.config).display().to_string(),
+            save_hotkey: self.config.hotkeys.save_clip.to_string(),
+        }
+    }
+
+    /// The panel's audio rows. Each source setting gets a row, which also
+    /// mutes or unmutes its input in the running session. An input that
+    /// stands for several settings (system loopback without per-app
+    /// capture) gets one row of its own instead, for this session only.
+    fn audio_rows(&self) -> Vec<AudioRow> {
+        let a = &self.config.audio;
+        let inputs = self
+            .session
+            .as_ref()
+            .map(Session::audio_inputs)
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        for (i, &(name, switch, muted)) in inputs.iter().enumerate() {
+            if switch.is_none() {
+                rows.push(AudioRow {
+                    target: AudioTarget::Shared(i),
+                    name,
+                    on: !muted,
+                    note: Some("this recording only"),
+                });
+            }
+        }
+        let shared = !rows.is_empty();
+        for switch in AudioSwitch::ALL {
+            // Covered by the shared row.
+            if shared && switch != AudioSwitch::Microphone {
+                continue;
+            }
+            let on = switch.get(a);
+            let live = inputs.iter().any(|&(_, s, _)| s == Some(switch));
+            let note = if switch == AudioSwitch::VoiceChat && a.voice_chat_apps.is_empty() {
+                Some("no apps listed")
+            } else if on && !live && self.session.is_some() {
+                Some("from the next recording")
+            } else {
+                None
+            };
+            rows.push(AudioRow {
+                target: AudioTarget::Switch(switch),
+                name: switch.name(),
+                on,
+                note,
+            });
+        }
+        rows
+    }
+
+    fn panel_command(&mut self, command: Command) {
+        match command {
+            Command::Close => self.close_panel(true),
+            Command::Save => {
+                self.close_panel(true);
+                self.save(None, None);
+            }
+            Command::SetSeconds(seconds) => {
+                self.config.replay.seconds = seconds;
+                if let Some(session) = &mut self.session {
+                    session.set_seconds(seconds);
+                }
+                info!("clip length set to {seconds} s");
+                self.persist(&["replay.seconds"]);
+            }
+            Command::SetQuality(quality) => self.set_quality(quality),
+            Command::SetAudio(AudioTarget::Switch(switch), on) => {
+                switch.set(&mut self.config.audio, on);
+                let live = self
+                    .session
+                    .as_mut()
+                    .is_some_and(|s| s.set_switch(switch, on));
+                info!(
+                    "{} audio {}{}",
+                    switch.name(),
+                    if on { "on" } else { "off" },
+                    if live {
+                        ""
+                    } else {
+                        " (from the next recording)"
+                    }
+                );
+                self.persist(&[switch.key()]);
+            }
+            Command::SetAudio(AudioTarget::Shared(input), on) => {
+                if let Some(session) = &mut self.session {
+                    session.set_input_muted(input, !on);
+                }
+            }
+            Command::PickFolder => {
+                let restore = self
+                    .overlay
+                    .as_ref()
+                    .map_or_else(Hwnd::default, Overlay::previous);
+                // The picker takes focus; it gives it back when it closes.
+                self.close_panel(false);
+                let events = self.events.clone();
+                overlay::pick_folder(paths::clips_dir(&self.config), restore, move |path| {
+                    events.send(Event::FolderPicked(path))
+                });
+            }
+            Command::OpenFolder => {
+                self.close_panel(false);
+                let dir = paths::clips_dir(&self.config);
+                let _ = std::fs::create_dir_all(&dir);
+                open(&dir);
+            }
+            Command::TogglePause => self.set_paused(!self.paused),
+        }
+        self.refresh();
+    }
+
+    fn set_quality(&mut self, quality: Quality) {
+        let v = &mut self.config.video;
+        v.quality = quality;
+        // A preset replaces a bitrate set by hand.
+        v.bitrate_kbps = None;
+        if let Some(session) = &mut self.session {
+            session.set_video_settings(&self.config.video);
+        }
+        info!("quality set to {quality:?}");
+        self.persist(&["video.quality", "video.bitrate_kbps"]);
+    }
+
+    fn folder_picked(&mut self, path: Option<PathBuf>) {
+        let Some(path) = path else {
+            return;
+        };
+        info!("clips folder set to {}", path.display());
+        self.config.output.directory = Some(path.clone());
+        if self.persist(&["output.directory"]) {
+            self.notify(
+                Kind::Info,
+                "Clips will be saved to",
+                &path.display().to_string(),
+            );
+        }
+    }
+
+    /// Writes settings changed in the panel to the settings file, leaving
+    /// the rest of the file as the user wrote it. They apply right away
+    /// either way; a failure only means they won't survive a restart.
+    fn persist(&mut self, keys: &[&str]) -> bool {
+        match self.config.save_keys(&self.config_path, keys) {
+            Ok(()) => true,
+            Err(e) => {
+                error!("could not save settings: {e}");
+                self.notify(Kind::Error, "Couldn't save the setting", &e.to_string());
+                false
+            }
+        }
     }
 
     fn ipc(&mut self, request: Request, reply: Sender<Response>) -> Flow {
@@ -861,6 +1145,7 @@ impl App {
         match command {
             MenuCommand::SaveClip => self.save(None, None),
             MenuCommand::TogglePause => self.set_paused(!self.paused),
+            MenuCommand::QuickPanel => self.open_panel(),
             MenuCommand::OpenClips => {
                 let dir = paths::clips_dir(&self.config);
                 let _ = std::fs::create_dir_all(&dir);
@@ -877,6 +1162,14 @@ impl App {
         }
         Flow::Continue
     }
+}
+
+/// "video stopped; restarting it" -> "Video stopped; restarting it".
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
 fn shell_open(file: &Path, params: Option<&Path>) -> bool {

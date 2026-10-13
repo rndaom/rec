@@ -6,7 +6,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 
 **Read first:** [docs/decisions.md](docs/decisions.md) (the why), [docs/roadmap.md](docs/roadmap.md) (the what), [docs/research.md](docs/research.md) (the evidence).
 
-**Status (2026-10-13):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio, exclusive-fullscreen detection and pipeline recovery done.
+**Status (2026-10-13):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio, exclusive-fullscreen detection, pipeline recovery and the quick panel done.
 
 | Crate | Role |
 |---|---|
@@ -23,7 +23,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 2. ~~Per-process audio tracks~~ (done)
 3. ~~Black-frame / exclusive-fullscreen detection~~ (done)
 4. ~~Pipeline recovery~~ (done: failures, resolution changes and GPU moves restart only the video pipeline as a new `segment`; see `recd/src/recover.rs`)
-5. Quick-panel overlay
+5. ~~Quick-panel overlay~~ (done: `recd/src/panel.rs` model, `overlay.rs` window; Alt+F7 or the tray)
 6. HDR
 7. Native encoders + AV1
 
@@ -45,6 +45,11 @@ Handoff file so any session can pick up quickly. Keep it short and current.
   - The MF AAC encoder holds 2 input frames before emitting. Repeated silent packets must stop ≥2 frames before audio returns, or the onset clicks (`silent_packet_repeat_is_transparent`, needs ffmpeg).
   - 4 inputs + mix cost ~2.4% of one core with silent-packet repeat (4.6% without).
   - Debug audio: `cargo run --release -p rec-audio --example capture -- --mix pid:N app:Discord.exe loopback 10 out` writes one `.aac` per track.
+- Quick panel:
+  - Opens in ~30 ms (DirectComposition + Direct2D on WARP). A hardware D3D device left ~19 MB in recd after the first open; WARP leaves ~6 MB plus ~15 parked worker threads. 60 opens: handles flat, no leak.
+  - Clip length uses `ReplayBuffer::set_limits`; quality uses `VideoCapture::set_bitrate` (ICodecAPI in the running MFT; the AMD HEVC MFT accepts it in ~16 ms, same segment, IDR cadence intact); audio switches use `AudioCapture::set_muted`. Settings go to the file via `Config::save_keys`, which keeps comments and layout.
+  - Turning on an audio source the session has no input for (e.g. the microphone when it was off at start) applies from the next recording: adding a track mid-buffer would break clips. The panel says so.
+  - Testing: `REC_DEBUG_CAPTURE_UI=1` makes it visible to screenshots. A real Alt+F7 press (SendInput) is needed for it to get focus; keys can then be posted to the `rec.panel` window. Refusing to open over exclusive fullscreen is untested on a real exclusive game (it relies on the watcher's `Exclusive` verdict).
 - Memory: `recd` uses ~127 MB private while recording at 1080p60. About 54 MB of that is driver / Media Foundation pipeline allocations and the rest is the buffer.
 - Bench: `rec-bench` was tested end to end only against stand-in `recd` and PresentMon scripts. The first real run (needs admin or the Performance Log Users group) may show PresentMon CLI differences. Rust `Command` children inherit the parent's std handles, so `rec-bench` clears the inherit flag before restarting the user's `recd`; otherwise `rec-bench | tee` never ends.
 - Logs: `%LOCALAPPDATA%\rec\recd.log`. Config: `%APPDATA%\rec\config.toml`.

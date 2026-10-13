@@ -42,8 +42,17 @@ pub(crate) struct Encoder {
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
     _manager: IMFDXGIDeviceManager,
+    /// Kept for in-place rate changes ([`Encoder::set_bitrate`]).
+    api: ICodecAPI,
+    /// Mean/peak currently set on the MFT in bit/s, updated after every
+    /// successful `SetValue` so the peak >= mean ordering in `set_bitrate`
+    /// stays right even after a partial failure.
+    mean_bps: u32,
+    peak_bps: u32,
     pub name: String,
     pub codec: VideoCodec,
+    /// Rate-control description as read back right after configuration; it
+    /// is not updated by [`Encoder::set_bitrate`].
     pub rate_control: String,
     /// Annex-B parameter sets from `MF_MT_MPEG_SEQUENCE_HEADER`, if given.
     pub sequence_header: Option<Vec<u8>>,
@@ -168,9 +177,26 @@ fn candidates(pref: CodecPreference) -> &'static [VideoCodec] {
     }
 }
 
-fn set_codec_value(api: &ICodecAPI, key: &GUID, value: VARIANT) -> bool {
+fn try_set_codec_value(
+    api: &ICodecAPI,
+    key: &GUID,
+    value: VARIANT,
+    context: &'static str,
+) -> Result<(), VideoError> {
     // SAFETY: `value` outlives the call; the MFT copies it.
-    unsafe { api.SetValue(key, &value) }.is_ok()
+    unsafe { api.SetValue(key, &value) }.ctx(context)
+}
+
+fn set_codec_value(api: &ICodecAPI, key: &GUID, value: VARIANT) -> bool {
+    try_set_codec_value(api, key, value, "ICodecAPI::SetValue").is_ok()
+}
+
+/// Mean and peak bit rate in bit/s for a mean of `kbps`. The one place the
+/// peak rule lives: peak-constrained VBR with peak = 1.5 x mean, which lets
+/// action scenes burst without the mean drifting from the requested quality.
+fn bitrate_bps(kbps: u32) -> (u32, u32) {
+    let mean = kbps.saturating_mul(1000);
+    (mean, mean.saturating_add(mean / 2))
 }
 
 fn get_u32(api: &ICodecAPI, key: &GUID) -> Option<u32> {
@@ -298,6 +324,7 @@ impl Encoder {
         unsafe { transform.SetInputType(input_id, &in_type, 0) }.ctx("SetInputType(NV12)")?;
 
         let rate_control = apply_codec_settings(&api, params);
+        let (mean_bps, peak_bps) = bitrate_bps(params.bitrate_kbps);
 
         // SAFETY: plain getter.
         let info =
@@ -325,6 +352,9 @@ impl Encoder {
             transform,
             events,
             _manager: manager,
+            api,
+            mean_bps,
+            peak_bps,
             name,
             codec,
             rate_control,
@@ -336,6 +366,50 @@ impl Encoder {
             need_input: 0,
             output_sample: None,
         })
+    }
+
+    /// Changes the mean bit rate (peak = 1.5 x mean) of the running encoder
+    /// without restarting it: the stream stays continuous, so a replay
+    /// buffer fed by it keeps its history. The new rate takes effect on
+    /// following pictures; the GOP and timestamps are untouched.
+    ///
+    /// The two `SetValue` calls are ordered so peak >= mean holds at every
+    /// step (an encoder may reject or clamp a peak below the mean): raising
+    /// sets the peak first, lowering the mean first. Returns the mean in
+    /// kbit/s the encoder reports afterwards, or `kbps` if it does not.
+    pub(crate) fn set_bitrate(&mut self, kbps: u32) -> Result<u32, VideoError> {
+        let (mean, peak) = bitrate_bps(kbps);
+        if mean > self.mean_bps {
+            self.set_peak(peak)?;
+            self.set_mean(mean)?;
+        } else {
+            self.set_mean(mean)?;
+            self.set_peak(peak)?;
+        }
+        Ok(get_u32(&self.api, &CODECAPI_AVEncCommonMeanBitRate)
+            .map_or(kbps, |bps| bps.saturating_add(500) / 1000))
+    }
+
+    fn set_mean(&mut self, bps: u32) -> Result<(), VideoError> {
+        try_set_codec_value(
+            &self.api,
+            &CODECAPI_AVEncCommonMeanBitRate,
+            VARIANT::from(bps),
+            "set mean bit rate",
+        )?;
+        self.mean_bps = bps;
+        Ok(())
+    }
+
+    fn set_peak(&mut self, bps: u32) -> Result<(), VideoError> {
+        try_set_codec_value(
+            &self.api,
+            &CODECAPI_AVEncCommonMaxBitRate,
+            VARIANT::from(bps),
+            "set peak bit rate",
+        )?;
+        self.peak_bps = bps;
+        Ok(())
     }
 
     /// Drains pending encoder events without waiting. Each encoded access
@@ -552,8 +626,7 @@ fn media_type(subtype: GUID, p: &EncoderParams) -> Result<IMFMediaType, VideoErr
 /// VBR (falls back to CBR). Returns a description of the rate-control mode
 /// the encoder reports afterwards.
 fn apply_codec_settings(api: &ICodecAPI, p: &EncoderParams) -> String {
-    let mean = p.bitrate_kbps.saturating_mul(1000);
-    let peak = mean.saturating_add(mean / 2);
+    let (mean, peak) = bitrate_bps(p.bitrate_kbps);
     set_codec_value(api, &CODECAPI_AVEncMPVGOPSize, VARIANT::from(p.fps));
     set_codec_value(
         api,
@@ -601,5 +674,25 @@ fn read_sequence_header(transform: &IMFTransform, output_id: u32) -> Option<Vec<
         t.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buf, None)
             .ok()?;
         Some(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bitrate_bps;
+
+    #[test]
+    fn peak_is_one_and_a_half_times_mean() {
+        assert_eq!(bitrate_bps(20_000), (20_000_000, 30_000_000));
+        assert_eq!(bitrate_bps(4_000), (4_000_000, 6_000_000));
+        assert_eq!(bitrate_bps(1), (1_000, 1_500));
+    }
+
+    #[test]
+    fn peak_never_below_mean_even_when_saturating() {
+        for kbps in [1, 999, 20_000, 1_000_000, u32::MAX / 1000, u32::MAX] {
+            let (mean, peak) = bitrate_bps(kbps);
+            assert!(peak >= mean, "{kbps}");
+        }
     }
 }

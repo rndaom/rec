@@ -71,8 +71,13 @@ pub struct Session {
     /// Buffer length in seconds and memory cap in MB, for the bitrate check.
     buffer_seconds: u32,
     max_memory_mb: u32,
+    post_roll_seconds: u32,
+    /// The video bitrate in use.
+    bitrate_kbps: u32,
     recovery: Recovery,
-    _audio: Option<AudioCapture>,
+    audio: Option<AudioCapture>,
+    /// Per audio input: its name and the setting it records alone.
+    audio_inputs: Vec<(&'static str, Option<AudioSwitch>)>,
     watcher: Watcher,
     problem: Option<Problem>,
 }
@@ -114,12 +119,71 @@ pub fn default_bitrate_kbps(
     (base * pixels.powf(0.75) * rate.powf(0.6) * codec).clamp(3_000.0, 150_000.0) as u32
 }
 
+/// An audio source setting that can be switched while recording (the quick
+/// panel's audio rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioSwitch {
+    Game,
+    VoiceChat,
+    Microphone,
+    OtherApps,
+}
+
+impl AudioSwitch {
+    pub const ALL: [Self; 4] = [
+        Self::Game,
+        Self::VoiceChat,
+        Self::Microphone,
+        Self::OtherApps,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Game => "Game",
+            Self::VoiceChat => "Voice chat",
+            Self::Microphone => "Microphone",
+            Self::OtherApps => "Other apps",
+        }
+    }
+
+    pub fn get(self, a: &AudioConfig) -> bool {
+        match self {
+            Self::Game => a.game,
+            Self::VoiceChat => a.voice_chat,
+            Self::Microphone => a.microphone,
+            Self::OtherApps => a.other_apps,
+        }
+    }
+
+    pub fn set(self, a: &mut AudioConfig, on: bool) {
+        *match self {
+            Self::Game => &mut a.game,
+            Self::VoiceChat => &mut a.voice_chat,
+            Self::Microphone => &mut a.microphone,
+            Self::OtherApps => &mut a.other_apps,
+        } = on;
+    }
+
+    /// Its key in the config file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Game => "audio.game",
+            Self::VoiceChat => "audio.voice_chat",
+            Self::Microphone => "audio.microphone",
+            Self::OtherApps => "audio.other_apps",
+        }
+    }
+}
+
 /// The audio inputs and tracks a session records, with each track's name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioPlan {
     pub config: AudioCaptureConfig,
     /// `(track, name)` in track order, mixed track first.
     pub names: Vec<(TrackId, &'static str)>,
+    /// Per input (in `config.inputs` order): its name, and the setting it
+    /// records alone (`None` for system loopback standing in for several).
+    pub inputs: Vec<(&'static str, Option<AudioSwitch>)>,
 }
 
 /// Turns the audio settings into inputs and tracks (video is track 0).
@@ -133,19 +197,30 @@ pub struct AudioPlan {
 /// differ from a single track.
 pub fn plan_audio(a: &AudioConfig, game_pid: Option<u32>, per_app: bool) -> Option<AudioPlan> {
     let process = |target: ProcessTarget, exclude: bool| AudioSource::Process { target, exclude };
-    // (source, name, in the mix)
-    let mut inputs: Vec<(AudioSource, &'static str, bool)> = Vec::new();
+    // (source, name, in the mix, the setting it records alone)
+    let mut inputs: Vec<(AudioSource, &'static str, bool, Option<AudioSwitch>)> = Vec::new();
+    let game = Some(AudioSwitch::Game);
     match game_pid.filter(|_| per_app) {
         Some(pid) => {
             if a.game {
-                inputs.push((process(ProcessTarget::Pid(pid), false), "Game", true));
+                inputs.push((process(ProcessTarget::Pid(pid), false), "Game", true, game));
             }
             if a.voice_chat && !a.voice_chat_apps.is_empty() {
                 let apps = ProcessTarget::Executables(a.voice_chat_apps.clone());
-                inputs.push((process(apps, false), "Voice chat", !a.other_apps));
+                inputs.push((
+                    process(apps, false),
+                    "Voice chat",
+                    !a.other_apps,
+                    Some(AudioSwitch::VoiceChat),
+                ));
             }
             if a.other_apps {
-                inputs.push((process(ProcessTarget::Pid(pid), true), "Other apps", true));
+                inputs.push((
+                    process(ProcessTarget::Pid(pid), true),
+                    "Other apps",
+                    true,
+                    Some(AudioSwitch::OtherApps),
+                ));
             }
         }
         None => {
@@ -155,7 +230,7 @@ pub fn plan_audio(a: &AudioConfig, game_pid: Option<u32>, per_app: bool) -> Opti
                 } else {
                     "System audio"
                 };
-                inputs.push((AudioSource::SystemLoopback, name, true));
+                inputs.push((AudioSource::SystemLoopback, name, true, None));
             }
         }
     }
@@ -163,13 +238,14 @@ pub fn plan_audio(a: &AudioConfig, game_pid: Option<u32>, per_app: bool) -> Opti
         let mic = AudioSource::Microphone {
             device_id: a.microphone_device.clone(),
         };
-        inputs.push((mic, "Microphone", true));
+        inputs.push((mic, "Microphone", true, Some(AudioSwitch::Microphone)));
     }
     if inputs.is_empty() {
         return None;
     }
 
-    let mixed = inputs.iter().filter(|(_, _, mix)| *mix).count();
+    let mixed = inputs.iter().filter(|(_, _, mix, _)| *mix).count();
+    let switches = inputs.iter().map(|&(_, name, _, s)| (name, s)).collect();
     let mix = a.mixed_track && mixed >= 2;
     let mut names = Vec::new();
     let mut next: TrackId = VIDEO_TRACK + 1;
@@ -180,7 +256,7 @@ pub fn plan_audio(a: &AudioConfig, game_pid: Option<u32>, per_app: bool) -> Opti
     });
     let inputs = inputs
         .into_iter()
-        .map(|(source, name, in_mix)| {
+        .map(|(source, name, in_mix, _)| {
             names.push((next, name));
             next += 1;
             AudioInput {
@@ -197,6 +273,7 @@ pub fn plan_audio(a: &AudioConfig, game_pid: Option<u32>, per_app: bool) -> Opti
             bitrate_kbps: a.bitrate_kbps,
         },
         names,
+        inputs: switches,
     })
 }
 
@@ -266,7 +343,7 @@ fn open_video(
     segment: u32,
     max_memory_mb: u32,
     buffer_seconds: u32,
-) -> Result<(VideoCapture, VideoFormat, String), String> {
+) -> Result<(VideoCapture, VideoFormat, u32, String), String> {
     let codec = match v.codec {
         Codec::Auto | Codec::Av1 => CodecPreference::Auto,
         Codec::H264 => CodecPreference::H264,
@@ -297,18 +374,24 @@ fn open_video(
         segment,
     };
     let video = VideoCapture::start(config, sink(buffer)).map_err(|e| e.to_string())?;
+    let format = video.info().format.clone();
+    let description = describe(&video, bitrate_kbps);
+    Ok((video, format, bitrate_kbps, description))
+}
+
+/// E.g. "HEVC 2560x1440@60 18 Mbit/s · AMD Radeon RX 7800 XT".
+fn describe(video: &VideoCapture, bitrate_kbps: u32) -> String {
     let info = video.info();
-    let format = info.format.clone();
-    let description = format!(
+    let f = &info.format;
+    format!(
         "{} {}x{}@{} {} Mbit/s · {}",
-        format.codec.name(),
-        format.width,
-        format.height,
-        format.fps,
-        bitrate_kbps / 1000,
+        f.codec.name(),
+        f.width,
+        f.height,
+        f.fps,
+        crate::panel::mbit(bitrate_kbps),
         info.adapter_name
-    );
-    Ok((video, format, description))
+    )
 }
 
 impl Session {
@@ -345,7 +428,7 @@ impl Session {
         if v.codec == Codec::Av1 {
             warning!("AV1 encoding is not available yet; using HEVC/H.264");
         }
-        let (video, format, description) = open_video(
+        let (video, format, bitrate_kbps, description) = open_video(
             &target,
             source,
             v,
@@ -367,6 +450,7 @@ impl Session {
         let per_app = rec_audio::process_loopback_supported();
         let game_pid = (target.pid != 0).then_some(target.pid);
         let mut audio = None;
+        let mut audio_inputs = Vec::new();
         if let Some(plan) = plan_audio(&config.audio, game_pid, per_app) {
             match AudioCapture::start(plan.config, sink(&buffer)) {
                 Ok(capture) => {
@@ -378,6 +462,7 @@ impl Session {
                         });
                     }
                     audio = Some(capture);
+                    audio_inputs = plan.inputs;
                 }
                 Err(e) => warning!("audio unavailable, recording without it: {e}"),
             }
@@ -400,8 +485,11 @@ impl Session {
             settings: config.video.clone(),
             buffer_seconds: seconds,
             max_memory_mb: replay.max_memory_mb,
+            post_roll_seconds: replay.post_roll_seconds,
+            bitrate_kbps,
             recovery: Recovery::new(now),
-            _audio: audio,
+            audio,
+            audio_inputs,
             watcher: Watcher::new(now),
             problem: None,
         })
@@ -465,7 +553,7 @@ impl Session {
             self.buffer_seconds,
         );
         match opened {
-            Ok((video, format, description)) => {
+            Ok((video, format, bitrate_kbps, description)) => {
                 info!(
                     "{}: video segment {segment}: {description}",
                     self.target.game
@@ -476,6 +564,7 @@ impl Session {
                 self.tracks[0].kind = TrackKind::Video(format.clone());
                 self.segments.push((segment, format));
                 self.description = description;
+                self.bitrate_kbps = bitrate_kbps;
                 self.video = Some(video);
                 // The new pipeline's frames are judged afresh.
                 self.watcher = Watcher::new(started);
@@ -553,6 +642,94 @@ impl Session {
             Some("video stopped; restarting it")
         } else {
             self.problem.map(Problem::short)
+        }
+    }
+
+    /// The watcher sees true exclusive fullscreen: nothing can be drawn
+    /// over the game, and taking focus from it would minimize it.
+    pub fn exclusive(&self) -> bool {
+        self.problem == Some(Problem::Exclusive)
+    }
+
+    /// Changes the clip length in place. The buffer keeps what it holds:
+    /// a longer one fills up from now, a shorter one drops its oldest part.
+    pub fn set_seconds(&mut self, seconds: u32) {
+        self.buffer_seconds = seconds + self.post_roll_seconds + BUFFER_SLACK_SECONDS;
+        if let Ok(mut buffer) = self.buffer.lock() {
+            let limits = Limits {
+                duration: secs(i64::from(self.buffer_seconds)),
+                ..buffer.limits()
+            };
+            buffer.set_limits(limits);
+        }
+    }
+
+    /// Applies new video settings. A bitrate change (quality, or the
+    /// bitrate override) is made in the running encoder, so the clip stays
+    /// one segment; only if the encoder refuses is the pipeline restarted,
+    /// which starts a new segment. Other settings apply from the next
+    /// restart.
+    pub fn set_video_settings(&mut self, settings: &VideoConfig) {
+        self.settings = settings.clone();
+        let Some(video) = &self.video else {
+            return;
+        };
+        let f = &video.info().format;
+        let kbps = settings.bitrate_kbps.unwrap_or_else(|| {
+            default_bitrate_kbps(settings.quality, settings.codec, f.width, f.height, f.fps)
+        });
+        if kbps == self.bitrate_kbps {
+            return;
+        }
+        match video.set_bitrate(kbps) {
+            Ok(actual) => {
+                info!(
+                    "{}: video bitrate {} -> {actual} kbit/s",
+                    self.target.game, self.bitrate_kbps
+                );
+                self.bitrate_kbps = actual;
+                self.description = describe(video, actual);
+            }
+            Err(e) => {
+                warning!("{}: bitrate change refused ({e})", self.target.game);
+                self.restart_video(qpc_now(), Some("new bitrate"));
+            }
+        }
+    }
+
+    /// The video bitrate in use, in kbit/s.
+    pub fn bitrate_kbps(&self) -> u32 {
+        self.bitrate_kbps
+    }
+
+    /// Per audio input: its name, the setting it records alone, and whether
+    /// it is muted.
+    pub fn audio_inputs(&self) -> Vec<(&'static str, Option<AudioSwitch>, bool)> {
+        let Some(audio) = &self.audio else {
+            return Vec::new();
+        };
+        (self.audio_inputs.iter().enumerate())
+            .map(|(i, &(name, switch))| (name, switch, audio.is_muted(i)))
+            .collect()
+    }
+
+    /// Mutes or unmutes the input that records `switch` alone. Returns
+    /// whether this session has one.
+    pub fn set_switch(&mut self, switch: AudioSwitch, on: bool) -> bool {
+        let input = (self.audio_inputs.iter()).position(|&(_, s)| s == Some(switch));
+        match (input, &self.audio) {
+            (Some(input), Some(audio)) => {
+                audio.set_muted(input, !on);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Mutes or unmutes audio input `input` for this session only.
+    pub fn set_input_muted(&mut self, input: usize, muted: bool) {
+        if let Some(audio) = &self.audio {
+            audio.set_muted(input, muted);
         }
     }
 

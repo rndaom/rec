@@ -305,6 +305,8 @@ pub enum ConfigError {
     },
     #[error("could not serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error("`{0}` is not a `section.key` setting name")]
+    InvalidKey(String),
 }
 
 pub const MIN_REPLAY_SECONDS: u32 = 5;
@@ -341,17 +343,63 @@ impl Config {
 
     /// Writes atomically: a temp file next to the target, then a rename.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        let text = self.to_toml()?;
-        let write_err = |source| ConfigError::Write {
+        write_atomic(path, &self.to_toml()?)
+    }
+
+    /// Writes only `keys` (dotted `"section.key"`, one level deep) from `self`
+    /// to the file at `path`, leaving everything else in the file as it is
+    /// (comments, order, formatting, keys from newer versions). A key that is
+    /// `None` in `self` (so absent when serialized) is removed from the file.
+    /// Creates the file with [`Config::save`] if it does not exist. Never
+    /// clobbers a file it cannot parse: that returns the parse error.
+    ///
+    /// The config file is meant to be edited by hand, and a full [`save`]
+    /// would throw away the user's comments and any setting `self` does not
+    /// know about. So the file's text is patched line by line instead. The
+    /// patched text is re-parsed and checked to differ from the original in
+    /// exactly the requested keys; layouts the line editor does not understand
+    /// (dotted keys, inline tables, multi-line values) fail that check and
+    /// fall back to editing the parsed table and re-serializing it, which
+    /// loses comments but still keeps every other setting.
+    ///
+    /// [`save`]: Config::save
+    pub fn save_keys(&self, path: &Path, keys: &[&str]) -> Result<(), ConfigError> {
+        let names = keys
+            .iter()
+            .map(|key| split_key(key))
+            .collect::<Result<Vec<_>, _>>()?;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return self.save(path),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        };
+        let original: toml::Table = toml::from_str(&text).map_err(|source| ConfigError::Parse {
             path: path.to_owned(),
             source,
+        })?;
+        let ours = toml::Table::try_from(self)?;
+        let wanted: Vec<Wanted> = names
+            .into_iter()
+            .map(|(section, key)| Wanted {
+                section,
+                key,
+                value: ours
+                    .get(section)
+                    .and_then(toml::Value::as_table)
+                    .and_then(|table| table.get(key)),
+            })
+            .collect();
+
+        let new_text = match patch_text(&text, &original, &wanted) {
+            Some(patched) => patched,
+            None => rewrite_table(&text, &original, &wanted)?,
         };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(write_err)?;
-        }
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text).map_err(write_err)?;
-        std::fs::rename(&tmp, path).map_err(write_err)
+        write_atomic(path, &new_text)
     }
 
     /// Clamps values to supported ranges.
@@ -375,6 +423,323 @@ impl Config {
             self.output.filename = OutputConfig::default().filename;
         }
     }
+}
+
+/// Writes via a temp file next to the target, then renames over it, so a
+/// crash never leaves a half-written config.
+fn write_atomic(path: &Path, text: &str) -> Result<(), ConfigError> {
+    let write_err = |source| ConfigError::Write {
+        path: path.to_owned(),
+        source,
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(write_err)?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).map_err(write_err)?;
+    std::fs::rename(&tmp, path).map_err(write_err)
+}
+
+/// One setting requested from [`Config::save_keys`] with the value `self` has
+/// for it (`None`: the key is absent and must be removed from the file).
+struct Wanted<'a> {
+    section: &'a str,
+    key: &'a str,
+    value: Option<&'a toml::Value>,
+}
+
+/// Splits `"section.key"`. Both parts must be bare TOML keys, which every
+/// config field name is, so inserted lines never need quoting.
+fn split_key(dotted: &str) -> Result<(&str, &str), ConfigError> {
+    let bare = |s: &str| !s.is_empty() && s.bytes().all(is_bare_key_byte);
+    match dotted.split_once('.') {
+        Some((section, key)) if bare(section) && bare(key) => Ok((section, key)),
+        _ => Err(ConfigError::InvalidKey(dotted.to_owned())),
+    }
+}
+
+fn is_bare_key_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Edits `text` in place and checks the result: it must parse, hold exactly
+/// the wanted values, and differ from `original` in nothing else. `None` means
+/// the layout is one the line editor cannot handle safely.
+fn patch_text(text: &str, original: &toml::Table, wanted: &[Wanted]) -> Option<String> {
+    let rendered: Vec<Option<String>> = wanted
+        .iter()
+        .map(|w| w.value.map(ToString::to_string))
+        .collect();
+    // Only single-line values can replace a single line.
+    if rendered.iter().flatten().any(|v| v.contains(['\n', '\r'])) {
+        return None;
+    }
+
+    let mut editor = LineEditor::new(text);
+    for (w, value) in wanted.iter().zip(&rendered) {
+        editor.set(w.section, w.key, value.as_deref());
+    }
+    let patched = editor.finish();
+
+    let edited: toml::Table = toml::from_str(&patched).ok()?;
+    let values_match = wanted.iter().all(|w| lookup(&edited, w) == w.value);
+    (values_match && without_wanted(&edited, wanted) == without_wanted(original, wanted))
+        .then_some(patched)
+}
+
+fn lookup<'a>(table: &'a toml::Table, w: &Wanted) -> Option<&'a toml::Value> {
+    table
+        .get(w.section)
+        .and_then(toml::Value::as_table)
+        .and_then(|section| section.get(w.key))
+}
+
+/// Copy of `table` without the wanted keys (and sections they leave empty),
+/// so two tables can be compared on everything else.
+fn without_wanted(table: &toml::Table, wanted: &[Wanted]) -> toml::Table {
+    let mut table = table.clone();
+    for w in wanted {
+        let emptied = match table.get_mut(w.section) {
+            Some(toml::Value::Table(section)) => {
+                section.remove(w.key);
+                section.is_empty()
+            }
+            _ => false,
+        };
+        if emptied {
+            table.remove(w.section);
+        }
+    }
+    table
+}
+
+/// Fallback for layouts [`patch_text`] rejects: apply the wanted keys to the
+/// parsed original and re-serialize it. Comments and formatting are lost, but
+/// every other setting in the file survives.
+fn rewrite_table(
+    text: &str,
+    original: &toml::Table,
+    wanted: &[Wanted],
+) -> Result<String, ConfigError> {
+    let mut table = original.clone();
+    for w in wanted {
+        if let Some(value) = w.value {
+            let section = table
+                .entry(w.section)
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if !section.is_table() {
+                *section = toml::Value::Table(toml::Table::new());
+            }
+            if let Some(section) = section.as_table_mut() {
+                section.insert(w.key.to_owned(), value.clone());
+            }
+        } else if let Some(section) = table.get_mut(w.section).and_then(toml::Value::as_table_mut) {
+            section.remove(w.key);
+        }
+    }
+    let out = toml::to_string_pretty(&table)?;
+    Ok(if text.contains("\r\n") {
+        out.replace('\n', "\r\n")
+    } else {
+        out
+    })
+}
+
+/// Line-based TOML editor that touches only the lines of the keys it is asked
+/// about. It understands just enough syntax (table headers, `key = value`
+/// lines, trailing comments); [`patch_text`] verifies what it produced.
+struct LineEditor {
+    lines: Vec<String>,
+    eol: &'static str,
+    bom: bool,
+    final_newline: bool,
+}
+
+/// A `[table]` header line.
+enum Header {
+    /// `[name]` with a single key.
+    Table(String),
+    /// `[[array]]`, dotted or otherwise unusual names: ends a section, never
+    /// matches one.
+    Other,
+}
+
+impl LineEditor {
+    fn new(text: &str) -> Self {
+        let (bom, body) = match text.strip_prefix('\u{feff}') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
+        Self {
+            lines: body.lines().map(str::to_owned).collect(),
+            eol: if body.contains("\r\n") { "\r\n" } else { "\n" },
+            bom,
+            final_newline: body.is_empty() || body.ends_with('\n'),
+        }
+    }
+
+    fn finish(self) -> String {
+        let mut out = String::new();
+        if self.bom {
+            out.push('\u{feff}');
+        }
+        out.push_str(&self.lines.join(self.eol));
+        if self.final_newline && !self.lines.is_empty() {
+            out.push_str(self.eol);
+        }
+        out
+    }
+
+    /// Sets `section.key` to the rendered inline `value`, or removes it.
+    fn set(&mut self, section: &str, key: &str, value: Option<&str>) {
+        let header = self
+            .lines
+            .iter()
+            .position(|l| matches!(parse_header(l), Some(Header::Table(name)) if name == section));
+        let Some(header) = header else {
+            if let Some(value) = value {
+                if self.lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                    self.lines.push(String::new());
+                }
+                self.lines.push(format!("[{section}]"));
+                self.lines.push(format!("{key} = {value}"));
+            }
+            return;
+        };
+        let body = header + 1;
+        let end = self.lines[body..]
+            .iter()
+            .position(|l| parse_header(l).is_some())
+            .map_or(self.lines.len(), |i| body + i);
+
+        let existing = (body..end).find_map(|i| match parse_key_line(&self.lines[i]) {
+            Some((name, value_start)) if name == key => Some((i, value_start)),
+            _ => None,
+        });
+        match (existing, value) {
+            (Some((i, value_start)), Some(value)) => {
+                self.lines[i] = replace_value(&self.lines[i], value_start, value);
+            }
+            (Some((i, _)), None) => {
+                self.lines.remove(i);
+            }
+            (None, Some(value)) => {
+                // After the last content line, so comments and blank lines
+                // that lead into the next section stay with that section.
+                let last = (body..end).rev().find(|&i| {
+                    let line = self.lines[i].trim();
+                    !line.is_empty() && !line.starts_with('#')
+                });
+                self.lines
+                    .insert(last.unwrap_or(header) + 1, format!("{key} = {value}"));
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+/// Parses `[name]` / `[[name]]` lines (surrounding whitespace and a trailing
+/// comment allowed). Lines like `[1, 2],` inside a multi-line array are not
+/// headers.
+fn parse_header(line: &str) -> Option<Header> {
+    let t = line.trim();
+    if !t.starts_with('[') {
+        return None;
+    }
+    let (open, close) = if t.starts_with("[[") {
+        ("[[", "]]")
+    } else {
+        ("[", "]")
+    };
+    let inner_start = open.len();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut inner_end = None;
+    for (i, c) in t.char_indices().skip(inner_start) {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if t[i..].starts_with(close) => {
+                inner_end = Some(i);
+                break;
+            }
+            None => {}
+        }
+    }
+    let inner_end = inner_end?;
+    let rest = t[inner_end + close.len()..].trim_start();
+    if !(rest.is_empty() || rest.starts_with('#')) {
+        return None;
+    }
+    let inner = t[inner_start..inner_end].trim();
+    Some(match parse_key(inner) {
+        Some((name, used)) if open == "[" && used == inner.len() => Header::Table(name),
+        _ => Header::Other,
+    })
+}
+
+/// Parses a bare or quoted key at the start of `s`, returning it and the
+/// number of bytes it occupies.
+fn parse_key(s: &str) -> Option<(String, usize)> {
+    let first = s.chars().next()?;
+    if first == '"' || first == '\'' {
+        let mut escaped = false;
+        for (i, c) in s.char_indices().skip(1) {
+            if first == '"' && escaped {
+                escaped = false;
+            } else if first == '"' && c == '\\' {
+                escaped = true;
+            } else if c == first {
+                return Some((s[1..i].to_owned(), i + 1));
+            }
+        }
+        return None;
+    }
+    let len = s.bytes().take_while(|&b| is_bare_key_byte(b)).count();
+    (len > 0).then(|| (s[..len].to_owned(), len))
+}
+
+/// For a `key = value` line, returns the key and the byte offset where the
+/// value starts. Dotted keys and anything else return `None`.
+fn parse_key_line(line: &str) -> Option<(String, usize)> {
+    let indent = line.len() - line.trim_start().len();
+    let (key, used) = parse_key(&line[indent..])?;
+    let after_key = indent + used;
+    let rest = line[after_key..].trim_start();
+    let rest = rest.strip_prefix('=')?;
+    let value_start = line.len() - rest.trim_start().len();
+    Some((key, value_start))
+}
+
+/// Replaces the value of a `key = value` line, keeping its indentation, key
+/// spelling, spacing and trailing comment.
+fn replace_value(line: &str, value_start: usize, value: &str) -> String {
+    let after = &line[value_start..];
+    let code_len = find_comment(after).unwrap_or(after.len());
+    let value_end = value_start + after[..code_len].trim_end().len();
+    format!("{}{}{}", &line[..value_start], value, &line[value_end..])
+}
+
+/// Byte offset of the `#` that starts a trailing comment, skipping `#` inside
+/// basic (`"..."`, with backslash escapes) and literal (`'...'`) strings.
+fn find_comment(s: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' => return Some(i),
+            None => {}
+        }
+    }
+    None
 }
 
 /// `%APPDATA%\rec\config.toml`.
@@ -466,5 +831,276 @@ mod tests {
             .join("rec-definitely-missing")
             .join("config.toml");
         assert_eq!(Config::load(&path).unwrap(), Config::default());
+    }
+
+    /// Temp directory holding a `config.toml`, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "rec-config-keys-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.join("config.toml")
+        }
+
+        fn write(&self, text: &str) -> PathBuf {
+            std::fs::write(self.path(), text).unwrap();
+            self.path()
+        }
+
+        fn read(&self) -> String {
+            std::fs::read_to_string(self.path()).unwrap()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn save_keys_keeps_comments_order_and_unknown_keys() {
+        let dir = TempDir::new();
+        let path = dir.write(
+            "# my rec config\nfuture_option = 1\n\n[replay]\n# how much to save\nseconds = 30\n\
+             post_roll_seconds = 5\nmystery = \"x\"\n\n[future_section]\na = 1\n\n\
+             [video]\nquality = \"balanced\"\nfps = 30\n",
+        );
+        let mut config = Config::load(&path).unwrap();
+        config.replay.seconds = 90;
+        config.video.quality = Quality::Quality;
+        config
+            .save_keys(&path, &["replay.seconds", "video.quality"])
+            .unwrap();
+
+        assert_eq!(
+            dir.read(),
+            "# my rec config\nfuture_option = 1\n\n[replay]\n# how much to save\nseconds = 90\n\
+             post_roll_seconds = 5\nmystery = \"x\"\n\n[future_section]\na = 1\n\n\
+             [video]\nquality = \"quality\"\nfps = 30\n"
+        );
+        assert_eq!(Config::load(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn save_keys_only_touches_requested_keys() {
+        let dir = TempDir::new();
+        let path = dir.write("[replay]\nseconds = 30\n");
+        let mut config = Config::default();
+        config.video.quality = Quality::Performance;
+        config.save_keys(&path, &["video.quality"]).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.replay.seconds, 30);
+        assert_eq!(loaded.video.quality, Quality::Performance);
+    }
+
+    #[test]
+    fn save_keys_keeps_trailing_comments() {
+        let dir = TempDir::new();
+        let path = dir.write("[replay]\n  seconds   =   30   # half a minute\n");
+        let mut config = Config::default();
+        config.replay.seconds = 120;
+        config.save_keys(&path, &["replay.seconds"]).unwrap();
+        assert_eq!(
+            dir.read(),
+            "[replay]\n  seconds   =   120   # half a minute\n"
+        );
+    }
+
+    #[test]
+    fn save_keys_inserts_missing_key_into_existing_section() {
+        let dir = TempDir::new();
+        let path = dir.write("[replay]\nseconds = 30\n# about video\n\n[video]\nfps = 30\n");
+        let mut config = Config::default();
+        config.replay.post_roll_seconds = 7;
+        config
+            .save_keys(&path, &["replay.post_roll_seconds"])
+            .unwrap();
+        assert_eq!(
+            dir.read(),
+            "[replay]\nseconds = 30\npost_roll_seconds = 7\n# about video\n\n[video]\nfps = 30\n"
+        );
+
+        // An empty section gets the key right after its header.
+        let path = dir.write("[replay]\n[video]\nfps = 30\n");
+        config
+            .save_keys(&path, &["replay.post_roll_seconds"])
+            .unwrap();
+        assert_eq!(
+            dir.read(),
+            "[replay]\npost_roll_seconds = 7\n[video]\nfps = 30\n"
+        );
+    }
+
+    #[test]
+    fn save_keys_appends_missing_section() {
+        let dir = TempDir::new();
+        let path = dir.write("# hi\n[replay]\nseconds = 30\n");
+        let mut config = Config::default();
+        config.video.quality = Quality::Quality;
+        config.audio.microphone = true;
+        config
+            .save_keys(&path, &["video.quality", "audio.microphone"])
+            .unwrap();
+        assert_eq!(
+            dir.read(),
+            "# hi\n[replay]\nseconds = 30\n\n[video]\nquality = \"quality\"\n\n[audio]\nmicrophone = true\n"
+        );
+    }
+
+    #[test]
+    fn save_keys_none_removes_the_key() {
+        let dir = TempDir::new();
+        let path = dir.write("[video]\nfps = 30\nbitrate_kbps = 8000 # custom\ncursor = false\n");
+        let config = Config::default();
+        config.save_keys(&path, &["video.bitrate_kbps"]).unwrap();
+        assert_eq!(dir.read(), "[video]\nfps = 30\ncursor = false\n");
+        assert_eq!(Config::load(&path).unwrap().video.bitrate_kbps, None);
+
+        // Removing a key or section that is not there changes nothing.
+        let before = dir.read();
+        config
+            .save_keys(&path, &["video.bitrate_kbps", "output.directory"])
+            .unwrap();
+        assert_eq!(dir.read(), before);
+    }
+
+    #[test]
+    fn save_keys_writes_windows_paths() {
+        let dir = TempDir::new();
+        let path = dir.write("[output]\ndirectory = \"old\" # where clips go\nfilename = \"x\"\n");
+        let mut config = Config::default();
+        config.output.directory = Some(PathBuf::from(r"D:\Clips\rec"));
+        config.save_keys(&path, &["output.directory"]).unwrap();
+
+        let text = dir.read();
+        assert!(text.contains("# where clips go"), "{text}");
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.output.directory,
+            Some(PathBuf::from(r"D:\Clips\rec"))
+        );
+        assert_eq!(loaded.output.filename, "x");
+    }
+
+    #[test]
+    fn save_keys_keeps_crlf_line_endings() {
+        let dir = TempDir::new();
+        let path = dir.write("# c\r\n[replay]\r\nseconds = 30\r\n\r\n[video]\r\nfps = 30\r\n");
+        let mut config = Config::default();
+        config.replay.seconds = 45;
+        config.replay.post_roll_seconds = 3;
+        config.audio.microphone = true;
+        config
+            .save_keys(
+                &path,
+                &[
+                    "replay.seconds",
+                    "replay.post_roll_seconds",
+                    "audio.microphone",
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            dir.read(),
+            "# c\r\n[replay]\r\nseconds = 45\r\npost_roll_seconds = 3\r\n\r\n[video]\r\nfps = 30\r\n\r\n[audio]\r\nmicrophone = true\r\n"
+        );
+    }
+
+    #[test]
+    fn save_keys_keeps_a_byte_order_mark() {
+        let dir = TempDir::new();
+        let path = dir.write("\u{feff}[replay]\nseconds = 30\n");
+        let mut config = Config::default();
+        config.replay.seconds = 45;
+        config.save_keys(&path, &["replay.seconds"]).unwrap();
+        assert_eq!(dir.read(), "\u{feff}[replay]\nseconds = 45\n");
+    }
+
+    #[test]
+    fn save_keys_falls_back_for_dotted_keys() {
+        let dir = TempDir::new();
+        let path = dir.write(
+            "future = 1\nreplay.seconds = 30\nreplay.post_roll_seconds = 9\n[video]\nfps = 30\n",
+        );
+        let mut config = Config::default();
+        config.replay.seconds = 45;
+        config.save_keys(&path, &["replay.seconds"]).unwrap();
+
+        let table: toml::Table = toml::from_str(&dir.read()).unwrap();
+        assert_eq!(table["future"].as_integer(), Some(1));
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.replay.seconds, 45);
+        assert_eq!(loaded.replay.post_roll_seconds, 9);
+        assert_eq!(loaded.video.fps, 30);
+
+        // Removing a key that only exists as a dotted key works too.
+        let path = dir.write("replay.seconds = 30\nreplay.post_roll_seconds = 9\n");
+        Config::default()
+            .save_keys(&path, &["replay.post_roll_seconds"])
+            .unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.replay.seconds, 30);
+        assert_eq!(loaded.replay.post_roll_seconds, 0);
+    }
+
+    #[test]
+    fn save_keys_falls_back_for_multi_line_values() {
+        let dir = TempDir::new();
+        let path = dir.write(
+            "[behavior]\nprivate_apps = [\n  \"a.exe\",\n  \"b.exe\",\n]\nsave_toast = false\n",
+        );
+        let mut config = Config::default();
+        config.behavior.private_apps = vec!["c.exe".into()];
+        config.save_keys(&path, &["behavior.private_apps"]).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.behavior.private_apps, vec!["c.exe".to_string()]);
+        assert!(!loaded.behavior.save_toast);
+    }
+
+    #[test]
+    fn save_keys_creates_a_missing_file() {
+        let dir = TempDir::new();
+        let path = dir.path();
+        let mut config = Config::default();
+        config.replay.seconds = 75;
+        config.save_keys(&path, &["replay.seconds"]).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn save_keys_leaves_an_unparseable_file_alone() {
+        let dir = TempDir::new();
+        let broken = "[replay\nseconds = = 30\n# keep me\n";
+        let path = dir.write(broken);
+        let err = Config::default()
+            .save_keys(&path, &["replay.seconds"])
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        assert_eq!(dir.read(), broken);
+        assert!(!path.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn save_keys_rejects_bad_key_names() {
+        let dir = TempDir::new();
+        let path = dir.write("[replay]\nseconds = 30\n");
+        for key in ["seconds", "replay.", ".seconds", "a.b.c", "replay.sec onds"] {
+            let err = Config::default().save_keys(&path, &[key]).unwrap_err();
+            assert!(matches!(err, ConfigError::InvalidKey(_)), "{key}");
+        }
+        assert_eq!(dir.read(), "[replay]\nseconds = 30\n");
     }
 }

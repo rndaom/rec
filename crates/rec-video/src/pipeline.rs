@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Sender, SyncSender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
 use rec_core::media::{VideoCodec, VideoFormat};
@@ -21,6 +21,20 @@ use crate::geometry::output_size;
 use crate::probe::BlackProbe;
 use crate::util::{ComApartment, Context, Event, Timer, wait_any};
 use crate::{PacketSink, SharedStats, VideoCaptureConfig, VideoError, VideoInfo};
+
+/// A request from `VideoCapture` to the running encode thread. The thread
+/// drains them once per tick (see [`Pipeline::run`]); each carries its own
+/// reply channel so the caller can wait for the outcome. Add variants here
+/// for further in-place changes.
+#[derive(Debug)]
+pub(crate) enum Command {
+    /// Change the encoder's mean bit rate (kbit/s); replies with the mean
+    /// the encoder reports afterwards.
+    SetBitrate {
+        kbps: u32,
+        reply: SyncSender<Result<u32, VideoError>>,
+    },
+}
 
 /// Marks the pipeline stopped and signals `VideoCapture::stop` when the
 /// encode thread ends, including by panic (e.g. in the sink).
@@ -47,6 +61,7 @@ pub(crate) fn run(
     stop: Arc<Event>,
     ready: SyncSender<Result<VideoInfo, VideoError>>,
     done: Sender<()>,
+    commands: Receiver<Command>,
 ) {
     // Declared first, so it is dropped last: after COM is uninitialised.
     let _finished = Finished {
@@ -65,7 +80,7 @@ pub(crate) fn run(
     // SAFETY: pseudo-handle of the current thread.
     let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
 
-    let mut pipeline = match Pipeline::new(&config, sink, stats.clone()) {
+    let mut pipeline = match Pipeline::new(&config, sink, stats.clone(), commands) {
         Ok(p) => p,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -98,6 +113,7 @@ struct Pipeline {
     source: crate::CaptureSource,
     fps: u32,
     duration: Hns,
+    commands: Receiver<Command>,
     /// `Latest::seq` of the picture in `last_slot`.
     last_seq: u64,
     last_slot: Option<usize>,
@@ -174,6 +190,7 @@ impl Pipeline {
         config: &VideoCaptureConfig,
         sink: PacketSink,
         stats: Arc<SharedStats>,
+        commands: Receiver<Command>,
     ) -> Result<Self, VideoError> {
         let gpu = d3d::create_for_source(config.source)?;
         let shared = Arc::new(CaptureShared {
@@ -255,6 +272,7 @@ impl Pipeline {
             source: config.source,
             fps: config.fps,
             duration,
+            commands,
             last_seq: 0,
             last_slot: None,
         })
@@ -291,6 +309,7 @@ impl Pipeline {
                 // The capture side already recorded why.
                 return Ok(());
             }
+            self.drain_commands();
             self.tick(due)?;
             #[cfg(debug_assertions)]
             debug_fail(start, due)?;
@@ -302,6 +321,23 @@ impl Pipeline {
                     self.stats.source_closed.store(true, Ordering::Release);
                     return Ok(());
                 }
+            }
+        }
+    }
+
+    /// Runs the queued [`Command`]s. Called once per tick, right before the
+    /// encoder is fed: an empty channel costs one atomic load, and a rate
+    /// change lands between two pictures, so it never races the encoder. A
+    /// failed command is reported to its caller only; it does not stop the
+    /// pipeline.
+    fn drain_commands(&mut self) {
+        loop {
+            match self.commands.try_recv() {
+                Ok(Command::SetBitrate { kbps, reply }) => {
+                    // The caller may have timed out and gone; nothing to do.
+                    let _ = reply.send(self.encoder.set_bitrate(kbps));
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             }
         }
     }

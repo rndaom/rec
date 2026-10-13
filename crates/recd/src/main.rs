@@ -13,6 +13,8 @@ mod hotkeys;
 mod ipc_server;
 mod log;
 mod mux;
+mod overlay;
+mod panel;
 mod paths;
 mod recover;
 mod saver;
