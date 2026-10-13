@@ -38,8 +38,12 @@ Capture uses only OS compositor APIs (WGC, DDA). We do no DLL injection, no grap
 
 **Video encode:**
 1. The first backend is **Media Foundation hardware encoders**. They ship with Windows and work on NVIDIA, AMD and Intel with zero bundled dependencies.
-2. **Native NVENC / AMF / oneVPL** backends follow, loaded at runtime from the GPU driver's own DLLs. They give finer rate control, AV1 on drivers whose MF encoder lacks it, and handling of session limits.
-3. The software fallback is Microsoft's built-in H.264 encoder, opt-in only.
+2. **Native vendor backends**, loaded at runtime from the GPU driver's own DLLs with hand-written bindings (no SDK headers or libraries bundled). They give finer rate control, AV1 and 10-bit where a driver's MF encoder lacks them, and handling of session limits. `encoder = "auto"` uses the native backend where one exists for the GPU, else Media Foundation; a native backend that cannot start falls back to Media Foundation with a warning, never a failed recording.
+   - **AMD AMF** (`amfrt64.dll`): implemented (`crates/rec-video/src/amf/`). It wraps the pipeline's NV12/P010 textures without a copy and keeps each one out of the surface pool until the encoder releases it.
+   - **NVIDIA NVENC** and **Intel oneVPL**: not written yet; they need NVIDIA and Intel hardware to develop and test on. Until then those GPUs use their Media Foundation encoders, which are the same silicon.
+3. The software fallback is Microsoft's built-in H.264 encoder, opt-in only. Not implemented yet.
+
+**AV1 sizes:** AMD's AV1 engine (RDNA3) codes 64 x 16 blocks and cannot signal a crop in either API: the MFT pads 1080 lines to 1082 (and hangs after one frame at other unaligned sizes), and AMF refuses unaligned sizes. AV1 frames are therefore padded to the alignment and the picture is centred in them (a few black lines). H.264 and HEVC code the exact size.
 
 **Audio encode:** Media Foundation AAC, built into Windows. Input is always 48 kHz 16-bit stereo, produced by WASAPI's own `AUTOCONVERTPCM` conversion, so a device change never changes the track format.
 

@@ -6,12 +6,12 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 
 **Read first:** [docs/decisions.md](docs/decisions.md) (the why), [docs/roadmap.md](docs/roadmap.md) (the what), [docs/research.md](docs/research.md) (the evidence).
 
-**Status (2026-10-13):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio, exclusive-fullscreen detection, pipeline recovery and the quick panel done.
+**Status (2026-10-13):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio, exclusive-fullscreen detection, pipeline recovery, the quick panel, HDR, AV1 and the AMD AMF backend done.
 
 | Crate | Role |
 |---|---|
 | `rec-core` | Config, hotkeys, IPC, replay buffer, media types, QPC clock |
-| `rec-video` | WGC → D3D11 NV12 → MF hardware encoder |
+| `rec-video` | WGC → D3D11 NV12/P010 (video processor or HDR shaders) → AMF or MF hardware encoder |
 | `rec-audio` | WASAPI → AAC |
 | `rec-mux` | Fragmented MP4 |
 | `recd` | Tray service |
@@ -24,8 +24,9 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 3. ~~Black-frame / exclusive-fullscreen detection~~ (done)
 4. ~~Pipeline recovery~~ (done: failures, resolution changes and GPU moves restart only the video pipeline as a new `segment`; see `recd/src/recover.rs`)
 5. ~~Quick-panel overlay~~ (done: `recd/src/panel.rs` model, `overlay.rs` window; Alt+F7 or the tray)
-6. HDR
-7. Native encoders + AV1
+6. ~~HDR~~ (done: HDR10 or tone-map, decision D12)
+7. ~~Native encoders + AV1~~ (AV1 and AMD AMF done; NVENC and oneVPL need NVIDIA / Intel hardware)
+8. Remaining M2 items: per-game profiles, extra clip-length hotkeys, marker hotkey, controller combo, storage quota with auto-prune, Win10 DDA fallback, adaptive GPU priority
 
 **Things learned**
 - Video:
@@ -37,6 +38,13 @@ Handoff file so any session can pick up quickly. Keep it short and current.
   - `StartCapture` can fail with E_INVALIDARG while a game window is switching to fullscreen; recd retries after 2/5/10/30 s and only toasts from the second failure.
   - Restarting the video pipeline (stop + start, AMD HEVC) takes ~220 ms. A clip never spans a restart: it is cut to one segment, and audio is relabelled with that segment's number (rec-mux rejects mixed segments).
   - A real device loss needs a driver reset (TDR), so recovery is tested with `REC_DEBUG_VIDEO_FAIL_AFTER=<s>` (debug builds only: the first pipeline fails after that long) and `fake_game --resize-after <s>`. The adapter-change path (hybrid laptops, a window moved to a monitor on another GPU) is only unit-tested: this machine has one GPU.
+- HDR and encoders:
+  - HDR is detected per display (`IDXGIOutput6` colour space); WGC then delivers FP16 scRGB. `convert.hlsl` makes P010 HDR10 (PQ, BT.2020, clipped at the display peak) or tone-maps to 8-bit BT.709 using the display's SDR white level. HDR10 mastering/CLL metadata is inserted in-band into every keyframe by the pipeline (`sei.rs`, `obu.rs`) and as `mdcv`/`clli` boxes in the MP4, for every backend alike.
+  - Only tested without a real HDR display: `record --assume-hdr` and `REC_DEBUG_ASSUME_HDR=1` (debug builds of recd) take the HDR path on an SDR display. The real-display path (`display::tests::primary_display_reports_its_colour`, the Win+Alt+B restart in `recover.rs`) still needs a run with HDR turned on.
+  - AMD AV1 (MFT and AMF, RDNA3) needs 64 x 16 sizes: the MFT pads 1080 to 1082 and hangs after one frame at other unaligned sizes; AMF refuses them. Frames are padded and the picture centred (`geometry::place`). `ENCODER_STALL` (3 s without output) turns any future hang into a pipeline restart.
+  - AMF (runtime 1.5.2, driver 32.0.31041, RX 7800 XT): creation 7–18 ms, under one frame of latency, `set_bitrate` under 0.1 ms; each input texture comes back by the poll that returns its output. The minimum runtime (1.4.28) is a guess. AV1 has a visible quality floor on noise at low bitrates.
+  - GPU tests: `cargo test --release -p rec-video --lib shader -- --ignored` (shader vs reference, ±1 code) and `cargo test --release -p rec-video amf -- --ignored --test-threads=1`.
+  - `record` example: `--codec av1`, `--encoder auto|amf|mf`, `--hdr auto|tonemap|off`, `--assume-hdr`.
 - Audio:
   - The MF AAC encoder has zero effective priming delay (measured).
   - WASAPI `AUTOCONVERTPCM` handles all format conversion.

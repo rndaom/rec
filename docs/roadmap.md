@@ -50,8 +50,9 @@ Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a liv
 - [ ] Benchmark harness: PresentMon/CapFrameX runs with and without `recd`, results in `bench/` and the README
   - Harness done (`rec-bench`, see `bench/README.md`); published numbers pending a run on real hardware (NVIDIA, AMD, Intel, hybrid laptop)
 - [x] Per-process audio tracks (game, voice chat, mic, other apps) + mixed track (`AudioSource::Process`)
-- [ ] Native NVENC / AMF / oneVPL backends; AV1; encoder capability probing and fallback chain
-- [ ] HDR: FP16 capture → HEVC Main10 PQ with HDR10 metadata, or tone-map to SDR
+- [x] AV1 (Media Foundation and AMF); native AMD AMF backend with fallback to Media Foundation
+- [ ] Native NVENC and oneVPL backends (need NVIDIA / Intel hardware to develop on)
+- [x] HDR: FP16 capture → HEVC Main10 / AV1 10-bit PQ with HDR10 metadata, or tone-map to SDR; restart on HDR switch
 - [x] Quick-panel overlay (DirectComposition, excluded from capture), keyboard and mouse navigation
 - [ ] Per-game profiles; extra clip-length hotkeys in the UI; marker hotkey; controller combo
 - [ ] Storage quota with auto-prune (starred clips kept)
