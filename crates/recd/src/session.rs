@@ -1,13 +1,16 @@
 //! One recording session: the video and audio pipelines for one target, all
-//! feeding a shared replay buffer of encoded packets.
+//! feeding a shared replay buffer of encoded packets. The video pipeline is
+//! restarted in place when it fails or the source changes (see
+//! [`crate::recover`]); each run is one `segment`.
 
 use std::sync::{Arc, Mutex};
 
 use rec_audio::{AudioCapture, AudioCaptureConfig, AudioInput, AudioSource, ProcessTarget};
-use rec_core::config::{AudioConfig, Codec, Config, Quality};
-use rec_core::media::{TrackInfo, TrackKind, VIDEO_TRACK};
+use rec_core::config::{AudioConfig, Codec, Config, Quality, VideoConfig};
+use rec_core::media::{TrackInfo, TrackKind, VIDEO_TRACK, VideoFormat};
 use rec_core::replay::{Limits, Packet, ReplayBuffer, TrackId};
-use rec_core::time::{qpc_now, secs};
+use rec_core::time::{Hns, as_secs_f64, qpc_now, secs};
+use rec_video::geometry::output_size;
 use rec_video::{CaptureSource, CodecPreference, VideoCapture, VideoCaptureConfig};
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -22,6 +25,7 @@ use windows::core::BOOL;
 
 use crate::detect;
 use crate::log::{info, warning};
+use crate::recover::Recovery;
 use crate::watch::{Observation, Problem, Watcher};
 use crate::win::Hwnd;
 
@@ -42,7 +46,11 @@ pub struct Target {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Health {
     Ok,
+    /// The video pipeline stopped and will be restarted; audio and the
+    /// buffer carry on.
+    Restarting,
     SourceClosed,
+    /// The video pipeline could not be brought back.
     Failed(String),
 }
 
@@ -50,10 +58,20 @@ pub enum Health {
 pub struct Session {
     pub target: Target,
     buffer: Arc<Mutex<ReplayBuffer>>,
+    /// Video track first; its format is the newest segment's.
     tracks: Vec<TrackInfo>,
     description: String,
     // Video is declared before audio so it stops first when dropped.
-    video: VideoCapture,
+    /// `None` while waiting to restart after a failure.
+    video: Option<VideoCapture>,
+    /// Format of every segment started so far, oldest first.
+    segments: Vec<(u32, VideoFormat)>,
+    source: CaptureSource,
+    settings: VideoConfig,
+    /// Buffer length in seconds and memory cap in MB, for the bitrate check.
+    buffer_seconds: u32,
+    max_memory_mb: u32,
+    recovery: Recovery,
     _audio: Option<AudioCapture>,
     watcher: Watcher,
     problem: Option<Problem>,
@@ -182,14 +200,6 @@ pub fn plan_audio(a: &AudioConfig, game_pid: Option<u32>, per_app: bool) -> Opti
     })
 }
 
-/// Output size after the `max_height` cap, keeping the aspect ratio.
-fn output_size(width: u32, height: u32, max_height: Option<u32>) -> (u32, u32) {
-    match max_height {
-        Some(max) if height > max => (width * max / height, max),
-        _ => (width, height),
-    }
-}
-
 fn monitor_by_index(index: u32) -> Option<HMONITOR> {
     unsafe extern "system" fn collect(
         monitor: HMONITOR,
@@ -245,6 +255,62 @@ fn source_size(source: CaptureSource, hwnd: Hwnd) -> (u32, u32) {
     }
 }
 
+/// Starts a video pipeline for `source` as `segment`, at the bitrate for the
+/// source's current size. Returns it with its format and a short
+/// description.
+fn open_video(
+    target: &Target,
+    source: CaptureSource,
+    v: &VideoConfig,
+    buffer: &Arc<Mutex<ReplayBuffer>>,
+    segment: u32,
+    max_memory_mb: u32,
+    buffer_seconds: u32,
+) -> Result<(VideoCapture, VideoFormat, String), String> {
+    let codec = match v.codec {
+        Codec::Auto | Codec::Av1 => CodecPreference::Auto,
+        Codec::H264 => CodecPreference::H264,
+        Codec::Hevc => CodecPreference::Hevc,
+    };
+    let (src_w, src_h) = source_size(source, target.hwnd);
+    let (out_w, out_h) = output_size(src_w, src_h, v.max_height);
+    let bitrate_kbps = v
+        .bitrate_kbps
+        .unwrap_or_else(|| default_bitrate_kbps(v.quality, v.codec, out_w, out_h, v.fps));
+
+    let needed = u64::from(bitrate_kbps) * 1000 / 8 * u64::from(buffer_seconds);
+    if needed > u64::from(max_memory_mb) * 1024 * 1024 {
+        warning!(
+            "{buffer_seconds} s at {bitrate_kbps} kbit/s needs ~{} MB but the buffer is capped at {max_memory_mb} MB; clips may be shorter",
+            needed / (1024 * 1024),
+        );
+    }
+
+    let config = VideoCaptureConfig {
+        source,
+        fps: v.fps,
+        max_height: v.max_height,
+        codec,
+        bitrate_kbps,
+        cursor: v.cursor,
+        track: VIDEO_TRACK,
+        segment,
+    };
+    let video = VideoCapture::start(config, sink(buffer)).map_err(|e| e.to_string())?;
+    let info = video.info();
+    let format = info.format.clone();
+    let description = format!(
+        "{} {}x{}@{} {} Mbit/s · {}",
+        format.codec.name(),
+        format.width,
+        format.height,
+        format.fps,
+        bitrate_kbps / 1000,
+        info.adapter_name
+    );
+    Ok((video, format, description))
+}
+
 impl Session {
     pub fn start(config: &Config, target: Target) -> Result<Self, String> {
         let replay = &config.replay;
@@ -276,58 +342,25 @@ impl Session {
         } else {
             CaptureSource::Window(target.hwnd.0)
         };
-        let codec = match v.codec {
-            Codec::Auto => CodecPreference::Auto,
-            Codec::H264 => CodecPreference::H264,
-            Codec::Hevc => CodecPreference::Hevc,
-            Codec::Av1 => {
-                warning!("AV1 encoding is not available yet; using HEVC/H.264");
-                CodecPreference::Auto
-            }
-        };
-        let (src_w, src_h) = source_size(source, target.hwnd);
-        let (out_w, out_h) = output_size(src_w, src_h, v.max_height);
-        let bitrate_kbps = v
-            .bitrate_kbps
-            .unwrap_or_else(|| default_bitrate_kbps(v.quality, v.codec, out_w, out_h, v.fps));
-
-        let needed = u64::from(bitrate_kbps) * 1000 / 8 * u64::from(seconds);
-        if needed > max_bytes as u64 {
-            warning!(
-                "{} s at {bitrate_kbps} kbit/s needs ~{} MB but the buffer is capped at {} MB; clips may be shorter",
-                seconds,
-                needed / (1024 * 1024),
-                replay.max_memory_mb
-            );
+        if v.codec == Codec::Av1 {
+            warning!("AV1 encoding is not available yet; using HEVC/H.264");
         }
-
-        let video_config = VideoCaptureConfig {
+        let (video, format, description) = open_video(
+            &target,
             source,
-            fps: v.fps,
-            max_height: v.max_height,
-            codec,
-            bitrate_kbps,
-            cursor: v.cursor,
-            track: VIDEO_TRACK,
-            segment: 0,
-        };
-        let video = VideoCapture::start(video_config, sink(&buffer)).map_err(|e| e.to_string())?;
+            v,
+            &buffer,
+            0,
+            replay.max_memory_mb,
+            seconds,
+        )?;
         let info = video.info();
-        let format = info.format.clone();
-        let description = format!(
-            "{} {}x{}@{} {} Mbit/s · {}",
-            format.codec.name(),
-            format.width,
-            format.height,
-            format.fps,
-            bitrate_kbps / 1000,
-            info.adapter_name
-        );
+        let encoder = (info.encoder_name.clone(), info.rate_control.clone());
 
         let mut tracks = vec![TrackInfo {
             id: VIDEO_TRACK,
             name: "Video".into(),
-            kind: TrackKind::Video(format),
+            kind: TrackKind::Video(format.clone()),
         }];
 
         // ---- audio ----
@@ -353,18 +386,122 @@ impl Session {
 
         info!(
             "session: {description}, encoder {}, rate control {}, {} audio track(s), buffer {seconds} s / {} MB",
-            info.encoder_name, info.rate_control, audio_tracks, replay.max_memory_mb
+            encoder.0, encoder.1, audio_tracks, replay.max_memory_mb
         );
+        let now = qpc_now();
         Ok(Self {
             target,
             buffer,
             tracks,
             description,
-            video,
+            video: Some(video),
+            segments: vec![(0, format)],
+            source,
+            settings: config.video.clone(),
+            buffer_seconds: seconds,
+            max_memory_mb: replay.max_memory_mb,
+            recovery: Recovery::new(now),
             _audio: audio,
-            watcher: Watcher::new(qpc_now()),
+            watcher: Watcher::new(now),
             problem: None,
         })
+    }
+
+    /// Checks the video pipeline and restarts it when it failed, or the
+    /// source changed size or moved to another GPU (see [`crate::recover`]).
+    /// Call regularly; restarts happen on the calling thread.
+    pub fn supervise(&mut self) -> Health {
+        let now = qpc_now();
+        let Some(video) = &self.video else {
+            if !self.recovery.retry_due(now) {
+                return Health::Restarting;
+            }
+            return self.restart_video(now, None);
+        };
+        let stats = video.stats();
+        if stats.source_closed {
+            return Health::SourceClosed;
+        }
+        if !stats.running {
+            let reason = stats
+                .last_error
+                .unwrap_or_else(|| "video capture stopped".into());
+            warning!("{}: video stopped: {reason}", self.target.game);
+            self.video = None;
+            let retry = self.recovery.crashed(now);
+            return self.retry_later(now, reason, retry);
+        }
+        let info = video.info();
+        let encoded = (info.format.width, info.format.height);
+        let wanted = stats
+            .source_size
+            .map(|(w, h)| output_size(w, h, self.settings.max_height));
+        let adapter_moved =
+            rec_video::adapter_for(self.source).is_ok_and(|luid| luid != info.adapter_luid);
+        match self.recovery.check(now, encoded, wanted, adapter_moved) {
+            Some(change) => self.restart_video(now, Some(&change.to_string())),
+            None => Health::Ok,
+        }
+    }
+
+    /// Stops the video pipeline, if one runs, and starts the next segment.
+    fn restart_video(&mut self, now: Hns, why: Option<&str>) -> Health {
+        if let Some(why) = why {
+            info!("{}: restarting video: {why}", self.target.game);
+        }
+        // The old pipeline lets go of its encoder first: GPUs limit how many
+        // encode sessions run at once.
+        if let Some(video) = self.video.take() {
+            video.stop();
+        }
+        let segment = self.segments.last().map_or(0, |&(s, _)| s + 1);
+        let opened = open_video(
+            &self.target,
+            self.source,
+            &self.settings,
+            &self.buffer,
+            segment,
+            self.max_memory_mb,
+            self.buffer_seconds,
+        );
+        match opened {
+            Ok((video, format, description)) => {
+                info!(
+                    "{}: video segment {segment}: {description}",
+                    self.target.game
+                );
+                let started = qpc_now();
+                self.recovery
+                    .started(started, (format.width, format.height));
+                self.tracks[0].kind = TrackKind::Video(format.clone());
+                self.segments.push((segment, format));
+                self.description = description;
+                self.video = Some(video);
+                // The new pipeline's frames are judged afresh.
+                self.watcher = Watcher::new(started);
+                self.problem = None;
+                Health::Ok
+            }
+            Err(e) => {
+                warning!("{}: video did not start: {e}", self.target.game);
+                let retry = self.recovery.start_failed(now);
+                self.retry_later(now, e, retry)
+            }
+        }
+    }
+
+    fn retry_later(&self, now: Hns, reason: String, at: Option<Hns>) -> Health {
+        match at {
+            Some(at) => {
+                info!(
+                    "{}: retrying video in {:.0} s",
+                    self.target.game,
+                    as_secs_f64(at - now)
+                );
+                Health::Restarting
+            }
+            None => Health::Failed(reason),
+        }
     }
 
     /// Checks that the game is really being captured (see [`crate::watch`]).
@@ -375,7 +512,7 @@ impl Session {
             // Desktop recording: a still desktop sends no frames, rightly.
             return None;
         }
-        let stats = self.video.stats();
+        let stats = self.video.as_ref()?.stats();
         let mut affinity = WDA_NONE.0;
         // SAFETY: plain queries that accept stale handles; `affinity` is a
         // valid out-pointer.
@@ -409,23 +546,13 @@ impl Session {
         Some(problem)
     }
 
-    /// The capture problem the watcher currently sees, if any.
-    pub fn problem(&self) -> Option<Problem> {
-        self.problem
-    }
-
-    pub fn health(&self) -> Health {
-        let stats = self.video.stats();
-        if stats.source_closed {
-            Health::SourceClosed
-        } else if !stats.running {
-            Health::Failed(
-                stats
-                    .last_error
-                    .unwrap_or_else(|| "video capture stopped".into()),
-            )
+    /// What is wrong with the recording right now, in a few words: the
+    /// video is restarting, or the watcher sees a capture problem.
+    pub fn warning(&self) -> Option<&'static str> {
+        if self.video.is_none() {
+            Some("video stopped; restarting it")
         } else {
-            Health::Ok
+            self.problem.map(Problem::short)
         }
     }
 
@@ -435,6 +562,11 @@ impl Session {
 
     pub fn tracks(&self) -> Vec<TrackInfo> {
         self.tracks.clone()
+    }
+
+    /// Every video segment started so far with its format, oldest first.
+    pub fn segments(&self) -> Vec<(u32, VideoFormat)> {
+        self.segments.clone()
     }
 
     /// Short description of the pipeline, e.g. "HEVC 2560x1440@60 18 Mbit/s · AMD Radeon RX 7800 XT".
@@ -562,12 +694,5 @@ mod tests {
             ..AudioConfig::default()
         };
         assert_eq!(plan_audio(&none, Some(1), true), None);
-    }
-
-    #[test]
-    fn output_size_caps_height() {
-        assert_eq!(output_size(2560, 1440, Some(1080)), (1920, 1080));
-        assert_eq!(output_size(1920, 1080, Some(1440)), (1920, 1080));
-        assert_eq!(output_size(1920, 1080, None), (1920, 1080));
     }
 }

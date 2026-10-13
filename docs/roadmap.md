@@ -57,7 +57,7 @@ Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a liv
 - [ ] Storage quota with auto-prune (starred clips kept)
 - [ ] Windows 10 path: DDA fallback (monitor capture without the yellow border)
 - [x] Exclusive-fullscreen black-frame detection with a "switch to borderless" hint
-- [ ] Hybrid-GPU handling; device-lost / driver-update / resolution-change recovery without losing the buffer
+- [x] Hybrid-GPU handling; device-lost / driver-update / resolution-change recovery without losing the buffer (`recd/src/recover.rs`; the GPU-switch path is not yet tested on a hybrid laptop)
 - [ ] Adaptive GPU priority when frames drop under full GPU load
 - [x] Cached silent AAC packet instead of encoding silence
 

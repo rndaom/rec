@@ -69,6 +69,19 @@ pub(crate) fn source_alive(source: CaptureSource) -> bool {
     }
 }
 
+/// A LUID as one comparable number.
+pub(crate) fn luid_key(luid: LUID) -> i64 {
+    (i64::from(luid.HighPart) << 32) | i64::from(luid.LowPart)
+}
+
+/// LUID of the adapter [`create_for_source`] would pick for `source` now.
+pub(crate) fn adapter_luid(source: CaptureSource) -> Result<i64, VideoError> {
+    let (adapter, _) = find_adapter(target_monitor(source))?;
+    // SAFETY: GetDesc1 fills a plain struct.
+    let desc = unsafe { adapter.GetDesc1() }.ctx("IDXGIAdapter1::GetDesc1")?;
+    Ok(luid_key(desc.AdapterLuid))
+}
+
 /// Finds the adapter whose DXGI output is `monitor`. Falls back to the first
 /// hardware adapter (e.g. for indirect/virtual displays) with `owns = false`.
 fn find_adapter(monitor: HMONITOR) -> Result<(IDXGIAdapter1, bool), VideoError> {

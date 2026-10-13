@@ -6,7 +6,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 
 **Read first:** [docs/decisions.md](docs/decisions.md) (the why), [docs/roadmap.md](docs/roadmap.md) (the what), [docs/research.md](docs/research.md) (the evidence).
 
-**Status (2026-10-12):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio and exclusive-fullscreen detection done.
+**Status (2026-10-13):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio, exclusive-fullscreen detection and pipeline recovery done.
 
 | Crate | Role |
 |---|---|
@@ -22,7 +22,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 1. ~~Benchmark harness~~ (harness done; the first published run on real hardware is still to do)
 2. ~~Per-process audio tracks~~ (done)
 3. ~~Black-frame / exclusive-fullscreen detection~~ (done)
-4. Pipeline recovery (device lost, resolution change), using new `segment` numbers
+4. ~~Pipeline recovery~~ (done: failures, resolution changes and GPU moves restart only the video pipeline as a new `segment`; see `recd/src/recover.rs`)
 5. Quick-panel overlay
 6. HDR
 7. Native encoders + AV1
@@ -35,6 +35,8 @@ Handoff file so any session can pick up quickly. Keep it short and current.
   - The AMD HEVC MFT honours peak-constrained VBR.
   - Fullscreen optimizations make DXGI fullscreen games (flip or blt) capturable; the shell then reports "D3D fullscreen". True exclusive fullscreen (reproduce with `__COMPAT_LAYER=DisableDXMaximizedWindowedMode` and the `fake_game` example) still delivers frames, at a reduced rate, but black apart from the cursor. `recd/src/watch.rs` turns that into a "switch to borderless" hint.
   - `StartCapture` can fail with E_INVALIDARG while a game window is switching to fullscreen; recd retries after 2/5/10/30 s and only toasts from the second failure.
+  - Restarting the video pipeline (stop + start, AMD HEVC) takes ~220 ms. A clip never spans a restart: it is cut to one segment, and audio is relabelled with that segment's number (rec-mux rejects mixed segments).
+  - A real device loss needs a driver reset (TDR), so recovery is tested with `REC_DEBUG_VIDEO_FAIL_AFTER=<s>` (debug builds only: the first pipeline fails after that long) and `fake_game --resize-after <s>`. The adapter-change path (hybrid laptops, a window moved to a monitor on another GPU) is only unit-tested: this machine has one GPU.
 - Audio:
   - The MF AAC encoder has zero effective priming delay (measured).
   - WASAPI `AUTOCONVERTPCM` handles all format conversion.

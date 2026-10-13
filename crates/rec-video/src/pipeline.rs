@@ -223,6 +223,7 @@ impl Pipeline {
             encoder_name: encoder.name.clone(),
             adapter_name: gpu.adapter_name.clone(),
             adapter_owns_monitor: gpu.owns_monitor,
+            adapter_luid: d3d::luid_key(gpu.luid),
             rate_control: encoder.rate_control.clone(),
             source_width: capture.source_width,
             source_height: capture.source_height,
@@ -291,6 +292,8 @@ impl Pipeline {
                 return Ok(());
             }
             self.tick(due)?;
+            #[cfg(debug_assertions)]
+            debug_fail(start, due)?;
             if tick % fps == 0 {
                 // Once a second: device health and source liveness.
                 // SAFETY: plain status query.
@@ -364,6 +367,30 @@ impl Pipeline {
         // the encoder is done with it.
         drop(sample);
         Ok(())
+    }
+}
+
+/// Debug builds only: with `REC_DEBUG_VIDEO_FAIL_AFTER=<seconds>` set, the
+/// first pipeline in the process fails that long after it started, the way a
+/// lost GPU device does. A real device loss needs a driver reset (TDR), so
+/// this is how recd's recovery is tested by hand.
+#[cfg(debug_assertions)]
+fn debug_fail(start: Hns, now: Hns) -> Result<(), VideoError> {
+    use std::sync::atomic::AtomicBool;
+    static FAILED: AtomicBool = AtomicBool::new(false);
+    let after = std::env::var("REC_DEBUG_VIDEO_FAIL_AFTER")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    match after {
+        Some(after)
+            if now - start >= (after * HNS_PER_SEC as f64) as Hns
+                && !FAILED.swap(true, Ordering::Relaxed) =>
+        {
+            Err(VideoError::Other(
+                "simulated device loss (REC_DEBUG_VIDEO_FAIL_AFTER)".into(),
+            ))
+        }
+        _ => Ok(()),
     }
 }
 

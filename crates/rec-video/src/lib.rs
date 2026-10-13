@@ -161,6 +161,11 @@ pub struct VideoStats {
     /// While the encoded picture is black: since when (QPC time of the first
     /// black picture checked). Checked every two seconds.
     pub black_since: Option<Hns>,
+    /// Size of the newest captured frame. It follows the source (a window
+    /// resized, a game switching resolution) while the encoded size stays
+    /// fixed for the pipeline's lifetime: the picture is scaled to fit, and
+    /// the caller decides when a restart at the new size is worth it.
+    pub source_size: Option<(u32, u32)>,
     /// The captured window or monitor went away; the pipeline has stopped.
     pub source_closed: bool,
     /// The encode thread is running.
@@ -179,6 +184,9 @@ pub struct VideoInfo {
     pub adapter_name: String,
     /// The adapter is the one whose output shows the captured monitor.
     pub adapter_owns_monitor: bool,
+    /// The adapter's LUID; compare with [`adapter_for`] to notice that the
+    /// source moved to another GPU.
+    pub adapter_luid: i64,
     /// Rate-control mode the encoder reported after configuration.
     pub rate_control: String,
     /// Source size when the session started.
@@ -224,6 +232,8 @@ pub(crate) struct SharedStats {
     pub last_frame: AtomicI64,
     /// 0 = not black (or not checked yet).
     pub black_since: AtomicI64,
+    /// `width << 32 | height` of the newest captured frame; 0 = none yet.
+    pub source_size: AtomicU64,
     pub source_closed: AtomicBool,
     pub running: AtomicBool,
     /// Set by any thread on a fatal error; the encode thread then stops.
@@ -253,6 +263,9 @@ impl SharedStats {
             parameter_sets_inserted: self.ps_inserted.load(Ordering::Relaxed),
             last_frame_time: Some(self.last_frame.load(Ordering::Relaxed)).filter(|&t| t != 0),
             black_since: Some(self.black_since.load(Ordering::Relaxed)).filter(|&t| t != 0),
+            source_size: Some(self.source_size.load(Ordering::Relaxed))
+                .filter(|&s| s != 0)
+                .map(|s| ((s >> 32) as u32, s as u32)),
             source_closed: self.source_closed.load(Ordering::Acquire),
             running: self.running.load(Ordering::Acquire),
             last_error: self.last_error.lock().ok().and_then(|e| e.clone()),
@@ -382,6 +395,15 @@ impl Drop for VideoCapture {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// LUID of the adapter a pipeline for `source` would run on now: the one
+/// driving the source's monitor. Differs from [`VideoInfo::adapter_luid`]
+/// once the window moved to a monitor on another GPU, or a hybrid laptop
+/// switched its panel to the other GPU.
+#[cfg(windows)]
+pub fn adapter_for(source: CaptureSource) -> Result<i64, VideoError> {
+    d3d::adapter_luid(source)
 }
 
 /// Outcome of [`request_borderless_access`].

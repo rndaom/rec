@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rec_core::media::{TrackInfo, VIDEO_TRACK};
+use rec_core::media::{TrackInfo, TrackKind, VIDEO_TRACK, VideoFormat};
 use rec_core::replay::{Packet, ReplayBuffer};
 use rec_core::time::{Hns, millis, qpc_now};
 use windows::Win32::System::Threading::{
@@ -20,6 +20,9 @@ use windows::Win32::System::Threading::{
 pub struct SaveJob {
     pub buffer: Arc<Mutex<ReplayBuffer>>,
     pub tracks: Vec<TrackInfo>,
+    /// The session's video segments when the save was requested, oldest
+    /// first, with their formats.
+    pub segments: Vec<(u32, VideoFormat)>,
     /// Clip start on the QPC clock.
     pub start: Hns,
     /// Clip end; the job waits until then (post-roll) before writing.
@@ -74,16 +77,22 @@ fn run(job: SaveJob) -> Result<PathBuf, String> {
             .map_err(|_| "replay buffer is unavailable")?;
         buffer.snapshot(job.start, Some(job.end))
     };
-    let packets = latest_segment(packets);
-    if !packets.iter().any(|p| p.track == VIDEO_TRACK) {
+    let known: Vec<u32> = job.segments.iter().map(|&(s, _)| s).collect();
+    let Some((segment, packets)) = clip_segment(packets, &known) else {
         return Err("nothing recorded yet".into());
+    };
+    let mut tracks = job.tracks;
+    if let Some((_, format)) = job.segments.iter().find(|&&(s, _)| s == segment) {
+        for track in tracks.iter_mut().filter(|t| t.id == VIDEO_TRACK) {
+            track.kind = TrackKind::Video(format.clone());
+        }
     }
 
     std::fs::create_dir_all(&job.dir)
         .map_err(|e| format!("can't create {}: {e}", job.dir.display()))?;
     let (file, path) = create_unique(&job.dir, &job.name, "mp4")
         .map_err(|e| format!("can't create a file in {}: {e}", job.dir.display()))?;
-    if let Err(e) = crate::mux::write(BufWriter::new(file), job.tracks, &packets) {
+    if let Err(e) = crate::mux::write(BufWriter::new(file), tracks, &packets) {
         let _ = std::fs::remove_file(&path);
         return Err(e);
     }
@@ -108,34 +117,37 @@ fn create_unique(dir: &Path, name: &str, ext: &str) -> io::Result<(File, PathBuf
     unreachable!("unbounded range")
 }
 
-/// Keeps only the newest encoder segment: a clip can't mix resolutions or
-/// codecs. Audio is kept from the segment's first video keyframe on.
-pub fn latest_segment(packets: Vec<Packet>) -> Vec<Packet> {
-    let Some(segment) = packets
+/// Cuts a snapshot down to one video segment, because a clip can't change
+/// resolution or codec midway (see `crate::recover`). Picks the newest of
+/// `segments` (the ones known when the save was requested) with a keyframe
+/// in the snapshot: a pipeline that restarted a moment ago may have none
+/// yet. Audio never restarts, so it is kept for the segment's time span and
+/// labelled with the segment's number. Returns `None` without video.
+pub fn clip_segment(packets: Vec<Packet>, segments: &[u32]) -> Option<(u32, Vec<Packet>)> {
+    let is_video = |p: &Packet| p.track == VIDEO_TRACK;
+    let (segment, start) = segments.iter().rev().find_map(|&s| {
+        packets
+            .iter()
+            .find(|p| is_video(p) && p.segment == s && p.keyframe)
+            .map(|p| (s, p.pts))
+    })?;
+    let end = packets
         .iter()
-        .filter(|p| p.track == VIDEO_TRACK)
-        .map(|p| p.segment)
-        .max()
-    else {
-        return Vec::new();
-    };
-    let Some(start) = packets
-        .iter()
-        .find(|p| p.track == VIDEO_TRACK && p.segment == segment && p.keyframe)
-        .map(|p| p.pts)
-    else {
-        return Vec::new();
-    };
-    packets
+        .filter(|p| is_video(p) && p.segment == segment)
+        .map(|p| p.pts + p.duration)
+        .max()?;
+    let packets = packets
         .into_iter()
-        .filter(|p| {
-            if p.track == VIDEO_TRACK {
-                p.segment == segment && p.pts >= start
+        .filter_map(|mut p| {
+            if is_video(&p) {
+                (p.segment == segment && p.pts >= start).then_some(p)
             } else {
-                p.pts >= start
+                p.segment = segment;
+                (start..end).contains(&p.pts).then_some(p)
             }
         })
-        .collect()
+        .collect();
+    Some((segment, packets))
 }
 
 #[cfg(test)]
@@ -148,32 +160,67 @@ mod tests {
             segment,
             pts,
             dts: pts,
-            duration: 1,
+            duration: 10,
             keyframe,
             data: Arc::from(&[0u8][..]),
         }
     }
 
-    #[test]
-    fn keeps_only_newest_segment() {
-        let packets = vec![
+    /// `(track, segment, pts)` of each packet.
+    fn summary(packets: &[Packet]) -> Vec<(u8, u32, Hns)> {
+        packets
+            .iter()
+            .map(|p| (p.track, p.segment, p.pts))
+            .collect()
+    }
+
+    /// Video segment 0 until 20, a restart, segment 1 from 40; audio
+    /// throughout, always labelled segment 0 by the audio pipeline.
+    fn restart() -> Vec<Packet> {
+        vec![
             packet(0, 0, 0, true),
             packet(1, 0, 5, true),
             packet(0, 0, 10, false),
             packet(1, 0, 15, true),
-            packet(0, 1, 20, true),
             packet(1, 0, 25, true),
-            packet(0, 1, 30, false),
-        ];
-        let kept = latest_segment(packets);
-        let pts: Vec<_> = kept.iter().map(|p| (p.track, p.pts)).collect();
-        assert_eq!(pts, vec![(0, 20), (1, 25), (0, 30)]);
+            packet(1, 0, 35, true),
+            packet(0, 1, 40, true),
+            packet(1, 0, 45, true),
+            packet(0, 1, 50, false),
+        ]
     }
 
     #[test]
-    fn empty_without_video() {
-        assert!(latest_segment(vec![packet(1, 0, 0, true)]).is_empty());
-        assert!(latest_segment(Vec::new()).is_empty());
+    fn keeps_the_newest_segment_and_relabels_audio() {
+        let (segment, kept) = clip_segment(restart(), &[0, 1]).unwrap();
+        assert_eq!(segment, 1);
+        assert_eq!(summary(&kept), vec![(0, 1, 40), (1, 1, 45), (0, 1, 50)]);
+    }
+
+    #[test]
+    fn a_segment_without_a_keyframe_yet_falls_back_to_the_previous_one() {
+        let mut packets = restart();
+        packets.retain(|p| p.segment == 0);
+        let (segment, kept) = clip_segment(packets, &[0, 1]).unwrap();
+        assert_eq!(segment, 0);
+        // Audio stops where the segment's video does.
+        assert_eq!(
+            summary(&kept),
+            vec![(0, 0, 0), (1, 0, 5), (0, 0, 10), (1, 0, 15)]
+        );
+    }
+
+    #[test]
+    fn segments_started_after_the_request_are_ignored() {
+        let (segment, kept) = clip_segment(restart(), &[0]).unwrap();
+        assert_eq!(segment, 0);
+        assert_eq!(kept.len(), 4);
+    }
+
+    #[test]
+    fn nothing_without_video() {
+        assert!(clip_segment(vec![packet(1, 0, 0, true)], &[0]).is_none());
+        assert!(clip_segment(Vec::new(), &[0]).is_none());
     }
 
     #[test]

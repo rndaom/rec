@@ -325,6 +325,10 @@ impl FrameHandler {
             .stats
             .last_frame
             .store(rec_core::time::qpc_now(), Ordering::Relaxed);
+        if content.Width > 0 && content.Height > 0 {
+            let size = (u64::from(content.Width as u32) << 32) | u64::from(content.Height as u32);
+            self.shared.stats.source_size.store(size, Ordering::Relaxed);
+        }
 
         // Follow window resizes so the pool buffers match the content.
         if content.Width > 0 && content.Height > 0 {

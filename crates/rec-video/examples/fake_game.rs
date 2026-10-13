@@ -5,13 +5,15 @@
 //!
 //! ```text
 //! cargo run --release -p rec-video --example fake_game -- [--seconds N] \
-//!     [--borderless | --fullscreen] [--blt] [--black-after S] [--stall-after S] //!     [--resume-after S]
+//!     [--borderless | --fullscreen] [--blt] [--black-after S] [--stall-after S] //!     [--resume-after S] [--resize-after S]
 //! ```
 //!
 //! `--borderless` covers the screen with a popup window (what games call
 //! borderless or windowed fullscreen). `--fullscreen` also asks DXGI for
 //! fullscreen (`SetFullscreenState`); `--blt`
-//! uses the legacy blt-model swap chain instead of flip. Press Esc to quit.
+//! uses the legacy blt-model swap chain instead of flip. `--resize-after`
+//! grows the window (half the screen) to three quarters of the screen, like
+//! a game switching resolution. Press Esc to quit.
 
 #[cfg(not(windows))]
 fn main() {
@@ -50,9 +52,9 @@ mod imp {
     use windows::Win32::UI::WindowsAndMessaging::{
         CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
         GetSystemMetrics, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW,
-        SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SetForegroundWindow, ShowWindow, TranslateMessage,
-        WM_DESTROY, WM_KEYDOWN, WM_QUIT, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP,
-        WS_VISIBLE,
+        SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow,
+        SetWindowPos, ShowWindow, TranslateMessage, WM_DESTROY, WM_KEYDOWN, WM_QUIT, WNDCLASSW,
+        WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
     };
     use windows::core::w;
 
@@ -64,6 +66,7 @@ mod imp {
         black_after: Option<f64>,
         stall_after: Option<f64>,
         resume_after: Option<f64>,
+        resize_after: Option<f64>,
     }
 
     fn parse_args() -> Result<Args, String> {
@@ -75,6 +78,7 @@ mod imp {
             black_after: None,
             stall_after: None,
             resume_after: None,
+            resize_after: None,
         };
         let mut it = std::env::args().skip(1);
         let num = |v: Option<String>, name: &str| -> Result<f64, String> {
@@ -90,6 +94,7 @@ mod imp {
                 "--black-after" => a.black_after = Some(num(it.next(), "--black-after")?),
                 "--stall-after" => a.stall_after = Some(num(it.next(), "--stall-after")?),
                 "--resume-after" => a.resume_after = Some(num(it.next(), "--resume-after")?),
+                "--resize-after" => a.resize_after = Some(num(it.next(), "--resize-after")?),
                 other => return Err(format!("unknown argument {other}")),
             }
         }
@@ -247,6 +252,7 @@ mod imp {
         let start = Instant::now();
         let mut last_print = 0u64;
         let mut presents = 0u64;
+        let mut resized = false;
         loop {
             let mut msg = MSG::default();
             // SAFETY: standard message pump on the window's thread.
@@ -264,6 +270,37 @@ mod imp {
                 break;
             }
             let after = |s: Option<f64>| s.is_some_and(|s| t >= s);
+            if after(args.resize_after) && !resized {
+                resized = true;
+                // SAFETY: our own window; the swap chain is resized below.
+                unsafe {
+                    let (w, h) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+                    SetWindowPos(
+                        hwnd,
+                        None,
+                        0,
+                        0,
+                        w * 3 / 4,
+                        h * 3 / 4,
+                        SWP_NOMOVE | SWP_NOZORDER,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                drop(rtv);
+                // SAFETY: as for ResizeBuffers above.
+                unsafe {
+                    swap.ResizeBuffers(
+                        0,
+                        0,
+                        0,
+                        DXGI_FORMAT_B8G8R8A8_UNORM,
+                        DXGI_SWAP_CHAIN_FLAG(desc.Flags as i32),
+                    )
+                }
+                .map_err(|e| format!("ResizeBuffers: {e}"))?;
+                rtv = target()?;
+                println!("resized");
+            }
             let stalled = after(args.stall_after) && !after(args.resume_after);
             let black = after(args.black_after) && !after(args.resume_after);
             if t as u64 > last_print {

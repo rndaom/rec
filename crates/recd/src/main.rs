@@ -14,6 +14,7 @@ mod ipc_server;
 mod log;
 mod mux;
 mod paths;
+mod recover;
 mod saver;
 mod session;
 mod tray;

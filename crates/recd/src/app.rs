@@ -414,8 +414,8 @@ impl App {
 
     fn headline(&self) -> String {
         match (&self.session, self.state()) {
-            (Some(s), (RecorderState::Recording, _)) => match s.problem() {
-                Some(p) => format!("Recording {} · {}", s.target.game, p.short()),
+            (Some(s), (RecorderState::Recording, _)) => match s.warning() {
+                Some(w) => format!("Recording {} · {w}", s.target.game),
                 None => format!(
                     "Recording {} · {} s buffer",
                     s.target.game, self.config.replay.seconds
@@ -428,7 +428,7 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        let problem = self.session.as_ref().and_then(Session::problem);
+        let problem = self.session.as_ref().and_then(Session::warning);
         let look = match self.state().0 {
             RecorderState::Recording if problem.is_some() => Look::Error,
             RecorderState::Recording => Look::Recording,
@@ -460,8 +460,8 @@ impl App {
             warning: self
                 .session
                 .as_ref()
-                .and_then(Session::problem)
-                .map(|p| p.short().into()),
+                .and_then(Session::warning)
+                .map(Into::into),
         }
     }
 
@@ -596,7 +596,7 @@ impl App {
     }
 
     fn check_health(&mut self) {
-        let Some(session) = &self.session else {
+        let Some(session) = &mut self.session else {
             self.kick();
             return;
         };
@@ -604,14 +604,21 @@ impl App {
         let game = session.target.game.clone();
         // SAFETY: IsWindow accepts any handle value.
         let window_gone = hwnd.0 != 0 && !unsafe { IsWindow(Some(hwnd.get())) }.as_bool();
-        match session.health() {
-            Health::Ok if !window_gone => {
+        let health = if window_gone {
+            Health::SourceClosed
+        } else {
+            session.supervise()
+        };
+        match health {
+            Health::Ok => {
                 if let Some(Some(problem)) = self.session.as_mut().and_then(Session::watch) {
                     let (title, detail) = problem.describe(&game);
                     self.notify(Kind::Error, &title, &detail);
                 }
             }
-            Health::Ok | Health::SourceClosed => {
+            // Logged by the session; the tray shows it via `warning`.
+            Health::Restarting => {}
+            Health::SourceClosed => {
                 self.stop_session("game closed");
                 self.error = None;
                 self.kick();
@@ -705,6 +712,7 @@ impl App {
         let job = SaveJob {
             buffer: session.buffer(),
             tracks: session.tracks(),
+            segments: session.segments(),
             start: now - secs(i64::from(seconds)),
             end: now + secs(i64::from(self.config.replay.post_roll_seconds)),
             dir,
