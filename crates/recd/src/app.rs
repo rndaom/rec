@@ -41,12 +41,14 @@ use crate::detect;
 use crate::feedback::{self, Kind, Toast};
 use crate::hotkeys::{Action, Hotkeys};
 use crate::ipc_server::IpcServer;
+use crate::journal::{GameSession, MarkSource};
 use crate::log::{error, info, warning};
 use crate::overlay::{self, Overlay};
 use crate::panel::{self, AudioRow, AudioTarget, Command, QualityChoice, View};
 use crate::paths::{self, Stamp};
 use crate::saver::{self, SaveJob};
 use crate::session::{AudioSwitch, Health, Session, Target, default_bitrate_kbps};
+use crate::sidecar::{ClipContext, Trigger};
 use crate::tray::{Look, MenuCommand, Tray, WM_TRAY};
 use crate::win::{Hwnd, wide};
 
@@ -312,6 +314,9 @@ struct App {
     hotkeys: Hotkeys,
     ipc: Option<IpcServer>,
     session: Option<Session>,
+    /// The game run `session` records; it outlives sessions restarted by a
+    /// reload, a pause or a failure (see `crate::journal`).
+    game_session: Option<GameSession>,
     paused: bool,
     /// Why the last session stopped or failed to start.
     error: Option<String>,
@@ -355,6 +360,7 @@ impl App {
             hotkeys: Hotkeys::default(),
             ipc,
             session: None,
+            game_session: None,
             paused: false,
             error: None,
             failed: None,
@@ -403,6 +409,7 @@ impl App {
             ipc.close();
         }
         self.stop_session("shutting down");
+        self.end_game_session("rec stopped");
         self.hotkeys.unregister();
         self.ipc = None;
     }
@@ -509,6 +516,7 @@ impl App {
 
     fn start_session(&mut self, target: Target) {
         self.stop_session("switching target");
+        self.enter_game_session(&target);
         match Session::start(&self.config, target.clone()) {
             Ok(session) => {
                 info!(
@@ -550,6 +558,22 @@ impl App {
         }
     }
 
+    /// Continues the game session if `target` is the same game run, otherwise
+    /// ends it and starts a new one.
+    fn enter_game_session(&mut self, target: &Target) {
+        if (self.game_session.as_ref()).is_some_and(|g| g.continues(target)) {
+            return;
+        }
+        self.end_game_session("another game started");
+        self.game_session = Some(GameSession::start(target, &paths::data_dir()));
+    }
+
+    fn end_game_session(&mut self, why: &str) {
+        if let Some(game) = self.game_session.take() {
+            game.end(why);
+        }
+    }
+
     /// Starts recording if the current mode and foreground window call for it.
     fn kick(&mut self) {
         if self.paused || !self.media_foundation || self.session.is_some() {
@@ -568,6 +592,7 @@ impl App {
                         hwnd: Hwnd::default(),
                         game: "Desktop".into(),
                         exe_name: String::new(),
+                        exe_path: PathBuf::new(),
                         pid: 0,
                         display: true,
                     });
@@ -609,6 +634,7 @@ impl App {
             hwnd: Hwnd(info.hwnd),
             game: detect::display_name(&info.exe_path, &info.title),
             exe_name: info.exe_name,
+            exe_path: info.exe_path,
             pid: info.pid,
             display: self.config.video.target == CaptureTarget::Display,
         };
@@ -640,6 +666,7 @@ impl App {
             Health::Restarting => {}
             Health::SourceClosed => {
                 self.stop_session("game closed");
+                self.end_game_session("game closed");
                 self.error = None;
                 self.kick();
             }
@@ -703,8 +730,12 @@ impl App {
 
     // ---- saving ----------------------------------------------------------------
 
-    fn save(&mut self, seconds: Option<u32>, reply: Option<Sender<Response>>) {
-        let Some(session) = &self.session else {
+    fn save(&mut self, seconds: Option<u32>, reply: Option<Sender<Response>>, trigger: Trigger) {
+        if let Some(session) = &self.session {
+            let target = session.target.clone();
+            self.enter_game_session(&target);
+        }
+        let (Some(session), Some(game_session)) = (&self.session, &self.game_session) else {
             let (_, reason) = self.state();
             let reason = reason.unwrap_or_default();
             if let Some(reply) = reply {
@@ -742,6 +773,13 @@ impl App {
                 Stamp::now(),
                 seconds,
             ),
+            context: ClipContext {
+                trigger,
+                requested: now,
+                session: game_session.info(),
+                levels: session.levels(),
+                sidecar: self.config.output.sidecar,
+            },
         };
         let events = self.events.clone();
         saver::spawn(job, move |result| {
@@ -752,6 +790,21 @@ impl App {
                 reply,
             })
         });
+    }
+
+    /// Adds a marker now to the game session being recorded. Clips saved
+    /// later that cover this moment list it. Returns the game's name.
+    fn mark(&mut self, src: MarkSource) -> Result<String, String> {
+        let (Some(session), Some(game)) = (&self.session, &self.game_session) else {
+            let (_, reason) = self.state();
+            return Err(format!(
+                "rec isn't recording: {}",
+                reason.unwrap_or_default()
+            ));
+        };
+        game.mark(qpc_now(), src);
+        info!("marker added ({})", src.name());
+        Ok(session.target.game.clone())
     }
 
     fn saved(
@@ -787,8 +840,10 @@ impl App {
     fn handle(&mut self, event: Event) -> Flow {
         match event {
             Event::Hotkey(id) => match self.hotkeys.action(id) {
-                Some(Action::SaveClip) => self.save(None, None),
-                Some(Action::SaveSeconds(seconds)) => self.save(Some(seconds), None),
+                Some(Action::SaveClip) => self.save(None, None, Trigger::Hotkey),
+                Some(Action::SaveSeconds(seconds)) => {
+                    self.save(Some(seconds), None, Trigger::Hotkey)
+                }
                 Some(Action::TogglePause) => {
                     self.set_paused(!self.paused);
                     let title = if self.paused {
@@ -799,9 +854,10 @@ impl App {
                     self.notify(Kind::Info, title, &self.headline());
                 }
                 Some(Action::ToggleOverlay) => self.toggle_panel(),
-                Some(Action::AddMarker) => {
-                    self.notify(Kind::Info, "Markers", "Coming in a later version")
-                }
+                Some(Action::AddMarker) => match self.mark(MarkSource::Hotkey) {
+                    Ok(game) => self.notify(Kind::Info, "Marker added", &game),
+                    Err(e) => self.notify(Kind::Error, "No marker added", &e),
+                },
                 None => {}
             },
             Event::Tray(code) => {
@@ -1012,7 +1068,7 @@ impl App {
             Command::Close => self.close_panel(true),
             Command::Save => {
                 self.close_panel(true);
-                self.save(None, None);
+                self.save(None, None, Trigger::Panel);
             }
             Command::SetSeconds(seconds) => {
                 self.config.replay.seconds = seconds;
@@ -1114,11 +1170,12 @@ impl App {
         let response = match request {
             Request::Status => Response::Status(self.status()),
             Request::Save { seconds } => {
-                self.save(seconds, Some(reply));
+                self.save(seconds, Some(reply), Trigger::Cli);
                 return Flow::Continue;
             }
-            Request::Mark => Response::Error {
-                message: "markers are not supported yet".into(),
+            Request::Mark => match self.mark(MarkSource::Cli) {
+                Ok(_) => Response::Ok,
+                Err(message) => Response::Error { message },
             },
             Request::Pause => {
                 self.set_paused(true);
@@ -1143,7 +1200,7 @@ impl App {
 
     fn menu(&mut self, command: MenuCommand) -> Flow {
         match command {
-            MenuCommand::SaveClip => self.save(None, None),
+            MenuCommand::SaveClip => self.save(None, None, Trigger::Tray),
             MenuCommand::TogglePause => self.set_paused(!self.paused),
             MenuCommand::QuickPanel => self.open_panel(),
             MenuCommand::OpenClips => {

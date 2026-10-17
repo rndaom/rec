@@ -54,7 +54,8 @@ Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a liv
 - [ ] Native NVENC and oneVPL backends (need NVIDIA / Intel hardware to develop on)
 - [x] HDR: FP16 capture → HEVC Main10 / AV1 10-bit PQ with HDR10 metadata, or tone-map to SDR; restart on HDR switch
 - [x] Quick-panel overlay (DirectComposition, excluded from capture), keyboard and mouse navigation
-- [ ] Per-game profiles; extra clip-length hotkeys in the UI; marker hotkey; controller combo
+- [ ] Per-game profiles; extra clip-length hotkeys in the UI; controller combo
+- [x] Marker hotkey and `rec mark`; AI-ready clips phase A: `<clip>.rec.json` sidecar, game-session journal, per-track loudness curves ([ai-clips.md](ai-clips.md))
 - [ ] Storage quota with auto-prune (starred clips kept)
 - [ ] Windows 10 path: DDA fallback (monitor capture without the yellow border)
 - [x] Exclusive-fullscreen black-frame detection with a "switch to borderless" hint

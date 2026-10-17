@@ -52,6 +52,16 @@
 //! mixed track lines the inputs up on their shared QPC timeline with the pure
 //! [`mixer`] module.
 //!
+//! # Levels
+//!
+//! Every track, the mixed one included, also gets a loudness curve: the RMS of
+//! each 100 ms window on a 0-255 dB scale (see [`levels`]), so a saved clip
+//! can tell where the loud moments are without decoding it.
+//! [`AudioCapture::levels`] hands out the shared [`levels::Levels`]; it keeps
+//! about 20 minutes per track unless [`levels::Levels::set_history`] says
+//! otherwise. Muted inputs and near-silence (see `SILENCE_LSB` in
+//! `capture.rs`) count as zero, as they do in the encoded track.
+//!
 //! # Threads and COM
 //!
 //! The caller must call `MFStartup` once per process before
@@ -62,6 +72,7 @@
 //! (push into the replay buffer and return).
 
 pub mod aac;
+pub mod levels;
 pub mod mixer;
 pub mod timeline;
 

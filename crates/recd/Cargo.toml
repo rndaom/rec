@@ -15,6 +15,8 @@ rec-core.workspace = true
 rec-audio = { path = "../rec-audio" }
 rec-mux = { path = "../rec-mux" }
 rec-video = { path = "../rec-video" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
 
 [dependencies.windows]
 workspace = true

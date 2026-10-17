@@ -3,8 +3,10 @@
 //! restarted in place when it fails or the source changes (see
 //! [`crate::recover`]); each run is one `segment`.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use rec_audio::levels::Levels;
 use rec_audio::{AudioCapture, AudioCaptureConfig, AudioInput, AudioSource, ProcessTarget};
 use rec_core::config::{
     AudioConfig, Codec, Config, EncoderPreference, HdrMode, Quality, VideoConfig,
@@ -39,6 +41,8 @@ pub struct Target {
     /// Friendly name used for folders and file names.
     pub game: String,
     pub exe_name: String,
+    /// Empty for desktop recording.
+    pub exe_path: PathBuf,
     /// The game's process id; 0 for desktop recording.
     pub pid: u32,
     /// Record the whole display instead of just the window.
@@ -504,6 +508,7 @@ impl Session {
                             kind: TrackKind::Audio(capture.format().clone()),
                         });
                     }
+                    capture.levels().set_history(secs(i64::from(seconds)));
                     audio = Some(capture);
                     audio_inputs = plan.inputs;
                 }
@@ -713,6 +718,11 @@ impl Session {
             };
             buffer.set_limits(limits);
         }
+        if let Some(audio) = &self.audio {
+            audio
+                .levels()
+                .set_history(secs(i64::from(self.buffer_seconds)));
+        }
     }
 
     /// Applies new video settings. A bitrate change (quality, or the
@@ -782,6 +792,11 @@ impl Session {
         if let Some(audio) = &self.audio {
             audio.set_muted(input, muted);
         }
+    }
+
+    /// Loudness history of every audio track.
+    pub fn levels(&self) -> Option<Levels> {
+        self.audio.as_ref().map(AudioCapture::levels)
     }
 
     pub fn buffer(&self) -> Arc<Mutex<ReplayBuffer>> {

@@ -10,11 +10,15 @@ use std::time::Duration;
 use rec_core::media::{TrackInfo, TrackKind, VIDEO_TRACK, VideoFormat};
 use rec_core::replay::{Packet, ReplayBuffer};
 use rec_core::time::{Hns, millis, qpc_now};
+use serde_json::json;
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadInformation, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
     THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
     THREAD_POWER_THROTTLING_STATE, ThreadPowerThrottling,
 };
+
+use crate::log::warning;
+use crate::sidecar::{self, ClipContext};
 
 #[derive(Debug)]
 pub struct SaveJob {
@@ -29,6 +33,8 @@ pub struct SaveJob {
     pub end: Hns,
     pub dir: PathBuf,
     pub name: String,
+    /// For the sidecar and the session journal.
+    pub context: ClipContext,
 }
 
 /// Runs `job` on its own thread and calls `done` with the saved path.
@@ -82,7 +88,12 @@ fn run(job: SaveJob) -> Result<PathBuf, String> {
         return Err("nothing recorded yet".into());
     };
     let mut tracks = job.tracks;
-    if let Some((_, format)) = job.segments.iter().find(|&&(s, _)| s == segment) {
+    let format = job
+        .segments
+        .iter()
+        .find(|&&(s, _)| s == segment)
+        .map(|(_, format)| format.clone());
+    if let Some(format) = &format {
         for track in tracks.iter_mut().filter(|t| t.id == VIDEO_TRACK) {
             track.kind = TrackKind::Video(format.clone());
         }
@@ -92,11 +103,36 @@ fn run(job: SaveJob) -> Result<PathBuf, String> {
         .map_err(|e| format!("can't create {}: {e}", job.dir.display()))?;
     let (file, path) = create_unique(&job.dir, &job.name, "mp4")
         .map_err(|e| format!("can't create a file in {}: {e}", job.dir.display()))?;
-    if let Err(e) = crate::mux::write(BufWriter::new(file), tracks, &packets) {
+    if let Err(e) = crate::mux::write(BufWriter::new(file), tracks.clone(), &packets) {
         let _ = std::fs::remove_file(&path);
         return Err(e);
     }
+    if let Some(format) = format {
+        describe(&path, &job.context, &tracks, &format, &packets);
+    }
     Ok(path)
+}
+
+/// Writes the clip's sidecar and journal line. A failure here leaves the
+/// clip itself intact, so it is only logged.
+fn describe(
+    path: &Path,
+    ctx: &ClipContext,
+    tracks: &[TrackInfo],
+    format: &VideoFormat,
+    packets: &[Packet],
+) {
+    match sidecar::describe(path, ctx, tracks, format, packets) {
+        Ok(saved) => ctx.session.append(json!({
+            "type": "clip",
+            "clip": saved.id,
+            "file": path,
+            "from": ctx.session.offset(saved.start),
+            "to": ctx.session.offset(saved.end),
+            "trigger_t": ctx.session.offset(ctx.requested),
+        })),
+        Err(e) => warning!("{}: no sidecar: {e}", path.display()),
+    }
 }
 
 /// Creates `name.ext`, or `name (2).ext`... atomically, so two quick saves

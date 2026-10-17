@@ -26,7 +26,8 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 5. ~~Quick-panel overlay~~ (done: `recd/src/panel.rs` model, `overlay.rs` window; Alt+F7 or the tray)
 6. ~~HDR~~ (done: HDR10 or tone-map, decision D12)
 7. ~~Native encoders + AV1~~ (AV1 and AMD AMF done; NVENC and oneVPL need NVIDIA / Intel hardware)
-8. Remaining M2 items: per-game profiles, extra clip-length hotkeys, marker hotkey, controller combo, storage quota with auto-prune, Win10 DDA fallback, adaptive GPU priority
+8. ~~AI-ready clips phase A~~ (done: `<clip>.rec.json` sidecar, marker hotkey and `rec mark`, session journal, loudness curves; see [docs/ai-clips.md](docs/ai-clips.md)). The marker hotkey has no default: set `hotkeys.add_marker`. Phases B to D (thumbnails and analysis, `rec digest`, `rec mcp`, game sources) are proposals.
+9. Remaining M2 items: per-game profiles, extra clip-length hotkeys, controller combo, storage quota with auto-prune, Win10 DDA fallback, adaptive GPU priority
 
 **Things learned**
 - Video:
@@ -60,6 +61,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
   - Testing: `REC_DEBUG_CAPTURE_UI=1` makes it visible to screenshots. A real Alt+F7 press (SendInput) is needed for it to get focus; keys can then be posted to the `rec.panel` window. Refusing to open over exclusive fullscreen is untested on a real exclusive game (it relies on the watcher's `Exclusive` verdict).
 - Memory: `recd` uses ~127 MB private while recording at 1080p60. About 54 MB of that is driver / Media Foundation pipeline allocations and the rest is the buffer.
 - Bench: `rec-bench` was tested end to end only against stand-in `recd` and PresentMon scripts. The first real run (needs admin or the Performance Log Users group) may show PresentMon CLI differences. Rust `Command` children inherit the parent's std handles, so `rec-bench` clears the inherit flag before restarting the user's `recd`; otherwise `rec-bench | tee` never ends.
+- AI-ready clips: verified live with `fake_game` under a separate `APPDATA`/`LOCALAPPDATA` (`game_apps = ["fake_game.exe"]`). Sidecar durations match ffprobe, and marker times agree between the sidecar and the journal. Non-zero loudness and the Steam app id are covered only by unit tests: `fake_game` is silent and not a Steam game. TF2's `appmanifest_440.acf` matches the test format.
 - Logs: `%LOCALAPPDATA%\rec\recd.log`. Config: `%APPDATA%\rec\config.toml`.
 - Testing: set `REC_DEBUG_CAPTURE_UI=1` to make toasts visible in screenshots.
 

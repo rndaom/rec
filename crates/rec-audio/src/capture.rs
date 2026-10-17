@@ -33,6 +33,7 @@ use windows::Win32::Media::Audio::IMMDeviceEnumerator;
 use windows::Win32::System::Threading::WaitForMultipleObjects;
 
 use crate::encoder::AacEncoder;
+use crate::levels::{Levels, Meter};
 use crate::mixer::{Mixed, Mixer};
 use crate::process::{self, Followed};
 use crate::sys::{ComGuard, Event, Mmcss};
@@ -65,6 +66,7 @@ pub struct AudioCapture {
     bitrate_kbps: u32,
     tracks: Vec<TrackId>,
     stats: Arc<Mutex<AudioStats>>,
+    levels: Levels,
     /// One flag per input, in config order.
     muted: Vec<Arc<AtomicBool>>,
     stop: Arc<Event>,
@@ -90,17 +92,19 @@ impl AudioCapture {
             inputs: vec![InputStats::default(); config.inputs.len()],
             ..AudioStats::default()
         }));
+        let levels = Levels::default();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("rec-audio".into())
             .spawn({
                 let stop = Arc::clone(&stop);
                 let stats = Arc::clone(&stats);
+                let levels = levels.clone();
                 let muted = muted.clone();
                 move || {
                     // Clears `running` however the thread ends, panics included.
                     let _running = Running(&stats);
-                    let result = run(config, sink, &muted, &stop, &stats, &ready_tx);
+                    let result = run(config, sink, &muted, &stop, &stats, &levels, &ready_tx);
                     if let Err(e) = result {
                         lock(&stats).last_error = Some(e.to_string());
                         // Only delivered if start() is still waiting.
@@ -115,6 +119,7 @@ impl AudioCapture {
                 bitrate_kbps,
                 tracks,
                 stats,
+                levels,
                 muted,
                 stop,
                 thread: Some(thread),
@@ -151,6 +156,12 @@ impl AudioCapture {
 
     pub fn stats(&self) -> AudioStats {
         lock(&self.stats).clone()
+    }
+
+    /// Loudness of every track, 10 values per second. Shared with the capture
+    /// thread: the handle keeps filling as long as the capture runs.
+    pub fn levels(&self) -> Levels {
+        self.levels.clone()
     }
 
     /// Mutes or unmutes input `input` (an index into
@@ -212,6 +223,7 @@ fn run(
     muted: &[Arc<AtomicBool>],
     stop: &Event,
     stats: &Mutex<AudioStats>,
+    levels: &Levels,
     ready: &Ready,
 ) -> Result<(), AudioError> {
     let _com = ComGuard::mta()?;
@@ -228,14 +240,14 @@ fn run(
     let mixed_inputs = config.inputs.iter().filter(|i| i.mix).count();
     let mut mix = config
         .mix_track
-        .map(|track| MixTrack::new(track, mixed_inputs, epoch, config.bitrate_kbps))
+        .map(|track| MixTrack::new(track, mixed_inputs, epoch, config.bitrate_kbps, levels))
         .transpose()?;
     let mut inputs = Vec::with_capacity(config.inputs.len());
     let mut slot = 0;
     for (input, muted) in config.inputs.into_iter().zip(muted) {
         let track = input
             .track
-            .map(|t| Track::new(t, config.bitrate_kbps))
+            .map(|t| Track::new(t, config.bitrate_kbps, levels))
             .transpose()?;
         let mix_slot = (input.mix && mix.is_some()).then(|| {
             slot += 1;
@@ -410,6 +422,7 @@ const LOOKAHEAD_FRAMES: u64 = 3;
 /// dropped when they arrive.
 struct Track {
     encoder: AacEncoder,
+    meter: Meter,
     out: Output,
     /// Samples fed to the encoder.
     fed: u64,
@@ -437,9 +450,10 @@ struct Repeat {
 }
 
 impl Track {
-    fn new(track: TrackId, bitrate_kbps: u32) -> Result<Self, AudioError> {
+    fn new(track: TrackId, bitrate_kbps: u32, levels: &Levels) -> Result<Self, AudioError> {
         Ok(Self {
             encoder: AacEncoder::new(bitrate_kbps)?,
+            meter: Meter::new(track, levels),
             out: Output {
                 track,
                 next_packet: 0,
@@ -463,6 +477,7 @@ impl Track {
         frames: u64,
         sink: &mut dyn FnMut(Packet),
     ) -> Result<(), AudioError> {
+        self.meter.push(timeline, pcm, frames);
         match pcm {
             Some(pcm) if pcm.iter().any(|&s| s != 0) => {
                 self.stop_repeating(timeline, sink)?;
@@ -885,6 +900,7 @@ impl MixTrack {
         inputs: usize,
         epoch: Hns,
         bitrate_kbps: u32,
+        levels: &Levels,
     ) -> Result<Self, AudioError> {
         let cfg = TimelineConfig::default();
         Ok(Self {
@@ -892,7 +908,7 @@ impl MixTrack {
             // skip exactly those.
             mixer: Mixer::new(inputs, hns_to_samples(cfg.max_fill) as i64),
             timeline: Timeline::new(epoch, cfg),
-            track: Track::new(track, bitrate_kbps)?,
+            track: Track::new(track, bitrate_kbps, levels)?,
             epoch,
         })
     }
@@ -975,7 +991,7 @@ mod tests {
             let _ = MFStartup(MF_VERSION, MFSTARTUP_LITE);
         });
         let _com = ComGuard::mta().unwrap();
-        let Ok(mut track) = Track::new(1, 160) else {
+        let Ok(mut track) = Track::new(1, 160, &Levels::default()) else {
             eprintln!("skipping: Media Foundation AAC encoder unavailable");
             return;
         };

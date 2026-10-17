@@ -117,6 +117,8 @@ dependencies = [
  "rec-core",
  "rec-mux",
  "rec-video",
+ "serde",
+ "serde_json",
  "windows",
 ]
 

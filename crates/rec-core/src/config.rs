@@ -197,6 +197,9 @@ pub struct OutputConfig {
     pub container: Container,
     /// Delete the oldest unstarred clips once the folder exceeds this size.
     pub quota_gb: Option<u32>,
+    /// Write `<clip>.rec.json` next to each clip: game, timing, audio track
+    /// roles, markers and loudness, for AI tools and the library.
+    pub sidecar: bool,
 }
 
 impl Default for OutputConfig {
@@ -207,6 +210,7 @@ impl Default for OutputConfig {
             filename: "{game}_{date}_{time}".into(),
             container: Container::Mp4,
             quota_gb: None,
+            sidecar: true,
         }
     }
 }
