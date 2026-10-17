@@ -16,3 +16,5 @@ path = "src/main.rs"
 
 [dependencies]
 rec-core.workspace = true
+rec-library = { path = "../rec-library" }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }

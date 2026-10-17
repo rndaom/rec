@@ -39,7 +39,8 @@ crates/
   rec-audio/  WASAPI loopback and microphone -> AAC
   rec-mux/    fragmented MP4 writer (H.264 / HEVC / AV1, multi-track AAC)
   recd/       background service: tray, hotkeys, game detection, sessions, saving
-  rec-cli/    `rec` command-line control (rec save 30, rec status, ...)
+  rec-cli/    `rec` command-line control (rec save 30, rec status, rec digest, rec mcp, ...)
+  rec-library/ saved clips for AI tools: sidecars, journals, overlaps, frame decoding, analysis
   rec-bench/  benchmark harness: PresentMon with and without recd, recd idle cost
 bench/
   README.md     how to run a fair benchmark and read the results
@@ -48,6 +49,7 @@ docs/
   research.md   competitor and technical research
   decisions.md  architecture decisions and why
   roadmap.md    milestones
+  ai-clips.md   clips an AI can understand: sidecars, digest bundles, MCP server
 ```
 
 ## Building
@@ -80,6 +82,21 @@ rec save 30
 ```
 
 `rec help` lists every command. Configuration lives at `%APPDATA%\rec\config.toml`; `rec config` prints the exact path.
+
+## Clips for AI tools
+Every clip gets a `<clip>.rec.json` sidecar with the game, when it was recorded, markers, and each audio track's role and loudness. Two commands make clips readable by a model:
+
+```bash
+rec digest "%USERPROFILE%\Videos\rec\Team Fortress 2"
+```
+
+writes a bundle per clip (summary, timeline, stills and labelled contact sheets) and an `index.json` that groups overlapping clips.
+
+```bash
+claude mcp add rec -- rec mcp
+```
+
+lets Claude Code, or any MCP client, list clips, read timelines and decode just the frames it needs. Everything stays on this machine. See [docs/ai-clips.md](docs/ai-clips.md).
 
 ## License
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.

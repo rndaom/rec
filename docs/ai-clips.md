@@ -1,6 +1,6 @@
-# AI-ready clips (proposal)
+# AI-ready clips
 
-Status: phase A built on branch `m2` (2026-10-17): the sidecar v1, markers, the session journal and loudness curves. See [Sidecar v1 as built](#sidecar-v1-as-built). Phases B to D are still proposals.
+Status: phases A and B built on branch `m2` (2026-10-17). Phase A: the sidecar v1, markers, the session journal and loudness curves (see [Sidecar v1 as built](#sidecar-v1-as-built)). Phase B: layer 2 analysis (`rec analyze`), `rec digest` and `rec mcp` (see [How an AI uses it](#how-an-ai-uses-it) and [Phase B as built](#phase-b-as-built)). Phases C and D are still proposals.
 
 **Goal:** a clip saved by rec should be easy for an AI to understand: what game it is, what happened and when, which moments matter, and how it relates to the other clips. This must work for every game, need no setup, and stay within D3 (no injection), D10 (local, no GPL) and D11 (no cost during gameplay).
 
@@ -150,6 +150,8 @@ This runs only when no game is in the foreground, or on demand, at EcoQoS, with 
 | Speech transcript (opt-in) | `speech` events with text | Local whisper.cpp (MIT) on the mic and voice tracks only. Off by default |
 | Data-driven HUD reader (per profile) | `kill`, `death` and other events with `src: "hud:<profile>"` and conf < 1 | See layer 3 |
 
+Built in phase B, on demand only (`rec analyze`, `rec digest` and the `analyze` MCP tool): the thumbnail, scene cuts, brightness and motion, dark and static stretches, and loud events. Not built yet: the keyframe strip, menu and scoreboard detection, blur, transcripts and the HUD reader. Nothing starts analysis by itself yet. See [Phase B as built](#phase-b-as-built).
+
 **Vision captioning is not built in.** rec does not ship a model. `rec digest` and `rec mcp` (below) give any AI exactly what it needs. If the user wants automatic captions, an optional setting can point at an OpenAI-compatible local endpoint, such as their own llama-server. It is off by default and never uses the cloud without opt-in (D10).
 
 ### Layer 3: game sources (opt-in, per game profile)
@@ -173,9 +175,9 @@ A per-game profile (the planned M2 feature) holds the source settings and `playe
 What phase A writes differs from the sketch above in a few places:
 - **Loudness** sits on each audio entry as `audio[i].loudness`, one number per 100 ms from t = 0. The top-level `loudness` object gives `hz` and `scale` (RMS, 0 = -60 dBFS or quieter, 255 = 0 dBFS, linear in dB). Muted inputs and near-silence read 0, matching what is encoded.
 - **`video.hdr`** is a boolean.
-- **Not yet written:** `game.profile`, `player`, `analysis`, `privacy` and `video.vfr`/`dropped_frames`. They come with per-game profiles and layer 2.
+- **Not yet written:** `game.profile`, `player`, `privacy` and `video.vfr`/`dropped_frames`. They come with per-game profiles. `analysis` is added by `rec analyze` (phase B).
 - **`clip.trigger`** is `hotkey`, `panel`, `tray` or `cli`.
-- **Events** are only markers for now: `{ "t", "kind": "marker", "src": "hotkey" | "cli", "conf": 1 }`.
+- **Events** from recd are only markers: `{ "t", "kind": "marker", "src": "hotkey" | "cli", "conf": 1 }`. `rec analyze` adds `cut` and `loud` events.
 - **`time.utc_offset_min`** sits next to `start_utc` (which is UTC, with a `Z`).
 
 `output.sidecar = false` turns the file off. The journal is written either way.
@@ -195,32 +197,77 @@ Code: `crates/recd/src/journal.rs` (game sessions, ids, UTC, Steam app id), `cra
 
 ## How an AI uses it
 
-**`rec digest <clip|folder> [--out dir]`** writes a self-contained bundle that any model can read:
-- `clip.rec.json`
-- `summary.md`: a plain-language timeline, for example "0:21.2 kill (sniper rifle, crit) · 0:22.4 loud · 0:24.9 marker".
-- `frames/`: stills at each event and marker, plus one every N seconds, named by clip time (`t021.18.jpg`) and sized for vision models.
-- `sheet-*.jpg`: a few labelled contact sheets, capped at a small number of images. The TF2 reviewers hit request limits with 319 image reads.
+Three `rec` commands. The `rec-library` crate does the work, and nothing of it runs in recd (D11).
 
-For a folder, `index.json` lists every clip with game, session, range, event counts and an overlap group.
+**`rec digest <clip|folder> [--out DIR] [--every SECONDS] [--width PX] [--no-analysis] [--no-frames]`** writes a self-contained bundle that any model can read without tools:
+- `clip.rec.json`: the sidecar, with the layer 2 analysis.
+- `summary.md`: the clip in plain language. It gives the game, local and UTC time, length and format, the clip's span in its session ("clip 3 of 7 saved in this session"), how and when it was saved, then a timeline ("**0:07.9** marker (rec mark)", "**0:22.4–0:23.5** loud game audio, peak -12 dBFS"), the level of each audio track, a picture summary, overlapping clips with their time offset, and tables of the stills and sheets.
+- `frames/t021.18.jpg` …: stills at every event (a loud stretch at its peak), at the save request, every N seconds (default 5) and at the last frame. Each is named by its frame's clip time, 1024 px wide by default, JPEG quality 0.85. Stills less than 0.25 s apart are merged. Scene cuts get stills only when a clip has 12 or fewer.
+- `sheet-1.jpg` …: up to 4 contact sheets of 16 tiles (4 × 384 px, about 1556 px wide, so vision models don't scale them down). Each tile's time and reason are written under the picture, never over the HUD. If more stills are taken than fit, every event still goes on a sheet and the clock stills are spread evenly over the rest.
 
-**`rec mcp`** is a stdio MCP server, local only, so Claude or another agent can query the library directly instead of reading files. It exposes these tools:
-- `list_clips(game?, since?, has_event?)`
-- `clip(id)`
-- `timeline(id)`
-- `frames(id, times[], width?)`: decodes on demand, so the agent asks only for the frames it needs
-- `audio_curve(id, track)`
-- `search(text)`: over transcripts and events
-- `overlaps(id)`
+Without `--out`, bundles go to `rec-digest\<clip name>\` next to the clips. A folder is searched recursively, skipping `rec-digest` and `*.rec` folders, and `index.json` lists every clip with:
+- its id, file (relative, with `/`), bundle and `source` (`sidecar` or `journal`);
+- game, `start_utc`, duration, session, `session_range` and `session_position` (`[n, of]` from the journal);
+- event counts, thumbnail, `overlap_group` and its overlaps.
 
-With this in place, the TF2 job's first hour becomes `list_clips(game: "Team Fortress 2", has_event: "kill")`, then `timeline` and a few `frames` calls per candidate.
+`groups` lists each overlap group with its session span and clip ids. A single clip is digested with its folder as context, so its overlaps and session position still show. Analysis runs first on clips that don't have it yet (`--no-analysis` skips it).
+
+Clips saved with `output.sidecar = false` are found through the session journal. They get their id, range, game, start time and markers, but no audio or video facts, and rec writes nothing next to them.
+
+**`rec analyze <clip|folder> [--force]`** runs layer 2 on clips that have a sidecar and stores the result in it (see [Phase B as built](#phase-b-as-built)).
+
+**`rec mcp [--dir DIR]...`** is a local MCP server on stdin and stdout: JSON-RPC 2.0, one message per line, protocol versions 2025-06-18, 2025-03-26 and 2024-11-05. By default it serves the clips folder from the config (`output.directory`, else `Videos\rec`) and the session journals. It rescans on every call, without re-reading unchanged sidecars, so new clips show up while it runs. Tools:
+- `list_clips(game?, since?, until?, has_event?, order?, limit?)`: newest first by default. `has_event` also matches loud moments derived from the curves.
+- `clip(id)`: the sidecar plus file paths, overlaps and session position. Loudness curves are summarised (median and peak).
+- `timeline(id)`: entries with `t`, `clock`, `kind`, `src`, `conf`, a plain-language `note`, and `dur` and `look_at` (the peak) for loud stretches, plus the picture summary.
+- `frames(id, times[], width?)`: up to 8 JPEG images per call, 768 px wide by default, decoded on demand. The decoder stays open between calls, so stepping through one clip is quick.
+- `audio_curve(id, track?, from?, to?, hz?)`: dBFS values. A lower `hz` keeps the loudest value of each group.
+- `overlaps(id)`: overlapping clips with the shared span and time offset, and the overlap group.
+- `analyze(id, force?)`: layer 2 for one clip.
+
+`id` takes the ULID, a unique prefix of 6 or more characters, or the file name. `search(text)` waits for transcripts (phase C). To add the server to Claude Code: `claude mcp add rec -- rec mcp` (with `rec.exe` on the PATH, or its full path).
+
+With this in place, the TF2 job's first hour becomes `list_clips(game: "Team Fortress 2", has_event: "kill")`, then `timeline` and a few `frames` calls per candidate. `kill` events need a phase D source; until then `marker` and `loud` are the events every clip has.
+
+## Phase B as built
+
+**Decoding** uses the Media Foundation source reader with a D3D11 device, so decoding runs on the GPU, with a software fallback. Its video processor converts to BGRA and scales on the GPU. A request up to 1.5 s after the current position decodes on, and anything else seeks to the IDR frame before it (one every second). WIC scales stills and writes JPEG, and Direct2D and DirectWrite draw the sheets. There is no FFmpeg, no GPL code and no network access (`MFSTARTUP_LITE`). `rec digest` and `rec analyze` run at EcoQoS.
+
+**Layer 2** decodes the clip once at 256 px wide and looks at it 10 times a second, as a 64 × 36 grid of mean colours. It writes `analysis` into the sidecar:
+
+| Field | Meaning |
+|---|---|
+| `v`, `tool`, `utc` | Format version (1), what wrote it and when |
+| `hz` | 1: `brightness` and `motion` have one value per second |
+| `brightness` | Mean luma (BT.709), 0–255 |
+| `motion` | Mean absolute change of the picture (RGB, 0–255) between looks 0.1 s apart |
+| `dark` | `[from, to]` stretches with mean luma under 20, 1 s or longer |
+| `static` | Stretches with almost no change (under 1) for 2 s or more: paused, a menu or loading |
+| `cuts` | Number of `cut` events |
+| `thumb` | `{ t, file, width }`: `<clip>.rec/thumb.jpg` next to the clip, 480 px wide. It is taken at the first marker, else the loudest game moment, else the middle, and moved off dark or static frames |
+
+It also adds events with conf < 1, which every run replaces:
+- **`cut`** (`src: "analysis:video"`): the picture changes by at least 20, its colour histogram by at least 0.35, and the change is at least 3 times the median change within ±1 s. A cut is stamped at the first look after it, so up to 0.1 s late. It compares colour, not just luma: fake_game's blue and red frames have the same brightness.
+- **`loud`** (`src: "audio:game"`, or `mix` or `system` when there is no game track, plus `audio:mic` and `audio:voice`): stretches well above the clip's own median level (at least 4 dB above it, and never below -40 dBFS) whose peak is 6 dB over that threshold or that last a second. At most 8 are kept for the game and 5 each for mic and voice, the loudest first. Fields: `dur`, `peak_t`, `peak_db`, `track`. Clips that have not been analysed get the same loud moments derived when their timeline is read.
+
+The sidecar is replaced in one step (a temporary file, then a rename) and keeps every other field in its order. A clip without a sidecar never gets one.
+
+**Measured** on this machine (RX 7800 XT):
+- The two fake_game clips from the phase A live test (946 × 532 HEVC, sidecars written by recd) were used. All 14 colour flips in the 13.9 s clip were found as cuts, each within 0.083 s of the frame-exact flip time from ffmpeg. The clips' overlap (3.883 s, offset 10 s) matches the journal. With its sidecar deleted, the second clip is rebuilt from the journal with the same id, range, start time and marker.
+- Analysis took 1.4 s for that 14 s clip, and 9.7 s for a synthetic 60 s 2560 × 1440 60 fps HEVC clip. Once analysed, digesting the synthetic clip (15 stills, 1 sheet) took 1.9 s.
+- `rec mcp` returned 3 frames in 217 ms from a cold decoder, then about 80 ms per frame.
+
+**Not verified:** real game footage (cut and static thresholds were only tuned on fake_game and synthetic grids), HDR10 clips (the video processor makes 8-bit BGRA without recd's tone mapping), AV1 clips, and loud moments in a real recording (fake_game is silent; unit tests cover them).
+
+Code: `crates/rec-library` (`clip`, `journal`, `library`, `overlap`, `timeline`, `summary`, `decode`, `image`, `analysis`, `digest`) and `crates/rec-cli/src/mcp.rs`. `cargo test -p rec-library decode -- --ignored` with `REC_TEST_CLIP=<clip.mp4>` decodes a real clip.
 
 ## Phasing
 
 | Phase | Fits in | Scope |
 |---|---|---|
 | A | M2 (next to the marker hotkey and per-game profiles) | Sidecar v1 with layer 0, marker hotkey, session journal, layer 1 loudness curves, `player.names` and `hud`/`sources` slots in profiles |
-| B | M3 (with `rec-ui` and the library) | Layer 2 thumbnails, cuts and quality; `rec digest`; `rec mcp`. The library UI reads the same sidecars |
-| C | M3+ (opt-in) | Local transcripts; optional local captioning endpoint |
+| B | Built in M2 (2026-10-17), ahead of `rec-ui` | Layer 2 thumbnails, cuts and quality; `rec digest`; `rec mcp`. The library UI (M3) will read the same sidecars through `rec-library` |
+| C | M3+ (opt-in) | Local transcripts and the `search(text)` MCP tool; optional local captioning endpoint |
 | D | Later (per game) | Sources: CS2 and Dota GSI, League, Source console log, Minecraft log, HUD profile engine (starting with TF2), then demo parsers |
 
 Phase A is small and on the save path, so it is the place to start. Every later phase depends on its ids, times and markers. It also means every clip the user records from now on is already AI-ready, even before any analysis exists.
@@ -229,4 +276,5 @@ Phase A is small and on the save path, so it is the place to start. Every later 
 
 - **Embed in the MP4?** A copy in `moov/udta` would survive uploads and renames, as the SteelSeries tag did. `moov` is written at the first keyframe, so this needs either a reserved `free` box that `finish()` overwrites (it already patches durations) or a trailing box. Check `rec-mux/src/writer.rs` before choosing. MP4 chapters for markers would also show up in ordinary players.
 - **Can trim and export in rec-ui keep the sidecar?** They should copy it, shift the times and set `parent`.
-- **Sidecar clutter.** Do `<clip>.rec.json` and the `<clip>.rec/` folder sit next to clips, or go in a hidden `.rec` folder per directory? Next to clips is simpler and survives copying a single clip. A setting can hide them.
+- **Sidecar clutter.** Do `<clip>.rec.json` and the `<clip>.rec/` folder sit next to clips, or go in a hidden `.rec` folder per directory? Next to clips is simpler and survives copying a single clip. A setting can hide them. Today analysis writes `<clip>.rec/thumb.jpg` next to the clip, and `rec digest` writes `rec-digest/` next to the clips unless given `--out`.
+- **Who starts analysis?** Today it runs only on demand. recd could queue it after a save and run it once no game is in the foreground (D11), or rec-ui could run it when the library opens.

@@ -6,7 +6,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 
 **Read first:** [docs/decisions.md](docs/decisions.md) (the why), [docs/roadmap.md](docs/roadmap.md) (the what), [docs/research.md](docs/research.md) (the evidence).
 
-**Status (2026-10-13):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio, exclusive-fullscreen detection, pipeline recovery, the quick panel, HDR, AV1 and the AMD AMF backend done.
+**Status (2026-10-17):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio, exclusive-fullscreen detection, pipeline recovery, the quick panel, HDR, AV1, the AMD AMF backend and AI-ready clips phases A and B done.
 
 | Crate | Role |
 |---|---|
@@ -15,7 +15,8 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 | `rec-audio` | WASAPI → AAC |
 | `rec-mux` | Fragmented MP4 |
 | `recd` | Tray service |
-| `rec-cli` | `rec` |
+| `rec-cli` | `rec`, including `rec digest`, `rec analyze` and the `rec mcp` server (`src/mcp.rs`) |
+| `rec-library` | Saved clips for AI tools: sidecars, journals, overlaps, timelines, MF/D3D11 decoding, WIC stills and sheets, layer 2 analysis |
 | `rec-bench` | Benchmark harness: PresentMon off/on runs, `recd` idle cost (see `bench/README.md`) |
 
 **Next step:** M2. Suggested order:
@@ -26,7 +27,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 5. ~~Quick-panel overlay~~ (done: `recd/src/panel.rs` model, `overlay.rs` window; Alt+F7 or the tray)
 6. ~~HDR~~ (done: HDR10 or tone-map, decision D12)
 7. ~~Native encoders + AV1~~ (AV1 and AMD AMF done; NVENC and oneVPL need NVIDIA / Intel hardware)
-8. ~~AI-ready clips phase A~~ (done: `<clip>.rec.json` sidecar, marker hotkey and `rec mark`, session journal, loudness curves; see [docs/ai-clips.md](docs/ai-clips.md)). The marker hotkey has no default: set `hotkeys.add_marker`. Phases B to D (thumbnails and analysis, `rec digest`, `rec mcp`, game sources) are proposals.
+8. ~~AI-ready clips phase A~~ (done: `<clip>.rec.json` sidecar, marker hotkey and `rec mark`, session journal, loudness curves; see [docs/ai-clips.md](docs/ai-clips.md)). The marker hotkey has no default: set `hotkeys.add_marker`. Phase B is done too: `rec digest`, `rec analyze`, `rec mcp` and layer 2 analysis (thumbnail, scene cuts, brightness, motion, loud moments). Phases C and D (transcripts, game sources) are proposals.
 9. Remaining M2 items: per-game profiles, extra clip-length hotkeys, controller combo, storage quota with auto-prune, Win10 DDA fallback, adaptive GPU priority
 
 **Things learned**
@@ -62,6 +63,12 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 - Memory: `recd` uses ~127 MB private while recording at 1080p60. About 54 MB of that is driver / Media Foundation pipeline allocations and the rest is the buffer.
 - Bench: `rec-bench` was tested end to end only against stand-in `recd` and PresentMon scripts. The first real run (needs admin or the Performance Log Users group) may show PresentMon CLI differences. Rust `Command` children inherit the parent's std handles, so `rec-bench` clears the inherit flag before restarting the user's `recd`; otherwise `rec-bench | tee` never ends.
 - AI-ready clips: verified live with `fake_game` under a separate `APPDATA`/`LOCALAPPDATA` (`game_apps = ["fake_game.exe"]`). Sidecar durations match ffprobe, and marker times agree between the sidecar and the journal. Non-zero loudness and the Steam app id are covered only by unit tests: `fake_game` is silent and not a Steam game. TF2's `appmanifest_440.acf` matches the test format.
+- AI-ready clips phase B (`rec-library`):
+  - Tested on copies of the phase A live-test clips (recd sidecars and journal, journal paths rewritten), one with its sidecar deleted to test journal-only clips, plus a synthetic 60 s 1440p60 HEVC clip. No new recording was needed, so no game lost focus.
+  - The MF source reader decodes on the GPU (`MF_SOURCE_READER_D3D_MANAGER`), and `ENABLE_ADVANCED_VIDEO_PROCESSING` converts to RGB32 and scales on the GPU when `MF_MT_FRAME_SIZE` is set. `SetCurrentPosition` past the end fails with `MF_E_INVALID_POSITION`, so seeks are clamped to just before the end. Seeking fragmented MP4 works.
+  - Scene cuts compare colour (grid of mean RGB plus a colour histogram), not luma: `fake_game`'s blue and red frames have equal brightness.
+  - Real game footage, HDR10, AV1 and non-silent audio are still unverified for analysis; see [docs/ai-clips.md](docs/ai-clips.md#phase-b-as-built).
+  - `cargo test -p rec-library decode -- --ignored` with `REC_TEST_CLIP=<clip.mp4>` decodes a real clip. Claude Code: `claude mcp add rec -- rec mcp`.
 - Logs: `%LOCALAPPDATA%\rec\recd.log`. Config: `%APPDATA%\rec\config.toml`.
 - Testing: set `REC_DEBUG_CAPTURE_UI=1` to make toasts visible in screenshots.
 
