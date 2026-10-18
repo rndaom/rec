@@ -12,6 +12,10 @@
 //! fit. The newest clip and clips saved in the last few minutes are never
 //! deleted. Deleting is permanent: the Recycle Bin is on the same drive, so
 //! moving clips there would free no space.
+//!
+//! [`set_starred`] writes the star; recd's "star last clip" hotkey and
+//! quick-panel row use it. `rec star` goes through rec-library, which writes
+//! sidecars with the same [`write_sidecar`].
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -20,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// Video file extensions a sidecar can sit next to.
 pub const VIDEO_EXTENSIONS: [&str; 3] = ["mp4", "mkv", "mov"];
@@ -422,6 +427,94 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+// ---- stars -------------------------------------------------------------------
+
+/// Stars or unstars the clip at `video`, so quota pruning keeps it (or may
+/// delete it again). The star is kept in the sidecar, read afresh so that
+/// nothing written to it since the clip was saved (analysis) is lost. A clip
+/// without a sidecar (saved with `output.sidecar = false`) gets `new`, with
+/// the star: the star has to be kept somewhere. Without a `new`, starring
+/// such a clip fails and unstarring it does nothing.
+pub fn set_starred(video: &Path, starred: bool, new: Option<Value>) -> Result<(), String> {
+    if !video.is_file() {
+        return Err(format!("{} is gone", video.display()));
+    }
+    let path = sidecar_for(video);
+    let mut raw = match fs::read_to_string(&path) {
+        Ok(text) => {
+            let raw: Value = serde_json::from_str(&text)
+                .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+            if !is_sidecar(&raw) {
+                return Err(format!("{} is not a rec sidecar", path.display()));
+            }
+            raw
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match new {
+            _ if !starred => return Ok(()),
+            Some(raw) if is_sidecar(&raw) => raw,
+            Some(_) => return Err("the new sidecar is not a rec sidecar".into()),
+            None => return Err(format!("{} has no sidecar", video.display())),
+        },
+        Err(e) => return Err(format!("can't read {}: {e}", path.display())),
+    };
+    raw["starred"] = starred.into();
+    write_sidecar(&path, &raw)
+}
+
+/// What pruning needs from a sidecar to read it: `rec` and `clip.id`.
+fn is_sidecar(raw: &Value) -> bool {
+    raw["rec"].is_u64() && raw["clip"]["id"].is_string()
+}
+
+/// Writes a sidecar as recd does (pretty, number arrays on one line),
+/// replacing the old file in one step so a reader never sees half of it.
+pub fn write_sidecar(path: &Path, raw: &Value) -> Result<(), String> {
+    let mut text = serde_json::to_string_pretty(raw).map_err(|e| e.to_string())?;
+    text = compact_number_arrays(&text);
+    text.push('\n');
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text).map_err(|e| format!("can't write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("can't replace {}: {e}", path.display())
+    })
+}
+
+/// Puts arrays of plain numbers on one line, as recd writes loudness
+/// curves, so a pretty-printed sidecar stays readable.
+pub fn compact_number_arrays(pretty: &str) -> String {
+    let mut out = String::with_capacity(pretty.len());
+    let mut rest = pretty;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open..];
+        let close = after.find(']');
+        let body = close.map(|c| &after[1..c]);
+        match body {
+            Some(body)
+                if !body.trim().is_empty()
+                    && body.chars().all(|c| {
+                        c.is_ascii_digit()
+                            || c.is_whitespace()
+                            || matches!(c, ',' | '.' | '-' | 'e' | 'E' | '+')
+                    }) =>
+            {
+                let items: Vec<&str> = body.split(',').map(str::trim).collect();
+                out.push('[');
+                out.push_str(&items.join(","));
+                out.push(']');
+                rest = &after[close.unwrap_or(0) + 1..];
+            }
+            _ => {
+                out.push('[');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,5 +793,100 @@ mod tests {
     fn formats_bytes() {
         assert_eq!(format_bytes(3 * BYTES_PER_GB / 2), "1.5 GB");
         assert_eq!(format_bytes(320 << 20), "320 MB");
+    }
+
+    fn keep_of(root: &Path, journals: &Path, video: &Path) -> Option<Keep> {
+        let (clips, problems) = Files::walk(root).clips(journals);
+        assert!(problems.is_empty(), "{problems:?}");
+        clips.into_iter().find(|c| c.video == video).unwrap().keep
+    }
+
+    #[test]
+    fn starring_keeps_every_field_and_the_layout() {
+        let tmp = Temp::new("star");
+        let video = tmp.0.join("tf2.mp4");
+        write(&video, 10);
+        // As recd writes it, plus analysis added later by `rec analyze`.
+        let text = "{\n  \"rec\": 1,\n  \"clip\": {\n    \"id\": \"01ABC\",\n    \"file\": \"tf2.mp4\"\n  },\n  \"game\": {\n    \"name\": \"TF2\"\n  },\n  \"audio\": [\n    {\n      \"index\": 0,\n      \"loudness\": [0,12,255]\n    }\n  ],\n  \"events\": [],\n  \"analysis\": {\n    \"cuts\": 2\n  }\n}\n";
+        fs::write(sidecar_for(&video), text).unwrap();
+        assert_eq!(keep_of(&tmp.0, &tmp.0, &video), None);
+
+        set_starred(&video, true, None).unwrap();
+        let starred = fs::read_to_string(sidecar_for(&video)).unwrap();
+        // The same file with the star added at the end.
+        let expected = text.replace("\n  }\n}\n", "\n  },\n  \"starred\": true\n}\n");
+        assert_eq!(starred, expected);
+        assert_eq!(keep_of(&tmp.0, &tmp.0, &video), Some(Keep::Starred));
+
+        // Starring again changes nothing; unstarring sets it in place.
+        set_starred(&video, true, None).unwrap();
+        assert_eq!(fs::read_to_string(sidecar_for(&video)).unwrap(), expected);
+        set_starred(&video, false, None).unwrap();
+        let unstarred = fs::read_to_string(sidecar_for(&video)).unwrap();
+        assert_eq!(unstarred, expected.replace("true", "false"));
+        assert_eq!(keep_of(&tmp.0, &tmp.0, &video), None);
+        assert!(!video.with_extension("rec.json.tmp").exists());
+    }
+
+    #[test]
+    fn starring_a_clip_without_a_sidecar_writes_the_new_one() {
+        let tmp = Temp::new("star-new");
+        let video = tmp.0.join("a.mp4");
+        write(&video, 10);
+        let new = serde_json::json!({
+            "rec": 1,
+            "clip": { "id": "01NEW", "file": "a.mp4", "duration": 30.0 },
+            "events": [],
+        });
+
+        // Unstarring writes nothing; starring with nothing to write fails.
+        set_starred(&video, false, Some(new.clone())).unwrap();
+        assert!(!sidecar_for(&video).exists());
+        let err = set_starred(&video, true, None).unwrap_err();
+        assert!(err.contains("has no sidecar"), "{err}");
+        assert!(!sidecar_for(&video).exists());
+
+        set_starred(&video, true, Some(new.clone())).unwrap();
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(sidecar_for(&video)).unwrap()).unwrap();
+        let mut expected = new;
+        expected["starred"] = true.into();
+        assert_eq!(written, expected);
+        assert_eq!(keep_of(&tmp.0, &tmp.0, &video), Some(Keep::Starred));
+    }
+
+    #[test]
+    fn starring_refuses_what_it_cannot_keep() {
+        let tmp = Temp::new("star-bad");
+        let gone = tmp.0.join("gone.mp4");
+        let err = set_starred(&gone, true, None).unwrap_err();
+        assert!(err.contains("is gone"), "{err}");
+
+        // A sidecar that isn't JSON, or not rec's, is left untouched.
+        let video = tmp.0.join("b.mp4");
+        write(&video, 10);
+        for text in ["{ not json", "{\"name\": \"someone else's\"}"] {
+            fs::write(sidecar_for(&video), text).unwrap();
+            assert!(set_starred(&video, true, None).is_err());
+            assert_eq!(fs::read_to_string(sidecar_for(&video)).unwrap(), text);
+        }
+
+        let other = tmp.0.join("c.mp4");
+        write(&other, 10);
+        let not_rec = serde_json::json!({ "clip": { "id": "01X" } });
+        assert!(set_starred(&other, true, Some(not_rec)).is_err());
+        assert!(!sidecar_for(&other).exists());
+    }
+
+    #[test]
+    fn compacts_number_arrays_only() {
+        let v = serde_json::json!({
+            "a": [1, 2, 3], "b": [[0.5, 1.5]], "c": ["x", "y"], "d": [], "e": [{"t": 1}],
+        });
+        let text = compact_number_arrays(&serde_json::to_string_pretty(&v).unwrap());
+        assert!(text.contains("\"a\": [1,2,3]"), "{text}");
+        assert!(text.contains("[0.5,1.5]"), "{text}");
+        assert!(text.contains("\"x\",\n"), "{text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), v);
     }
 }

@@ -381,40 +381,7 @@ fn write_thumb(
     Ok((round3(frame.t), format!("{stem}.rec/thumb.jpg")))
 }
 
-/// Puts arrays of plain numbers on one line, as recd writes loudness
-/// curves, so a pretty-printed sidecar stays readable.
-pub fn compact_number_arrays(pretty: &str) -> String {
-    let mut out = String::with_capacity(pretty.len());
-    let mut rest = pretty;
-    while let Some(open) = rest.find('[') {
-        out.push_str(&rest[..open]);
-        let after = &rest[open..];
-        let close = after.find(']');
-        let body = close.map(|c| &after[1..c]);
-        match body {
-            Some(body)
-                if !body.trim().is_empty()
-                    && body.chars().all(|c| {
-                        c.is_ascii_digit()
-                            || c.is_whitespace()
-                            || matches!(c, ',' | '.' | '-' | 'e' | 'E' | '+')
-                    }) =>
-            {
-                let items: Vec<&str> = body.split(',').map(str::trim).collect();
-                out.push('[');
-                out.push_str(&items.join(","));
-                out.push(']');
-                rest = &after[close.unwrap_or(0) + 1..];
-            }
-            _ => {
-                out.push('[');
-                rest = &after[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
+pub use rec_core::store::compact_number_arrays;
 
 /// Plain-language lines about an `analysis` object, for `summary.md`.
 pub fn describe(analysis: &Value) -> Vec<String> {
@@ -619,17 +586,6 @@ mod tests {
         s["events"] = json!([]);
         let clip = Clip::from_value(s).unwrap();
         assert_eq!(thumb_time(&clip, &p), 15.0);
-    }
-
-    #[test]
-    fn compacts_number_arrays_only() {
-        let v =
-            json!({"a": [1, 2, 3], "b": [[0.5, 1.5]], "c": ["x", "y"], "d": [], "e": [{"t": 1}]});
-        let text = compact_number_arrays(&serde_json::to_string_pretty(&v).unwrap());
-        assert!(text.contains("\"a\": [1,2,3]"), "{text}");
-        assert!(text.contains("[0.5,1.5]"), "{text}");
-        assert!(text.contains("\"x\",\n"), "{text}");
-        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), v);
     }
 
     #[test]

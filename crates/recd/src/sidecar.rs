@@ -64,6 +64,9 @@ pub struct Saved {
     /// QPC time of the clip's first frame and of its end.
     pub start: Hns,
     pub end: Hns,
+    /// The sidecar to write if the clip is starred, when `output.sidecar`
+    /// is off and none was written: see [`minimal`].
+    pub minimal: Option<serde_json::Value>,
 }
 
 /// The clip's first frame and end on the QPC clock, from its video packets.
@@ -91,15 +94,18 @@ pub fn describe(
     packets: &[Packet],
 ) -> Result<Saved, String> {
     let (start, end) = clip_range(packets).ok_or("the clip has no video")?;
-    let saved = Saved {
+    let mut saved = Saved {
         id: new_id(),
         start,
         end,
+        minimal: None,
     };
     if ctx.sidecar {
         let json = render(clip, ctx, &saved, tracks, format)?;
         let path = path_for(clip);
         std::fs::write(&path, json).map_err(|e| format!("can't write {}: {e}", path.display()))?;
+    } else {
+        saved.minimal = Some(minimal(clip, ctx, &saved)?);
     }
     Ok(saved)
 }
@@ -110,10 +116,12 @@ struct Sidecar<'a> {
     clip: Clip<'a>,
     game: Game<'a>,
     time: Time,
-    video: Video,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video: Option<Video>,
     audio: Vec<Audio<'a>>,
     events: Vec<Event>,
-    loudness: Loudness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loudness: Option<Loudness>,
 }
 
 #[derive(Serialize)]
@@ -189,7 +197,6 @@ fn render(
     tracks: &[TrackInfo],
     format: &VideoFormat,
 ) -> Result<String, String> {
-    let session = &ctx.session;
     let duration = saved.end - saved.start;
     let samples =
         (duration.max(0) as u64 * u64::from(LEVEL_HZ)).div_ceil(HNS_PER_SEC as u64) as usize;
@@ -211,6 +218,38 @@ fn render(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let sidecar = Sidecar {
+        video: Some(Video {
+            codec: format.codec.name().to_ascii_lowercase().replace('.', ""),
+            width: format.width,
+            height: format.height,
+            fps: format.fps,
+            hdr: format.color.is_hdr(),
+        }),
+        audio,
+        loudness: Some(Loudness {
+            hz: LEVEL_HZ,
+            scale: "RMS level: 0 is -60 dBFS or quieter, 255 is 0 dBFS, linear in dB",
+        }),
+        ..layer0(clip, ctx, saved)
+    };
+    let mut json = serde_json::to_string_pretty(&sidecar).map_err(|e| e.to_string())?;
+    json.push('\n');
+    Ok(json)
+}
+
+/// The sidecar of a clip saved with `output.sidecar = false`, written only
+/// if the clip is starred (the star has to be kept somewhere). It holds what
+/// the session journal knows too (id, range, game, start time, markers) and
+/// nothing about the video or audio, like the one `rec star` builds from
+/// the journal for such a clip.
+fn minimal(clip: &Path, ctx: &ClipContext, saved: &Saved) -> Result<serde_json::Value, String> {
+    serde_json::to_value(layer0(clip, ctx, saved)).map_err(|e| e.to_string())
+}
+
+/// Layer 0: the clip, game, time and markers, with no media facts.
+fn layer0<'a>(clip: &Path, ctx: &'a ClipContext, saved: &'a Saved) -> Sidecar<'a> {
+    let session = &ctx.session;
     let events = session
         .markers(saved.start, saved.end)
         .into_iter()
@@ -221,7 +260,7 @@ fn render(
             conf: 1.0,
         })
         .collect();
-    let sidecar = Sidecar {
+    Sidecar {
         rec: VERSION,
         clip: Clip {
             id: &saved.id,
@@ -230,7 +269,7 @@ fn render(
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             parent: None,
-            duration: round_ms(duration),
+            duration: round_ms(saved.end - saved.start),
             trigger: ctx.trigger.name(),
             saved_at: round_ms(ctx.requested - saved.start),
         },
@@ -245,23 +284,11 @@ fn render(
             session: session.id.clone(),
             session_offset: session.offset(saved.start),
         },
-        video: Video {
-            codec: format.codec.name().to_ascii_lowercase().replace('.', ""),
-            width: format.width,
-            height: format.height,
-            fps: format.fps,
-            hdr: format.color.is_hdr(),
-        },
-        audio,
+        video: None,
+        audio: Vec::new(),
         events,
-        loudness: Loudness {
-            hz: LEVEL_HZ,
-            scale: "RMS level: 0 is -60 dBFS or quieter, 255 is 0 dBFS, linear in dB",
-        },
-    };
-    let mut json = serde_json::to_string_pretty(&sidecar).map_err(|e| e.to_string())?;
-    json.push('\n');
-    Ok(json)
+        loudness: None,
+    }
 }
 
 /// A number array on one line, so the pretty-printed file stays readable.
@@ -422,6 +449,7 @@ mod tests {
             id: "01TESTCLIP0000000000000000".into(),
             start,
             end: start + millis(2000),
+            minimal: None,
         };
         let json = render(
             Path::new(r"C:\clips\tf2.mp4"),
@@ -449,6 +477,128 @@ mod tests {
         assert_eq!(events[0]["src"], "cli");
         // Curves stay on one line.
         assert!(json.contains("\"loudness\": [0,0,"), "{json}");
+    }
+
+    /// A context whose session started 60 s before `start`, with a marker
+    /// 1.5 s into a clip starting there.
+    fn context(start: Hns, sidecar: bool) -> ClipContext {
+        use crate::journal::{MarkSource, Marker};
+        let session = SessionInfo::for_test(
+            start - rec_core::time::secs(60),
+            vec![Marker {
+                t: start + millis(1500),
+                src: MarkSource::Hotkey,
+            }],
+        );
+        ClipContext {
+            trigger: Trigger::Panel,
+            requested: start + millis(1800),
+            session: Arc::new(session),
+            levels: None,
+            sidecar,
+        }
+    }
+
+    fn video_format() -> VideoFormat {
+        VideoFormat {
+            codec: rec_core::media::VideoCodec::Hevc,
+            width: 1280,
+            height: 720,
+            fps: 60,
+            color: rec_core::media::VideoColor::Sdr,
+        }
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("recd-sidecar-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn without_sidecars_a_minimal_one_waits_for_a_star() {
+        let dir = temp("minimal");
+        let clip = dir.join("tf2.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        let start = rec_core::time::secs(100);
+        let packets = [packet(0, start), packet(0, start + millis(2000) - 10)];
+        let saved = describe(
+            &clip,
+            &context(start, false),
+            &[],
+            &video_format(),
+            &packets,
+        )
+        .unwrap();
+        // Nothing is written next to the clip.
+        assert!(!path_for(&clip).exists());
+
+        let minimal = saved.minimal.clone().unwrap();
+        assert_eq!(minimal["rec"], VERSION);
+        assert_eq!(minimal["clip"]["id"], saved.id.as_str());
+        assert_eq!(minimal["clip"]["file"], "tf2.mp4");
+        assert_eq!(minimal["clip"]["duration"], 2.0);
+        assert_eq!(minimal["clip"]["trigger"], "panel");
+        assert_eq!(minimal["clip"]["saved_at"], 1.8);
+        assert_eq!(minimal["game"]["steam_appid"], 440);
+        assert_eq!(minimal["time"]["session_offset"], 60.0);
+        assert_eq!(minimal["events"][0]["t"], 1.5);
+        assert_eq!(minimal["audio"], serde_json::json!([]));
+        // No media facts: they would need the packets, and are what
+        // `output.sidecar = false` leaves out.
+        assert!(minimal.get("video").is_none() && minimal.get("loudness").is_none());
+
+        // Starring writes it, and quota pruning then keeps the clip.
+        rec_core::store::set_starred(&clip, true, saved.minimal).unwrap();
+        let text = std::fs::read_to_string(path_for(&clip)).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(written["starred"], true);
+        assert_eq!(written["clip"]["id"], minimal["clip"]["id"]);
+        let (clips, problems) = rec_core::store::Files::walk(&dir).clips(&dir);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(clips[0].keep, Some(rec_core::store::Keep::Starred));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn starring_a_written_sidecar_keeps_it_as_recd_wrote_it() {
+        let dir = temp("star");
+        let clip = dir.join("tf2.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        let start = rec_core::time::secs(100);
+        let packets = [packet(0, start), packet(0, start + millis(2000) - 10)];
+        let audio = rec_core::media::AudioFormat {
+            codec: rec_core::media::AudioCodec::Aac,
+            sample_rate: 48_000,
+            channels: 2,
+            codec_config: vec![0x11, 0x90],
+        };
+        let tracks = [TrackInfo {
+            id: 1,
+            name: "Mixed".into(),
+            kind: TrackKind::Audio(audio),
+        }];
+        let saved = describe(
+            &clip,
+            &context(start, true),
+            &tracks,
+            &video_format(),
+            &packets,
+        );
+        assert!(saved.unwrap().minimal.is_none());
+        let before = std::fs::read_to_string(path_for(&clip)).unwrap();
+
+        rec_core::store::set_starred(&clip, true, None).unwrap();
+        let after = std::fs::read_to_string(path_for(&clip)).unwrap();
+        // Byte for byte the same, loudness curves still on one line, with
+        // the star added at the end.
+        let expected = format!(
+            "{},\n  \"starred\": true\n}}\n",
+            before.trim_end().strip_suffix('}').unwrap().trim_end()
+        );
+        assert_eq!(after, expected);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

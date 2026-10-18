@@ -369,15 +369,7 @@ pub fn set_starred(clip: &mut Clip, starred: bool) -> Result<(), String> {
 
 /// Writes a sidecar, replacing the old file in one step.
 pub fn write_sidecar(path: &Path, raw: &Value) -> Result<(), String> {
-    let mut text = serde_json::to_string_pretty(raw).map_err(|e| e.to_string())?;
-    text = crate::analysis::compact_number_arrays(&text);
-    text.push('\n');
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("can't write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("can't replace {}: {e}", path.display())
-    })
+    rec_core::store::write_sidecar(path, raw)
 }
 
 fn str_of(v: &Value) -> Option<String> {

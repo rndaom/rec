@@ -83,7 +83,7 @@ rec save 30
 
 `rec help` lists every command. Configuration lives at `%APPDATA%\rec\config.toml`; `rec config` prints the exact path.
 
-To cap the space clips use, set `quota_gb` under `[output]`. rec then deletes its oldest clips after each save. `rec star` keeps the newest clip (or `rec star <clip>` a given one) out of that, and so does making a clip read-only. `rec prune --dry-run` lists what would go. Only clips rec saved are ever counted or deleted.
+To cap the space clips use, set `quota_gb` under `[output]`. rec then deletes its oldest clips after each save. `rec star` keeps the newest clip (or `rec star <clip>` a given one) out of that, and so does making a clip read-only. In game, "Star last clip" in the quick panel (Alt+F7) does the same for the clip you just saved, or set a hotkey for it: `star_last = "Alt+F9"` under `[hotkeys]` (there is no default). `rec prune --dry-run` lists what would go. Only clips rec saved are ever counted or deleted.
 
 ## Clips for AI tools
 Every clip gets a `<clip>.rec.json` sidecar with the game, when it was recorded, markers, and each audio track's role and loudness. Two commands make clips readable by a model:

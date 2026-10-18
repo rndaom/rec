@@ -10,7 +10,7 @@ use std::time::Duration;
 use rec_core::media::{TrackInfo, TrackKind, VIDEO_TRACK, VideoFormat};
 use rec_core::replay::{Packet, ReplayBuffer};
 use rec_core::time::{Hns, millis, qpc_now};
-use serde_json::json;
+use serde_json::{Value, json};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadInformation, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
     THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
@@ -37,8 +37,17 @@ pub struct SaveJob {
     pub context: ClipContext,
 }
 
-/// Runs `job` on its own thread and calls `done` with the saved path.
-pub fn spawn(job: SaveJob, done: impl FnOnce(Result<PathBuf, String>) + Send + 'static) {
+/// A clip written to disk.
+#[derive(Debug)]
+pub struct SavedClip {
+    pub path: PathBuf,
+    /// The sidecar to write if the clip is starred, when `output.sidecar` is
+    /// off and none was written (see `sidecar::minimal`).
+    pub minimal: Option<Value>,
+}
+
+/// Runs `job` on its own thread and calls `done` with the saved clip.
+pub fn spawn(job: SaveJob, done: impl FnOnce(Result<SavedClip, String>) + Send + 'static) {
     let spawned = std::thread::Builder::new()
         .name("save".into())
         .spawn(move || {
@@ -70,7 +79,7 @@ pub fn lower_priority() {
     }
 }
 
-fn run(job: SaveJob) -> Result<PathBuf, String> {
+fn run(job: SaveJob) -> Result<SavedClip, String> {
     // Give in-flight encoder output a moment to land in the buffer.
     let wait = job.end + millis(150) - qpc_now();
     if wait > 0 {
@@ -107,31 +116,37 @@ fn run(job: SaveJob) -> Result<PathBuf, String> {
         let _ = std::fs::remove_file(&path);
         return Err(e);
     }
-    if let Some(format) = format {
-        describe(&path, &job.context, &tracks, &format, &packets);
-    }
-    Ok(path)
+    let minimal =
+        format.and_then(|format| describe(&path, &job.context, &tracks, &format, &packets));
+    Ok(SavedClip { path, minimal })
 }
 
-/// Writes the clip's sidecar and journal line. A failure here leaves the
-/// clip itself intact, so it is only logged.
+/// Writes the clip's sidecar and journal line, and returns the sidecar to
+/// write if the clip is starred when none was written. A failure here leaves
+/// the clip itself intact, so it is only logged.
 fn describe(
     path: &Path,
     ctx: &ClipContext,
     tracks: &[TrackInfo],
     format: &VideoFormat,
     packets: &[Packet],
-) {
+) -> Option<Value> {
     match sidecar::describe(path, ctx, tracks, format, packets) {
-        Ok(saved) => ctx.session.append(json!({
-            "type": "clip",
-            "clip": saved.id,
-            "file": path,
-            "from": ctx.session.offset(saved.start),
-            "to": ctx.session.offset(saved.end),
-            "trigger_t": ctx.session.offset(ctx.requested),
-        })),
-        Err(e) => warning!("{}: no sidecar: {e}", path.display()),
+        Ok(saved) => {
+            ctx.session.append(json!({
+                "type": "clip",
+                "clip": saved.id,
+                "file": path,
+                "from": ctx.session.offset(saved.start),
+                "to": ctx.session.offset(saved.end),
+                "trigger_t": ctx.session.offset(ctx.requested),
+            }));
+            saved.minimal
+        }
+        Err(e) => {
+            warning!("{}: no sidecar: {e}", path.display());
+            None
+        }
     }
 }
 

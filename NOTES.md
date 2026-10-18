@@ -28,7 +28,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 6. ~~HDR~~ (done: HDR10 or tone-map, decision D12)
 7. ~~Native encoders + AV1~~ (AV1 and AMD AMF done; NVENC and oneVPL need NVIDIA / Intel hardware)
 8. ~~AI-ready clips phase A~~ (done: `<clip>.rec.json` sidecar, marker hotkey and `rec mark`, session journal, loudness curves; see [docs/ai-clips.md](docs/ai-clips.md)). The marker hotkey has no default: set `hotkeys.add_marker`. Phase B is done too: `rec digest`, `rec analyze`, `rec mcp` and layer 2 analysis (thumbnail, scene cuts, brightness, motion, loud moments). Phases C and D (transcripts, game sources) are proposals.
-9. ~~Storage quota with auto-prune~~ (done: `output.quota_gb`, `rec star` / `unstar` / `prune`, decision D13; `recd/src/prune.rs`, `rec-core/src/store.rs`)
+9. ~~Storage quota with auto-prune~~ (done: `output.quota_gb`, `rec star` / `unstar` / `prune`, decision D13; `recd/src/prune.rs`, `rec-core/src/store.rs`). In game, "Star last clip" stars the clip recd saved last: a quick-panel row, and the `hotkeys.star_last` hotkey, which has no default.
 10. Remaining M2 items: per-game profiles, extra clip-length hotkeys, controller combo, Win10 DDA fallback, adaptive GPU priority
 
 **Things learned**
@@ -73,7 +73,8 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 - Storage quota:
   - Verified with a throwaway `APPDATA`/`LOCALAPPDATA` and 400 MB stand-in files (`SetLength`, never decoded): `rec star`, `rec prune --dry-run`, `rec prune`, and recd's startup prune all deleted only the oldest unstarred rec clip (with its sidecar and `<clip>.rec` folder), keeping starred, read-only and non-rec videos. The prune after a real save runs the same `prune::request` but wasn't run live: a sandboxed recd records whatever game is in the foreground.
   - Starring lives in the sidecar, so a journal-only clip gets a sidecar when starred. `analysis::save` re-reads `starred` from disk because `rec mcp` holds clips in memory for a long time.
-  - Ideas not done: a star button in the quick panel or a "star last clip" hotkey, a low-disk warning, pruning folders the clips used to be saved to.
+  - "Star last clip" (`hotkeys.star_last`, quick-panel row) writes through `store::set_starred` on recd's main thread, only when used: nothing is added while recording. recd doesn't depend on rec-library (MF/D3D11 decoding, WIC), so the sidecar write lives in rec-core and rec-library's `write_sidecar` calls it. rec-core's `serde_json` has `preserve_order`, so a star keeps the file's key order in recd-only builds too. With `output.sidecar = false`, the save thread keeps a layer-0 sidecar (`sidecar::minimal`, the same facts `rec star` builds from the journal) in memory for the last clip, written only when it is starred. Unit-tested only: not run live, for the same reason as the prune after a save.
+  - Ideas not done: a low-disk warning, pruning folders the clips used to be saved to, unstarring from the panel.
 - Logs: `%LOCALAPPDATA%\rec\recd.log`. Config: `%APPDATA%\rec\config.toml`.
 - Testing: set `REC_DEBUG_CAPTURE_UI=1` to make toasts visible in screenshots.
 

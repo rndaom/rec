@@ -18,6 +18,8 @@ pub enum Action {
     SaveSeconds(u32),
     ToggleOverlay,
     AddMarker,
+    /// Star the clip saved last, so quota pruning keeps it.
+    StarLast,
     TogglePause,
 }
 
@@ -87,6 +89,7 @@ impl Hotkeys {
             (config.toggle_overlay, Action::ToggleOverlay),
         ];
         bindings.extend(config.add_marker.map(|h| (h, Action::AddMarker)));
+        bindings.extend(config.star_last.map(|h| (h, Action::StarLast)));
         bindings.extend(config.pause.map(|h| (h, Action::TogglePause)));
         bindings.extend(
             config

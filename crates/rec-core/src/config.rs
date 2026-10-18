@@ -233,6 +233,8 @@ pub struct HotkeyConfig {
     /// Extra save hotkeys with their own lengths (e.g. 15 s, full buffer).
     pub extra_clips: Vec<ClipHotkey>,
     pub add_marker: Option<Hotkey>,
+    /// Stars the clip saved last, so `output.quota_gb` never deletes it.
+    pub star_last: Option<Hotkey>,
     pub pause: Option<Hotkey>,
 }
 
@@ -256,6 +258,7 @@ impl Default for HotkeyConfig {
             toggle_overlay: Hotkey::new(ALT, Key::Function(7)),
             extra_clips: Vec::new(),
             add_marker: None,
+            star_last: None,
             pause: None,
         }
     }
@@ -849,6 +852,13 @@ quota_gb = 50
                 .unwrap();
         assert_eq!(config.hotkeys.extra_clips.len(), 1);
         assert_eq!(config.hotkeys.extra_clips[0].hotkey.to_string(), "Alt+F6");
+    }
+
+    #[test]
+    fn star_last_hotkey_is_optional() {
+        assert_eq!(Config::default().hotkeys.star_last, None);
+        let config = Config::from_toml("[hotkeys]\nstar_last = \"Alt+F9\"\n").unwrap();
+        assert_eq!(config.hotkeys.star_last.unwrap().to_string(), "Alt+F9");
     }
 
     #[test]

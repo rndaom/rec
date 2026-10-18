@@ -179,7 +179,7 @@ What phase A writes differs from the sketch above in a few places:
 - **`clip.trigger`** is `hotkey`, `panel`, `tray` or `cli`.
 - **Events** from recd are only markers: `{ "t", "kind": "marker", "src": "hotkey" | "cli", "conf": 1 }`. `rec analyze` adds `cut` and `loud` events.
 - **`time.utc_offset_min`** sits next to `start_utc` (which is UTC, with a `Z`).
-- **`starred`** (top level, boolean) is set by `rec star` and `rec unstar`, not by recd. Quota pruning never deletes a starred clip (D13). Starring a clip that has no sidecar writes one, built from its journal line. `rec analyze` keeps the flag from the file on disk, so starring during analysis sticks.
+- **`starred`** (top level, boolean) is set by `rec star` and `rec unstar`, and by recd's "Star last clip" (the `hotkeys.star_last` hotkey, no default, and the quick-panel row), which stars the clip recd saved last in this run. Quota pruning never deletes a starred clip (D13). Starring a clip that has no sidecar writes one: `rec star` builds it from the journal line, recd from the same facts kept from the save (layer 0 only: no `video`, no loudness, `audio: []`). `rec analyze` keeps the flag from the file on disk, so starring during analysis sticks.
 
 `output.sidecar = false` turns the file off. The journal is written either way.
 

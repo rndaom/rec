@@ -47,6 +47,14 @@ pub struct AudioRow {
     pub note: Option<&'static str>,
 }
 
+/// The clip saved last in this run, which "Star last clip" stars.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastClip {
+    /// File name without the extension.
+    pub name: String,
+    pub starred: bool,
+}
+
 /// Everything the panel shows, rebuilt by `app` whenever it changes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct View {
@@ -67,12 +75,16 @@ pub struct View {
     pub folder: String,
     /// The save hotkey, for the footer.
     pub save_hotkey: String,
+    /// `None` until a clip is saved.
+    pub last_clip: Option<LastClip>,
 }
 
 /// A row of the panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     Save,
+    /// Star the clip saved last, so quota pruning keeps it.
+    Star,
     Length,
     Quality,
     /// An index into [`View::audio`].
@@ -91,7 +103,7 @@ impl Item {
     /// The group the row belongs to; groups are drawn with a gap between.
     fn group(self) -> u8 {
         match self {
-            Item::Save => 0,
+            Item::Save | Item::Star => 0,
             Item::Length | Item::Quality => 1,
             Item::Audio(_) => 2,
             Item::Folder | Item::OpenFolder | Item::Pause => 3,
@@ -103,6 +115,7 @@ impl Item {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Save,
+    StarLast,
     SetSeconds(u32),
     SetQuality(Quality),
     SetAudio(AudioTarget, bool),
@@ -211,7 +224,7 @@ impl Panel {
     }
 
     pub fn items(view: &View) -> Vec<Item> {
-        let mut items = vec![Item::Save, Item::Length, Item::Quality];
+        let mut items = vec![Item::Save, Item::Star, Item::Length, Item::Quality];
         items.extend((0..view.audio.len()).map(Item::Audio));
         items.extend([Item::Folder, Item::OpenFolder, Item::Pause]);
         items
@@ -221,6 +234,8 @@ impl Panel {
     pub fn enabled(view: &View, item: Item) -> bool {
         match item {
             Item::Save => view.recording,
+            // Starring twice would do nothing.
+            Item::Star => view.last_clip.as_ref().is_some_and(|c| !c.starred),
             _ => true,
         }
     }
@@ -351,6 +366,7 @@ fn change(view: &View, item: Item, dir: i32) -> Option<Command> {
 fn activate(view: &View, item: Item) -> Option<Command> {
     match item {
         Item::Save => Some(Command::Save),
+        Item::Star => Some(Command::StarLast),
         Item::Length | Item::Quality => change(view, item, 1),
         Item::Audio(i) => {
             let row = view.audio.get(i)?;
@@ -470,6 +486,7 @@ mod tests {
             ],
             folder: r"C:\Users\me\Videos\rec".into(),
             save_hotkey: "Alt+F8".into(),
+            last_clip: None,
         }
     }
 
@@ -587,28 +604,31 @@ mod tests {
         assert_eq!(layout.rows.len(), items.len());
         // Header, then groups separated by gaps.
         assert_eq!(layout.rows[0], size::HEADER + size::GAP);
-        assert_eq!(layout.rows[1], layout.rows[0] + size::ROW + size::GAP);
-        assert_eq!(layout.rows[2], layout.rows[1] + size::ROW);
+        // Save and Star share a group.
+        assert_eq!(layout.rows[1], layout.rows[0] + size::ROW);
+        assert_eq!(layout.rows[2], layout.rows[1] + size::ROW + size::GAP);
+        assert_eq!(layout.rows[3], layout.rows[2] + size::ROW);
         assert!(layout.height > *layout.rows.last().unwrap() + size::ROW);
 
         let mid = |row: usize| layout.rows[row] + size::ROW / 2.0;
-        assert_eq!(layout.hit(20.0, mid(1)), Some((1, 0)));
+        assert_eq!(layout.hit(20.0, mid(2)), Some((2, 0)));
         let value_left = size::WIDTH - size::PAD - size::VALUE;
-        assert_eq!(layout.hit(value_left + 10.0, mid(1)), Some((1, -1)));
-        assert_eq!(layout.hit(size::WIDTH - 20.0, mid(1)), Some((1, 1)));
+        assert_eq!(layout.hit(value_left + 10.0, mid(2)), Some((2, -1)));
+        assert_eq!(layout.hit(size::WIDTH - 20.0, mid(2)), Some((2, 1)));
         // The header, a gap and outside the panel hit nothing.
         assert_eq!(layout.hit(20.0, 10.0), None);
-        assert_eq!(layout.hit(20.0, layout.rows[1] - 2.0), None);
-        assert_eq!(layout.hit(-1.0, mid(1)), None);
+        assert_eq!(layout.hit(20.0, layout.rows[2] - 2.0), None);
+        assert_eq!(layout.hit(-1.0, mid(2)), None);
     }
 
     #[test]
     fn clicks_and_wheel() {
         let v = view();
         let mut p = Panel::new(&v);
-        assert_eq!(p.click(&v, 1, -1), Some(Command::SetSeconds(45)));
-        assert_eq!(p.click(&v, 1, 0), Some(Command::SetSeconds(90)));
-        assert_eq!(p.wheel(&v, 1, 1), Some(Command::SetSeconds(90)));
+        let length = 2;
+        assert_eq!(p.click(&v, length, -1), Some(Command::SetSeconds(45)));
+        assert_eq!(p.click(&v, length, 0), Some(Command::SetSeconds(90)));
+        assert_eq!(p.wheel(&v, length, 1), Some(Command::SetSeconds(90)));
         assert_eq!(p.wheel(&v, 0, 1), None);
         let folder = Panel::items(&v)
             .iter()
@@ -616,6 +636,43 @@ mod tests {
             .unwrap();
         assert_eq!(p.click(&v, folder, 1), Some(Command::PickFolder));
         assert_eq!(p.selected(&v), Some(Item::Folder));
+    }
+
+    #[test]
+    fn star_works_once_a_clip_is_saved_until_it_is_starred() {
+        let mut v = view();
+        let mut p = Panel::new(&v);
+        let star = 1;
+        assert_eq!(Panel::items(&v)[star], Item::Star);
+        // Nothing saved yet: skipped by the keyboard, clicks do nothing.
+        assert!(!Panel::enabled(&v, Item::Star));
+        p.key(&v, Key::Down);
+        assert_eq!(p.selected(&v), Some(Item::Length));
+        assert_eq!(p.click(&v, star, 0), None);
+
+        v.last_clip = Some(LastClip {
+            name: "TF2_2026-10-18_21-04-03".into(),
+            starred: false,
+        });
+        p.key(&v, Key::Home);
+        p.key(&v, Key::Down);
+        assert_eq!(p.selected(&v), Some(Item::Star));
+        assert_eq!(p.key(&v, Key::Activate), Some(Command::StarLast));
+        assert_eq!(p.click(&v, star, 1), Some(Command::StarLast));
+        // Not a stepper.
+        assert_eq!(p.key(&v, Key::Right), None);
+        assert_eq!(p.wheel(&v, star, 1), None);
+
+        // Once starred, the selection moves off it.
+        v.last_clip.as_mut().unwrap().starred = true;
+        p.fix_selection(&v, 1);
+        assert_eq!(p.selected(&v), Some(Item::Length));
+        assert_eq!(p.click(&v, star, 0), None);
+
+        // Not recording, with a clip to star: it is the first live row.
+        v.recording = false;
+        v.last_clip.as_mut().unwrap().starred = false;
+        assert_eq!(Panel::new(&v).selected(&v), Some(Item::Star));
     }
 
     #[test]

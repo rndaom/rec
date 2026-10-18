@@ -800,6 +800,22 @@ impl Scene<'_> {
                     let value = format!("Last {}", format_seconds(self.view.seconds));
                     text(&value, &self.text.value, row(value_x, size::VALUE));
                 }
+                Item::Star => {
+                    let value = match &self.view.last_clip {
+                        None => "No clip saved yet",
+                        Some(c) if c.starred => "Starred",
+                        Some(c) => &c.name,
+                    };
+                    set(
+                        if enabled {
+                            color::TEXT
+                        } else {
+                            color::DISABLED
+                        },
+                        1.0,
+                    );
+                    text(value, &self.text.path, row(value_x, size::VALUE));
+                }
                 Item::Folder => {
                     set(color::TEXT, 0.85);
                     text(
@@ -828,6 +844,7 @@ impl Scene<'_> {
 fn label(view: &View, item: Item) -> &'static str {
     match item {
         Item::Save => "Save clip",
+        Item::Star => "Star last clip",
         Item::Length => "Clip length",
         Item::Quality => "Quality",
         Item::Audio(i) => view.audio.get(i).map_or("", |a| a.name),

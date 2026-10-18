@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use rec_core::config::{self, CaptureTarget, Config, MAX_REPLAY_SECONDS, Quality, RecordWhen};
 use rec_core::ipc::{PROTOCOL_VERSION, RecorderState, Request, Response, Status};
+use rec_core::store;
 use rec_core::time::{as_secs_f64, qpc_now, secs};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
@@ -47,7 +48,7 @@ use crate::overlay::{self, Overlay};
 use crate::panel::{self, AudioRow, AudioTarget, Command, QualityChoice, View};
 use crate::paths::{self, Stamp};
 use crate::prune;
-use crate::saver::{self, SaveJob};
+use crate::saver::{self, SaveJob, SavedClip};
 use crate::session::{AudioSwitch, Health, Session, Target, default_bitrate_kbps};
 use crate::sidecar::{ClipContext, Trigger};
 use crate::tray::{Look, MenuCommand, Tray, WM_TRAY};
@@ -106,7 +107,7 @@ pub enum Event {
     Foreground(Hwnd),
     Ipc(Request, Sender<Response>),
     Saved {
-        result: Result<PathBuf, String>,
+        result: Result<SavedClip, String>,
         seconds: u32,
         game: String,
         reply: Option<Sender<Response>>,
@@ -323,6 +324,19 @@ struct App {
     error: Option<String>,
     failed: Option<Failure>,
     own_pid: u32,
+    /// The clip saved last in this run, for "star last clip".
+    last_clip: Option<LastClip>,
+}
+
+#[derive(Debug)]
+struct LastClip {
+    path: PathBuf,
+    game: String,
+    /// Starred from here; a star from `rec star` isn't seen, and starring
+    /// again does no harm.
+    starred: bool,
+    /// The sidecar to write when starring, for a clip saved without one.
+    minimal: Option<serde_json::Value>,
 }
 
 impl App {
@@ -366,6 +380,7 @@ impl App {
             error: None,
             failed: None,
             own_pid: detect::own_pid(),
+            last_clip: None,
         }
     }
 
@@ -812,14 +827,20 @@ impl App {
 
     fn saved(
         &mut self,
-        result: Result<PathBuf, String>,
+        result: Result<SavedClip, String>,
         seconds: u32,
         game: &str,
         reply: Option<Sender<Response>>,
     ) {
         let response = match result {
-            Ok(path) => {
+            Ok(SavedClip { path, minimal }) => {
                 info!("saved {}", path.display());
+                self.last_clip = Some(LastClip {
+                    path: path.clone(),
+                    game: game.to_owned(),
+                    starred: false,
+                    minimal,
+                });
                 prune::request(&self.config);
                 self.notify(
                     Kind::Success,
@@ -836,6 +857,33 @@ impl App {
         };
         if let Some(reply) = reply {
             let _ = reply.send(response);
+        }
+    }
+
+    /// Stars the clip saved last in this run, so quota pruning never
+    /// deletes it (`store::set_starred`).
+    fn star_last(&mut self) {
+        let Some(last) = &mut self.last_clip else {
+            self.notify(
+                Kind::Error,
+                "No clip to star",
+                "No clip has been saved since rec started",
+            );
+            return;
+        };
+        match store::set_starred(&last.path, true, last.minimal.clone()) {
+            Ok(()) => {
+                info!("starred {}", last.path.display());
+                last.starred = true;
+                // Written now: a later star only sets the flag again.
+                last.minimal = None;
+                let game = last.game.clone();
+                self.notify(Kind::Info, "Clip starred", &game);
+            }
+            Err(e) => {
+                error!("star failed: {e}");
+                self.notify(Kind::Error, "Couldn't star the clip", &e);
+            }
         }
     }
 
@@ -862,6 +910,7 @@ impl App {
                     Ok(game) => self.notify(Kind::Info, "Marker added", &game),
                     Err(e) => self.notify(Kind::Error, "No marker added", &e),
                 },
+                Some(Action::StarLast) => self.star_last(),
                 None => {}
             },
             Event::Tray(code) => {
@@ -1017,6 +1066,14 @@ impl App {
             audio: self.audio_rows(),
             folder: paths::clips_dir(&self.config).display().to_string(),
             save_hotkey: self.config.hotkeys.save_clip.to_string(),
+            last_clip: self.last_clip.as_ref().map(|c| panel::LastClip {
+                name: c
+                    .path
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                starred: c.starred,
+            }),
         }
     }
 
@@ -1073,6 +1130,10 @@ impl App {
             Command::Save => {
                 self.close_panel(true);
                 self.save(None, None, Trigger::Panel);
+            }
+            Command::StarLast => {
+                self.close_panel(true);
+                self.star_last();
             }
             Command::SetSeconds(seconds) => {
                 self.config.replay.seconds = seconds;
