@@ -51,7 +51,7 @@ pub fn spawn(job: SaveJob, done: impl FnOnce(Result<PathBuf, String>) + Send + '
 }
 
 /// EcoQoS plus background mode: lowest CPU, I/O and memory priority.
-fn lower_priority() {
+pub fn lower_priority() {
     let state = THREAD_POWER_THROTTLING_STATE {
         Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
         ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,

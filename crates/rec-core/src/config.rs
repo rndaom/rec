@@ -195,7 +195,9 @@ pub struct OutputConfig {
     /// Placeholders: `{game}`, `{date}`, `{time}`, `{seconds}`.
     pub filename: String,
     pub container: Container,
-    /// Delete the oldest unstarred clips once the folder exceeds this size.
+    /// Keep rec's clips in the folder under this many GB (as Explorer counts
+    /// them) by deleting the oldest for good. Starred and read-only clips are
+    /// never deleted and don't count. `None` or 0: no limit.
     pub quota_gb: Option<u32>,
     /// Write `<clip>.rec.json` next to each clip: game, timing, audio track
     /// roles, markers and loudness, for AI tools and the library.
@@ -432,6 +434,9 @@ impl Config {
 
         for clip in &mut self.hotkeys.extra_clips {
             clip.seconds = clip.seconds.clamp(MIN_REPLAY_SECONDS, MAX_REPLAY_SECONDS);
+        }
+        if self.output.quota_gb == Some(0) {
+            self.output.quota_gb = None;
         }
         if self.output.filename.trim().is_empty() {
             self.output.filename = OutputConfig::default().filename;
@@ -812,6 +817,24 @@ mod tests {
         assert_eq!(config.replay.post_roll_seconds, 60);
         assert_eq!(config.video.fps, 240);
         assert_eq!(config.audio.bitrate_kbps, 64);
+    }
+
+    #[test]
+    fn zero_quota_means_no_limit() {
+        let config = Config::from_toml(
+            "[output]
+quota_gb = 0
+",
+        )
+        .unwrap();
+        assert_eq!(config.output.quota_gb, None);
+        let config = Config::from_toml(
+            "[output]
+quota_gb = 50
+",
+        )
+        .unwrap();
+        assert_eq!(config.output.quota_gb, Some(50));
     }
 
     #[test]

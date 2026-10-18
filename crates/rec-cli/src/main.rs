@@ -7,11 +7,12 @@ mod mcp;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use rec_core::config;
+use rec_core::config::{self, Config};
 use rec_core::ipc::{self, RecorderState, Request, Response};
+use rec_core::store::{self, BYTES_PER_GB, format_bytes};
 use rec_library::image::Imaging;
 use rec_library::journal::Journal;
-use rec_library::{Library, analysis, digest, sys};
+use rec_library::{Library, analysis, clip, digest, sys};
 
 const USAGE: &str = "\
 rec - control the rec background recorder
@@ -24,6 +25,15 @@ usage:
   rec reload            reload the config file
   rec quit              stop the background service
   rec config            print the config file path
+
+the clips folder:
+  rec star [CLIP]       keep a clip: quota pruning never deletes it. CLIP is a
+                        path, file name or clip id; default the newest clip
+  rec unstar CLIP       let quota pruning delete the clip again
+  rec prune [--dry-run] [--quota GB]
+                        delete the oldest unstarred clips until rec's clips fit
+                        in output.quota_gb (or GB). recd does this after every
+                        save; --dry-run only lists what would go
 
 saved clips, for AI tools:
   rec digest PATH [--out DIR] [--every SECONDS] [--width PX] [--no-analysis] [--no-frames]
@@ -44,8 +54,21 @@ enum Command {
     ConfigPath,
     Send(Request),
     Digest(DigestArgs),
-    Analyze { target: PathBuf, force: bool },
-    Mcp { dirs: Vec<PathBuf> },
+    Analyze {
+        target: PathBuf,
+        force: bool,
+    },
+    Mcp {
+        dirs: Vec<PathBuf>,
+    },
+    Star {
+        clip: Option<String>,
+        starred: bool,
+    },
+    Prune {
+        dry_run: bool,
+        quota_gb: Option<u32>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -90,6 +113,31 @@ fn parse(args: &[String]) -> Result<Command, String> {
                 }
             }
             return Ok(Command::Mcp { dirs });
+        }
+        Some("star") => Command::Star {
+            clip: args.next().map(str::to_owned),
+            starred: true,
+        },
+        Some("unstar") => Command::Star {
+            clip: Some(args.next().ok_or("`rec unstar` needs a clip")?.to_owned()),
+            starred: false,
+        },
+        Some("prune") => {
+            let (mut dry_run, mut quota_gb) = (false, None);
+            while let Some(arg) = args.next() {
+                match arg {
+                    "--dry-run" => dry_run = true,
+                    "--quota" => {
+                        let v = args.next().ok_or("`--quota` needs a number of GB")?;
+                        quota_gb = match v.parse::<u32>() {
+                            Ok(n) if n > 0 => Some(n),
+                            _ => return Err(format!("`--quota {v}`: give a whole number of GB")),
+                        };
+                    }
+                    other => return Err(format!("unexpected argument `{other}`")),
+                }
+            }
+            return Ok(Command::Prune { dry_run, quota_gb });
         }
         Some("config") => Command::ConfigPath,
         Some("status") => Command::Send(Request::Status),
@@ -262,6 +310,132 @@ fn run_analyze(target: &Path, force: bool) -> ExitCode {
     }
 }
 
+fn run_star(key: Option<&str>, starred: bool) -> ExitCode {
+    // A path names the clip directly; anything else is looked up in the
+    // clips folder.
+    let root = match key {
+        Some(k) if Path::new(k).is_file() => PathBuf::from(k),
+        _ => sys::clips_dir(),
+    };
+    let mut library = Library::scan(std::slice::from_ref(&root), &Journal::default_dir());
+    let found = match key {
+        Some(k) => library.position(k),
+        None => newest(&library),
+    };
+    let Some(i) = found else {
+        match key {
+            Some(k) => eprintln!("rec: no clip `{k}` in {}", root.display()),
+            None => eprintln!("rec: no rec clips in {}", root.display()),
+        }
+        return ExitCode::FAILURE;
+    };
+    let target = &mut library.clips[i];
+    if let Err(e) = clip::set_starred(target, starred) {
+        eprintln!("rec: {e}");
+        return ExitCode::FAILURE;
+    }
+    let name = target.video.as_deref().unwrap_or(Path::new(&target.file));
+    let verb = if starred { "starred" } else { "unstarred" };
+    println!("{verb}: {}", name.display());
+    ExitCode::SUCCESS
+}
+
+/// The most recently saved clip, by the video's modified time.
+fn newest(library: &Library) -> Option<usize> {
+    (library.clips.iter().enumerate())
+        .filter_map(|(i, c)| {
+            let modified = std::fs::metadata(c.video.as_deref()?)
+                .ok()?
+                .modified()
+                .ok()?;
+            Some((modified, i))
+        })
+        .max()
+        .map(|(_, i)| i)
+}
+
+fn run_prune(dry_run: bool, quota_gb: Option<u32>) -> ExitCode {
+    let configured = || {
+        Config::load(&config::default_config_path())
+            .ok()
+            .and_then(|c| c.output.quota_gb)
+    };
+    let Some(gb) = quota_gb.or_else(configured) else {
+        eprintln!("rec: no quota: set output.quota_gb in the config file, or pass --quota GB");
+        return ExitCode::FAILURE;
+    };
+    let quota = u64::from(gb) * BYTES_PER_GB;
+    let root = sys::clips_dir();
+    let pruned = store::prune(&root, &Journal::default_dir(), quota, dry_run);
+    for problem in &pruned.problems {
+        eprintln!("kept, sidecar unreadable: {problem}");
+    }
+    let plan = &pruned.plan;
+    let gone = if dry_run {
+        &plan.delete
+    } else {
+        &pruned.deleted
+    };
+    let verb = if dry_run { "would delete" } else { "deleted" };
+    for clip in gone {
+        println!(
+            "{verb} {} ({})",
+            clip.video.display(),
+            format_bytes(clip.bytes)
+        );
+    }
+    for (video, e) in &pruned.failed {
+        eprintln!("couldn't delete {}: {e}", video.display());
+    }
+    if pruned.quick {
+        println!(
+            "{}: every video together fits in {}, nothing to delete",
+            root.display(),
+            format_bytes(quota)
+        );
+        return ExitCode::SUCCESS;
+    }
+    let freed: u64 = gone.iter().map(|c| c.bytes).sum();
+    let left = plan.used - freed;
+    println!(
+        "{}: rec's clips use {} of {}",
+        root.display(),
+        format_bytes(plan.used),
+        format_bytes(quota)
+    );
+    if !gone.is_empty() {
+        let then = if dry_run { "would use" } else { "now use" };
+        println!("they {then} {}", format_bytes(left));
+    }
+    if plan.kept_clips > 0 {
+        let clips = |n: usize| if n == 1 { "clip" } else { "clips" };
+        let why = if plan.starred == plan.kept_clips {
+            "starred".to_string()
+        } else {
+            format!(
+                "{} starred, the rest read-only or with an unreadable sidecar",
+                plan.starred
+            )
+        };
+        println!(
+            "kept, not counted: {} {}, {} ({why})",
+            plan.kept_clips,
+            clips(plan.kept_clips),
+            format_bytes(plan.kept)
+        );
+    }
+    if left > quota {
+        println!(
+            "the rest are too new to delete: the newest clip and clips saved in the last few minutes"
+        );
+    }
+    if pruned.failed.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn report(response: Response) -> ExitCode {
     match response {
         Response::Ok => println!("ok"),
@@ -320,6 +494,8 @@ fn main() -> ExitCode {
         }
         Ok(Command::Digest(args)) => run_digest(args),
         Ok(Command::Analyze { target, force }) => run_analyze(&target, force),
+        Ok(Command::Star { clip, starred }) => run_star(clip.as_deref(), starred),
+        Ok(Command::Prune { dry_run, quota_gb }) => run_prune(dry_run, quota_gb),
         Ok(Command::Mcp { dirs }) => {
             let dirs = if dirs.is_empty() {
                 vec![sys::clips_dir()]
@@ -429,5 +605,54 @@ mod tests {
             })
         );
         assert!(parse_str("mcp --dir").is_err());
+    }
+
+    #[test]
+    fn parses_store_commands() {
+        assert_eq!(
+            parse_str("star"),
+            Ok(Command::Star {
+                clip: None,
+                starred: true
+            })
+        );
+        assert_eq!(
+            parse_str("star 01JABC"),
+            Ok(Command::Star {
+                clip: Some("01JABC".into()),
+                starred: true
+            })
+        );
+        assert_eq!(
+            parse_str("unstar a.mp4"),
+            Ok(Command::Star {
+                clip: Some("a.mp4".into()),
+                starred: false
+            })
+        );
+        assert_eq!(
+            parse_str("prune"),
+            Ok(Command::Prune {
+                dry_run: false,
+                quota_gb: None
+            })
+        );
+        assert_eq!(
+            parse_str("prune --quota 20 --dry-run"),
+            Ok(Command::Prune {
+                dry_run: true,
+                quota_gb: Some(20)
+            })
+        );
+        for bad in [
+            "unstar",
+            "star a b",
+            "prune --quota",
+            "prune --quota 0",
+            "prune --quota 1.5",
+            "prune now",
+        ] {
+            assert!(parse_str(bad).is_err(), "{bad}");
+        }
     }
 }

@@ -343,20 +343,21 @@ pub fn analyze(clip: &Clip, imaging: &Imaging) -> Result<Clip, String> {
 
 /// Writes an analysed clip's sidecar, replacing the old file in one step.
 /// Clips without a sidecar keep the analysis in memory only: rec doesn't
-/// create one against `output.sidecar = false`.
+/// create one against `output.sidecar = false`. The star is taken from the
+/// file on disk, so starring a clip while it was being analysed sticks.
 pub fn save(clip: &Clip) -> Result<(), String> {
     let Some(path) = &clip.sidecar else {
         return Ok(());
     };
-    let mut text = serde_json::to_string_pretty(&clip.raw).map_err(|e| e.to_string())?;
-    text = compact_number_arrays(&text);
-    text.push('\n');
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("can't write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("can't replace {}: {e}", path.display())
-    })
+    let mut raw = clip.raw.clone();
+    let on_disk = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|v| v.get("starred").cloned());
+    if let Some(starred) = on_disk {
+        raw["starred"] = starred;
+    }
+    crate::clip::write_sidecar(path, &raw)
 }
 
 /// `<clip>.rec\thumb.jpg`; returns its time and path relative to the clip.

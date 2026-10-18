@@ -280,6 +280,7 @@ fn index_entry(
         "game": clip.game.name,
         "start_utc": clip.start_utc.map(format_utc),
         "duration": round3(clip.duration),
+        "starred": clip.starred,
         "session": clip.session,
         "session_range": clip.session_range().map(|(_, a, b)| json!([round3(a), round3(b)])),
         "session_position": position.map(|(n, of)| json!([n, of])),

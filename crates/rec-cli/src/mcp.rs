@@ -159,6 +159,7 @@ impl Server {
         let since = time_arg(args, "since")?;
         let until = time_arg(args, "until")?;
         let has_event = args["has_event"].as_str();
+        let starred_only = args["starred"].as_bool() == Some(true);
         let limit = args["limit"].as_u64().unwrap_or(50).clamp(1, 500) as usize;
         let oldest_first = args["order"].as_str() == Some("oldest");
         let groups = overlap::groups(&self.library.clips);
@@ -169,6 +170,9 @@ impl Server {
                 && !clip.game.name.to_lowercase().contains(g.as_str())
                 && !clip.game.exe.to_lowercase().contains(g.as_str())
             {
+                continue;
+            }
+            if starred_only && !clip.starred {
                 continue;
             }
             let start = clip.start_utc;
@@ -196,6 +200,7 @@ impl Server {
                 "start_utc": start.map(format_utc),
                 "local_time": start.zip(clip.utc_offset_min).map(|(t, off)| format_local(t, off)),
                 "duration": round3(clip.duration),
+                "starred": clip.starred,
                 "session": clip.session,
                 "session_range": clip.session_range().map(|(_, a, b)| json!([round3(a), round3(b)])),
                 "events": counts,
@@ -460,12 +465,13 @@ fn tools() -> Vec<Value> {
     vec![
         json!({
             "name": "list_clips",
-            "description": "List saved clips with game, time, length, session range, event counts and overlap group. Filters combine.",
+            "description": "List saved clips with game, time, length, starred flag, session range, event counts and overlap group. Filters combine.",
             "inputSchema": { "type": "object", "properties": {
                 "game": { "type": "string", "description": "Part of the game name or exe, any case." },
                 "since": { "type": "string", "description": "Clips that start at or after this date or UTC time (2026-10-17 or 2026-10-17T21:00:00Z)." },
                 "until": { "type": "string", "description": "Clips that start before this date or UTC time." },
                 "has_event": { "type": "string", "description": "Only clips with an event of this kind: marker, loud, cut, kill, …" },
+                "starred": { "type": "boolean", "description": "true: only clips the user starred (their keepers)." },
                 "order": { "type": "string", "enum": ["newest", "oldest"], "description": "Default newest first." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Default 50." }
             } }

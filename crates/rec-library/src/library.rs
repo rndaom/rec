@@ -7,11 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::clip::{Clip, Event, VIDEO_EXTENSIONS, sidecar_stem};
-use crate::journal::Journal;
+pub use rec_core::store::DIGEST_DIR;
+use rec_core::store::{classify, path_key as key, walk};
 
-/// Name of the folder `rec digest` writes to by default.
-pub const DIGEST_DIR: &str = "rec-digest";
+use crate::clip::{Clip, Event, sidecar_stem};
+use crate::journal::Journal;
 
 #[derive(Debug, Default)]
 pub struct Library {
@@ -186,47 +186,6 @@ fn fill_from_journal(clip: &mut Clip, journal: &Journal) {
     }
 }
 
-fn walk(dir: &Path, sidecars: &mut Vec<PathBuf>, videos: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name != DIGEST_DIR && !name.ends_with(".rec") && !name.starts_with('.') {
-                walk(&path, sidecars, videos);
-            }
-        } else if kind.is_file() {
-            classify(&path, sidecars, videos);
-        }
-    }
-}
-
-fn classify(path: &Path, sidecars: &mut Vec<PathBuf>, videos: &mut Vec<PathBuf>) {
-    if sidecar_stem(path).is_some() {
-        sidecars.push(path.to_owned());
-    } else if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-    {
-        videos.push(path.to_owned());
-    }
-}
-
-/// Windows paths compare without regard to case or slash direction.
-fn key(path: &Path) -> String {
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
-    absolute.to_string_lossy().replace('/', "\\").to_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +253,100 @@ mod tests {
         assert_eq!(library.find("01TEST").unwrap().id, a.id);
         assert!(library.find("01").is_none(), "too short a prefix");
         assert!(library.find("").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn starring_is_kept_in_the_sidecar() {
+        use rec_core::store::{Files, Keep};
+
+        let dir = temp("star");
+        let clips = dir.join("clips");
+        std::fs::create_dir_all(&clips).unwrap();
+        std::fs::write(clips.join("a.mp4"), b"video").unwrap();
+        std::fs::write(clips.join("a.rec.json"), sample().to_string()).unwrap();
+        std::fs::write(clips.join("b.mp4"), b"video").unwrap();
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let b = clips.join("b.mp4").to_string_lossy().replace('\\', "\\\\");
+        std::fs::write(
+            sessions.join("01S.jsonl"),
+            format!(
+                "{{\"type\":\"start\",\"session\":\"01S\",\"game\":\"Team Fortress 2\",\"exe\":\"tf_win64.exe\",\"utc\":\"2026-10-18T02:00:00Z\"}}\n\
+                 {{\"type\":\"clip\",\"clip\":\"01JOURNALONLY\",\"file\":\"{b}\",\"from\":10.0,\"to\":40.0}}\n"
+            ),
+        )
+        .unwrap();
+        let scan = || Library::scan(std::slice::from_ref(&clips), &sessions);
+        let keeps = || {
+            let (mut found, _) = Files::walk(&clips).clips(&sessions);
+            found.sort_by(|x, y| x.video.cmp(&y.video));
+            found.into_iter().map(|c| c.keep).collect::<Vec<_>>()
+        };
+        let mut library = scan();
+        let stale = library.find("a.mp4").unwrap().clone();
+        assert!(!stale.starred);
+        assert_eq!(keeps(), [None, None]);
+
+        // A clip with a sidecar: the flag is added, the rest kept.
+        let i = library.position("a.mp4").unwrap();
+        crate::clip::set_starred(&mut library.clips[i], true).unwrap();
+        let text = std::fs::read_to_string(clips.join("a.rec.json")).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["starred"], true);
+        assert_eq!(raw["future_field"]["kept"], true);
+
+        // Saving analysis from a copy loaded before the star keeps it.
+        crate::analysis::save(&stale).unwrap();
+        assert!(scan().find("a.mp4").unwrap().starred);
+
+        // A journal-only clip gets a sidecar built from the journal, which
+        // the library still reads with the session's game.
+        let i = library.position("b.mp4").unwrap();
+        crate::clip::set_starred(&mut library.clips[i], true).unwrap();
+        assert!(clips.join("b.rec.json").is_file());
+        let library = scan();
+        let b = library.find("01JOURNALONLY").unwrap();
+        assert!(b.starred);
+        assert_eq!(b.source, Source::Sidecar);
+        assert_eq!(b.game.name, "Team Fortress 2");
+        assert!(b.raw.get("source").is_none());
+        assert_eq!(keeps(), [Some(Keep::Starred), Some(Keep::Starred)]);
+
+        // Unstarring.
+        let mut library = scan();
+        let i = library.position("b.mp4").unwrap();
+        crate::clip::set_starred(&mut library.clips[i], false).unwrap();
+        assert_eq!(keeps(), [Some(Keep::Starred), None]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unstarring_a_journal_only_clip_writes_nothing() {
+        let dir = temp("unstar");
+        let video = dir.join("c.mp4");
+        std::fs::write(&video, b"video").unwrap();
+        let mut clip = Clip::from_journal(
+            "01C",
+            &video,
+            "01S",
+            0.0,
+            10.0,
+            None,
+            Default::default(),
+            None,
+            None,
+            Vec::new(),
+        );
+        crate::clip::set_starred(&mut clip, false).unwrap();
+        assert!(!crate::clip::sidecar_for(&video).exists());
+        // A file in the sidecar's place that isn't one is never replaced.
+        std::fs::write(crate::clip::sidecar_for(&video), "{").unwrap();
+        assert!(crate::clip::set_starred(&mut clip, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(crate::clip::sidecar_for(&video)).unwrap(),
+            "{"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

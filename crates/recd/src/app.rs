@@ -46,6 +46,7 @@ use crate::log::{error, info, warning};
 use crate::overlay::{self, Overlay};
 use crate::panel::{self, AudioRow, AudioTarget, Command, QualityChoice, View};
 use crate::paths::{self, Stamp};
+use crate::prune;
 use crate::saver::{self, SaveJob};
 use crate::session::{AudioSwitch, Health, Session, Target, default_bitrate_kbps};
 use crate::sidecar::{ClipContext, Trigger};
@@ -400,6 +401,7 @@ impl App {
         }
         self.kick();
         self.refresh();
+        prune::request(&self.config);
     }
 
     fn shutdown(&mut self) {
@@ -724,6 +726,7 @@ impl App {
             self.kick();
         }
         info!("settings reloaded");
+        prune::request(&self.config);
         self.refresh();
         Ok(())
     }
@@ -817,6 +820,7 @@ impl App {
         let response = match result {
             Ok(path) => {
                 info!("saved {}", path.display());
+                prune::request(&self.config);
                 self.notify(
                     Kind::Success,
                     "Clip saved",
@@ -1143,6 +1147,7 @@ impl App {
         };
         info!("clips folder set to {}", path.display());
         self.config.output.directory = Some(path.clone());
+        prune::request(&self.config);
         if self.persist(&["output.directory"]) {
             self.notify(
                 Kind::Info,

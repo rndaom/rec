@@ -17,6 +17,7 @@ mod mux;
 mod overlay;
 mod panel;
 mod paths;
+mod prune;
 mod recover;
 mod saver;
 mod session;

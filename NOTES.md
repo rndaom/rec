@@ -6,11 +6,11 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 
 **Read first:** [docs/decisions.md](docs/decisions.md) (the why), [docs/roadmap.md](docs/roadmap.md) (the what), [docs/research.md](docs/research.md) (the evidence).
 
-**Status (2026-10-17):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio, exclusive-fullscreen detection, pipeline recovery, the quick panel, HDR, AV1, the AMD AMF backend and AI-ready clips phases A and B done.
+**Status (2026-10-18):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio, exclusive-fullscreen detection, pipeline recovery, the quick panel, HDR, AV1, the AMD AMF backend, AI-ready clips phases A and B, and the storage quota done.
 
 | Crate | Role |
 |---|---|
-| `rec-core` | Config, hotkeys, IPC, replay buffer, media types, QPC clock |
+| `rec-core` | Config, hotkeys, IPC, replay buffer, media types, QPC clock, the clips folder (`store`: rec clips, stars, quota pruning) |
 | `rec-video` | WGC → D3D11 NV12/P010 (video processor or HDR shaders) → AMF or MF hardware encoder |
 | `rec-audio` | WASAPI → AAC |
 | `rec-mux` | Fragmented MP4 |
@@ -28,7 +28,8 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 6. ~~HDR~~ (done: HDR10 or tone-map, decision D12)
 7. ~~Native encoders + AV1~~ (AV1 and AMD AMF done; NVENC and oneVPL need NVIDIA / Intel hardware)
 8. ~~AI-ready clips phase A~~ (done: `<clip>.rec.json` sidecar, marker hotkey and `rec mark`, session journal, loudness curves; see [docs/ai-clips.md](docs/ai-clips.md)). The marker hotkey has no default: set `hotkeys.add_marker`. Phase B is done too: `rec digest`, `rec analyze`, `rec mcp` and layer 2 analysis (thumbnail, scene cuts, brightness, motion, loud moments). Phases C and D (transcripts, game sources) are proposals.
-9. Remaining M2 items: per-game profiles, extra clip-length hotkeys, controller combo, storage quota with auto-prune, Win10 DDA fallback, adaptive GPU priority
+9. ~~Storage quota with auto-prune~~ (done: `output.quota_gb`, `rec star` / `unstar` / `prune`, decision D13; `recd/src/prune.rs`, `rec-core/src/store.rs`)
+10. Remaining M2 items: per-game profiles, extra clip-length hotkeys, controller combo, Win10 DDA fallback, adaptive GPU priority
 
 **Things learned**
 - Video:
@@ -69,6 +70,10 @@ Handoff file so any session can pick up quickly. Keep it short and current.
   - Scene cuts compare colour (grid of mean RGB plus a colour histogram), not luma: `fake_game`'s blue and red frames have equal brightness.
   - Real game footage, HDR10, AV1 and non-silent audio are still unverified for analysis; see [docs/ai-clips.md](docs/ai-clips.md#phase-b-as-built).
   - `cargo test -p rec-library decode -- --ignored` with `REC_TEST_CLIP=<clip.mp4>` decodes a real clip. Claude Code: `claude mcp add rec -- rec mcp`.
+- Storage quota:
+  - Verified with a throwaway `APPDATA`/`LOCALAPPDATA` and 400 MB stand-in files (`SetLength`, never decoded): `rec star`, `rec prune --dry-run`, `rec prune`, and recd's startup prune all deleted only the oldest unstarred rec clip (with its sidecar and `<clip>.rec` folder), keeping starred, read-only and non-rec videos. The prune after a real save runs the same `prune::request` but wasn't run live: a sandboxed recd records whatever game is in the foreground.
+  - Starring lives in the sidecar, so a journal-only clip gets a sidecar when starred. `analysis::save` re-reads `starred` from disk because `rec mcp` holds clips in memory for a long time.
+  - Ideas not done: a star button in the quick panel or a "star last clip" hotkey, a low-disk warning, pruning folders the clips used to be saved to.
 - Logs: `%LOCALAPPDATA%\rec\recd.log`. Config: `%APPDATA%\rec\config.toml`.
 - Testing: set `REC_DEBUG_CAPTURE_UI=1` to make toasts visible in screenshots.
 

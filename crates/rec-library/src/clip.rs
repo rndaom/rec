@@ -17,8 +17,7 @@ pub const SIDECAR_VERSION: u64 = 1;
 /// Loudness samples per second when the file doesn't say.
 pub const DEFAULT_HZ: u32 = 10;
 
-/// Video file extensions a sidecar can sit next to.
-pub const VIDEO_EXTENSIONS: [&str; 3] = ["mp4", "mkv", "mov"];
+pub use rec_core::store::{VIDEO_EXTENSIONS, sidecar_for, sidecar_stem, video_for};
 
 /// Where a clip's facts came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +96,8 @@ pub struct Clip {
     pub events: Vec<Event>,
     /// The sidecar's `analysis` object, once layer 2 has run.
     pub analysis: Option<Value>,
+    /// Kept by quota pruning (`rec star`).
+    pub starred: bool,
     /// The whole file as read (or, for journal-only clips, as built).
     pub raw: Value,
 }
@@ -187,6 +188,7 @@ impl Clip {
                 .map_or(DEFAULT_HZ, |hz| hz as u32),
             events,
             analysis: raw.get("analysis").filter(|a| a.is_object()).cloned(),
+            starred: raw["starred"].as_bool().unwrap_or(false),
             raw,
         })
     }
@@ -256,6 +258,7 @@ impl Clip {
             hz: DEFAULT_HZ,
             events: markers,
             analysis: None,
+            starred: false,
             raw,
         }
     }
@@ -319,32 +322,62 @@ impl Event {
     }
 }
 
-/// `<clip>.rec.json` for `clip.mp4`.
-pub fn sidecar_for(video: &Path) -> PathBuf {
-    video.with_extension("rec.json")
-}
-
-/// The stem shared by a sidecar and its video: `a.rec.json` → `a`.
-pub fn sidecar_stem(sidecar: &Path) -> Option<String> {
-    let name = sidecar.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".rec.json")?;
-    (!stem.is_empty()).then(|| stem.to_owned())
-}
-
-/// The video a sidecar describes: same stem (the user may have renamed
-/// both), else `clip.file` in the same folder.
-pub fn video_for(sidecar: &Path, file: &str) -> Option<PathBuf> {
-    let dir = sidecar.parent()?;
-    if let Some(stem) = sidecar_stem(sidecar) {
-        for ext in VIDEO_EXTENSIONS {
-            let path = dir.join(format!("{stem}.{ext}"));
-            if path.is_file() {
-                return Some(path);
+/// Stars or unstars a clip; quota pruning never deletes a starred clip. The
+/// star is kept in the sidecar, read afresh so nothing written since the
+/// clip was loaded (analysis) is lost. A clip known only from the journal
+/// gets a sidecar built from it: the star has to be kept somewhere.
+pub fn set_starred(clip: &mut Clip, starred: bool) -> Result<(), String> {
+    let (path, mut raw) = match &clip.sidecar {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("can't read {}: {e}", path.display()))?;
+            let raw: Value = serde_json::from_str(&text)
+                .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+            if !raw.is_object() || raw.get("rec").is_none() {
+                return Err(format!("{} is not a rec sidecar", path.display()));
             }
+            (path.clone(), raw)
         }
-    }
-    let named = dir.join(file);
-    (!file.is_empty() && named.is_file()).then_some(named)
+        None if !starred => {
+            clip.starred = false;
+            return Ok(());
+        }
+        None => {
+            let video = (clip.video.as_deref()).ok_or("the clip's video is missing")?;
+            let path = sidecar_for(video);
+            if path.exists() {
+                return Err(format!(
+                    "{} exists but isn't a readable rec sidecar",
+                    path.display()
+                ));
+            }
+            let mut raw = clip.raw.clone();
+            if let Some(fields) = raw.as_object_mut() {
+                fields.shift_remove("source");
+            }
+            (path, raw)
+        }
+    };
+    raw["starred"] = starred.into();
+    write_sidecar(&path, &raw)?;
+    clip.raw = raw;
+    clip.starred = starred;
+    clip.sidecar = Some(path);
+    clip.source = Source::Sidecar;
+    Ok(())
+}
+
+/// Writes a sidecar, replacing the old file in one step.
+pub fn write_sidecar(path: &Path, raw: &Value) -> Result<(), String> {
+    let mut text = serde_json::to_string_pretty(raw).map_err(|e| e.to_string())?;
+    text = crate::analysis::compact_number_arrays(&text);
+    text.push('\n');
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("can't write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("can't replace {}: {e}", path.display())
+    })
 }
 
 fn str_of(v: &Value) -> Option<String> {

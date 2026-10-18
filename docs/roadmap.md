@@ -56,7 +56,7 @@ Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a liv
 - [x] Quick-panel overlay (DirectComposition, excluded from capture), keyboard and mouse navigation
 - [ ] Per-game profiles; extra clip-length hotkeys in the UI; controller combo
 - [x] Marker hotkey and `rec mark`; AI-ready clips phase A: `<clip>.rec.json` sidecar, game-session journal, per-track loudness curves ([ai-clips.md](ai-clips.md))
-- [ ] Storage quota with auto-prune (starred clips kept)
+- [x] Storage quota with auto-prune (starred and read-only clips kept); `rec star`, `rec unstar`, `rec prune` (D13)
 - [ ] Windows 10 path: DDA fallback (monitor capture without the yellow border)
 - [x] Exclusive-fullscreen black-frame detection with a "switch to borderless" hint
 - [x] Hybrid-GPU handling; device-lost / driver-update / resolution-change recovery without losing the buffer (`recd/src/recover.rs`; the GPU-switch path is not yet tested on a hybrid laptop)

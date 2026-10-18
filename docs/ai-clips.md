@@ -179,6 +179,7 @@ What phase A writes differs from the sketch above in a few places:
 - **`clip.trigger`** is `hotkey`, `panel`, `tray` or `cli`.
 - **Events** from recd are only markers: `{ "t", "kind": "marker", "src": "hotkey" | "cli", "conf": 1 }`. `rec analyze` adds `cut` and `loud` events.
 - **`time.utc_offset_min`** sits next to `start_utc` (which is UTC, with a `Z`).
+- **`starred`** (top level, boolean) is set by `rec star` and `rec unstar`, not by recd. Quota pruning never deletes a starred clip (D13). Starring a clip that has no sidecar writes one, built from its journal line. `rec analyze` keeps the flag from the file on disk, so starring during analysis sticks.
 
 `output.sidecar = false` turns the file off. The journal is written either way.
 
@@ -207,17 +208,17 @@ Three `rec` commands. The `rec-library` crate does the work, and nothing of it r
 
 Without `--out`, bundles go to `rec-digest\<clip name>\` next to the clips. A folder is searched recursively, skipping `rec-digest` and `*.rec` folders, and `index.json` lists every clip with:
 - its id, file (relative, with `/`), bundle and `source` (`sidecar` or `journal`);
-- game, `start_utc`, duration, session, `session_range` and `session_position` (`[n, of]` from the journal);
+- game, `start_utc`, duration, `starred`, session, `session_range` and `session_position` (`[n, of]` from the journal);
 - event counts, thumbnail, `overlap_group` and its overlaps.
 
 `groups` lists each overlap group with its session span and clip ids. A single clip is digested with its folder as context, so its overlaps and session position still show. Analysis runs first on clips that don't have it yet (`--no-analysis` skips it).
 
-Clips saved with `output.sidecar = false` are found through the session journal. They get their id, range, game, start time and markers, but no audio or video facts, and rec writes nothing next to them.
+Clips saved with `output.sidecar = false` are found through the session journal. They get their id, range, game, start time and markers, but no audio or video facts, and rec writes nothing next to them unless one is starred.
 
 **`rec analyze <clip|folder> [--force]`** runs layer 2 on clips that have a sidecar and stores the result in it (see [Phase B as built](#phase-b-as-built)).
 
 **`rec mcp [--dir DIR]...`** is a local MCP server on stdin and stdout: JSON-RPC 2.0, one message per line, protocol versions 2025-06-18, 2025-03-26 and 2024-11-05. By default it serves the clips folder from the config (`output.directory`, else `Videos\rec`) and the session journals. It rescans on every call, without re-reading unchanged sidecars, so new clips show up while it runs. Tools:
-- `list_clips(game?, since?, until?, has_event?, order?, limit?)`: newest first by default. `has_event` also matches loud moments derived from the curves.
+- `list_clips(game?, since?, until?, has_event?, starred?, order?, limit?)`: newest first by default. `has_event` also matches loud moments derived from the curves. `starred: true` lists only the clips the user starred.
 - `clip(id)`: the sidecar plus file paths, overlaps and session position. Loudness curves are summarised (median and peak).
 - `timeline(id)`: entries with `t`, `clock`, `kind`, `src`, `conf`, a plain-language `note`, and `dur` and `look_at` (the peak) for loud stretches, plus the picture summary.
 - `frames(id, times[], width?)`: up to 8 JPEG images per call, 768 px wide by default, decoded on demand. The decoder stays open between calls, so stepping through one clip is quick.
