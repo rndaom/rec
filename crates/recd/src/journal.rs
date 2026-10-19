@@ -22,6 +22,7 @@ use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
 
 use crate::log::warning;
 use crate::session::Target;
+use crate::sidecar::ClipProfile;
 
 /// Markers older than this can't be in any clip and are dropped.
 const MARKER_HISTORY: Hns = secs(MAX_REPLAY_SECONDS as i64 + 60);
@@ -132,8 +133,14 @@ pub struct GameSession {
 }
 
 impl GameSession {
-    /// Starts a session for `target` and writes its first journal line.
-    pub fn start(target: &Target, data_dir: &Path) -> Self {
+    /// Starts a session for `target` and writes its first journal line, with
+    /// the game's Steam app id ([`steam_appid`]) and profile.
+    pub fn start(
+        target: &Target,
+        data_dir: &Path,
+        steam_appid: Option<u32>,
+        profile: Option<&ClipProfile>,
+    ) -> Self {
         let dir = data_dir.join("sessions");
         let id = new_id();
         let journal = match std::fs::create_dir_all(&dir) {
@@ -147,7 +154,7 @@ impl GameSession {
             id,
             game: target.game.clone(),
             exe_name: target.exe_name.clone(),
-            steam_appid: steam_appid(&target.exe_path),
+            steam_appid,
             start: qpc_now(),
             journal,
             markers: Mutex::new(Vec::new()),
@@ -158,6 +165,8 @@ impl GameSession {
             "game": info.game,
             "exe": info.exe_name,
             "steam_appid": info.steam_appid,
+            "profile": profile.map(|p| &p.id),
+            "player_names": profile.map_or(&[][..], |p| &p.player_names),
             "utc_offset_min": utc_offset_minutes(),
         }));
         Self {

@@ -142,6 +142,18 @@ fn facts(md: &mut String, clip: &Clip, extras: &Extras) {
         (true, None) => {}
     }
     let _ = writeln!(md, "- **Game:** {what}");
+    if !game.player_names.is_empty() {
+        let names: Vec<String> = game.player_names.iter().map(|n| format!("`{n}`")).collect();
+        let from = game
+            .profile
+            .as_ref()
+            .map_or_else(String::new, |p| format!(" `{p}`"));
+        let _ = writeln!(
+            md,
+            "- **Player:** {} (the player's names in this game, from the rec profile{from})",
+            names.join(", ")
+        );
+    }
     if let Some(start) = clip.start_utc {
         let local = clip
             .utc_offset_min
@@ -346,5 +358,14 @@ mod tests {
         }
         // The empty microphone curve is not described.
         assert!(!md.contains("Microphone (mic):"), "{md}");
+        // No profile naming the player: no player line.
+        assert!(!md.contains("**Player:**"), "{md}");
+
+        let mut raw = sample();
+        raw["game"]["profile"] = serde_json::json!("tf2");
+        raw["player"] = serde_json::json!({ "names": ["RNDAOM", "rnd"] });
+        let md = render(&Clip::from_value(raw).unwrap(), &entries, &extras);
+        let want = "- **Player:** `RNDAOM`, `rnd` (the player's names in this game, from the rec profile `tf2`)";
+        assert!(md.contains(want), "missing {want:?} in\n{md}");
     }
 }

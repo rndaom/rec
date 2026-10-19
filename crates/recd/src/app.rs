@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use rec_core::config::{self, CaptureTarget, Config, MAX_REPLAY_SECONDS, Quality, RecordWhen};
 use rec_core::ipc::{PROTOCOL_VERSION, RecorderState, Request, Response, Status};
+use rec_core::profile::{self, Profile, Profiles};
 use rec_core::store;
 use rec_core::time::{as_secs_f64, qpc_now, secs};
 use windows::Win32::Foundation::{
@@ -43,15 +44,15 @@ use crate::detect;
 use crate::feedback::{self, Kind, Toast};
 use crate::hotkeys::{Action, Hotkeys};
 use crate::ipc_server::IpcServer;
-use crate::journal::{GameSession, MarkSource};
+use crate::journal::{self, GameSession, MarkSource};
 use crate::log::{error, info, warning};
 use crate::overlay::{self, Overlay};
-use crate::panel::{self, AudioRow, AudioTarget, Command, QualityChoice, View};
+use crate::panel::{self, AudioRow, AudioTarget, Command, ProfileScope, QualityChoice, View};
 use crate::paths::{self, Stamp};
 use crate::prune;
 use crate::saver::{self, SaveJob, SavedClip};
 use crate::session::{AudioSwitch, Health, Session, Target, default_bitrate_kbps};
-use crate::sidecar::{ClipContext, Trigger};
+use crate::sidecar::{ClipContext, ClipProfile, Trigger};
 use crate::tray::{Look, MenuCommand, Tray, WM_TRAY};
 use crate::win::{Hwnd, wide};
 
@@ -66,6 +67,24 @@ const PANEL_REFRESH_MS: u32 = 500;
 const TOAST_MS: u32 = 2500;
 /// Don't retry a target that failed to start more often than this.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// The settings the quick panel changes. "Settings for" saves all of them
+/// to the game's profile, or takes them all out of it.
+const PANEL_KEYS: [&str; 7] = [
+    "replay.seconds",
+    "video.quality",
+    "video.bitrate_kbps",
+    "audio.game",
+    "audio.voice_chat",
+    "audio.microphone",
+    "audio.other_apps",
+];
+
+/// Whether the panel's settings are the game's own: its profile sets any
+/// of them. Changes in the panel are then saved to the profile.
+fn own_settings(profile: &Profile) -> bool {
+    PANEL_KEYS.iter().any(|key| profile.sets(key))
+}
 
 /// Retry delays after consecutive failures to start on the same target.
 /// Games often create their window and then switch it to fullscreen; a
@@ -306,7 +325,14 @@ enum Flow {
 struct App {
     hwnd: Hwnd,
     events: Events,
+    /// The settings in effect: `global` with the recorded game's profile
+    /// applied over it.
     config: Config,
+    /// The config file's settings, which every game starts from.
+    global: Config,
+    /// The profile of the game being recorded (kept while paused), if any
+    /// (decision D16, `rec_core::profile`).
+    profile: Option<Profile>,
     config_path: PathBuf,
     /// Problem with the settings file, shown until fixed.
     config_error: Option<String>,
@@ -376,7 +402,9 @@ impl App {
         Self {
             hwnd,
             events,
+            global: config.clone(),
             config,
+            profile: None,
             config_path,
             config_error,
             first_run,
@@ -594,18 +622,167 @@ impl App {
     }
 
     /// Continues the game session if `target` is the same game run, otherwise
-    /// ends it and starts a new one.
+    /// ends it and starts a new one. Either way the game's profile is read
+    /// again and applied, so edits to it count from here.
     fn enter_game_session(&mut self, target: &Target) {
-        if (self.game_session.as_ref()).is_some_and(|g| g.continues(target)) {
-            return;
+        let continues = (self.game_session.as_ref()).is_some_and(|g| g.continues(target));
+        if !continues {
+            self.end_game_session("another game started");
         }
-        self.end_game_session("another game started");
-        self.game_session = Some(GameSession::start(target, &paths::data_dir()));
+        let steam_appid = match &self.game_session {
+            Some(game) => game.info().steam_appid,
+            None => journal::steam_appid(&target.exe_path),
+        };
+        self.use_profile(target, steam_appid);
+        if !continues {
+            self.game_session = Some(GameSession::start(
+                target,
+                &paths::data_dir(),
+                steam_appid,
+                self.clip_profile().as_ref(),
+            ));
+        }
     }
 
     fn end_game_session(&mut self, why: &str) {
         if let Some(game) = self.game_session.take() {
             game.end(why);
+        }
+        self.profile = None;
+        self.config = self.global.clone();
+    }
+
+    // ---- per-game profiles -------------------------------------------------------
+
+    /// Finds the profile of the game `target` runs, making one if it has
+    /// none, and puts its settings in effect over the config file's.
+    /// Desktop recording has no profile.
+    fn use_profile(&mut self, target: &Target, steam_appid: Option<u32>) {
+        self.profile = if target.pid == 0 || target.exe_name.is_empty() {
+            None
+        } else {
+            self.find_profile(target, steam_appid)
+        };
+        self.config = self.layered();
+    }
+
+    /// The config file's settings with the profile's in place of their own.
+    fn layered(&self) -> Config {
+        match &self.profile {
+            Some(p) => p.apply(&self.global),
+            None => self.global.clone(),
+        }
+    }
+
+    fn find_profile(&mut self, target: &Target, steam_appid: Option<u32>) -> Option<Profile> {
+        let dir = profile::default_dir();
+        let found = Profiles::load(&dir);
+        for problem in &found.problems {
+            warning!("profile skipped: {problem}");
+        }
+        if let Some(p) = found.find(&target.exe_name, steam_appid) {
+            if !p.ignored.is_empty() {
+                warning!(
+                    "{}: ignored settings a profile can't set: {}",
+                    p.path.display(),
+                    p.ignored.join(", ")
+                );
+            }
+            let sets: Vec<String> = (p.overrides().into_iter())
+                .map(|(key, value)| format!("{key} = {value}"))
+                .collect();
+            info!(
+                "profile {} for {}: {}",
+                p.path.display(),
+                target.game,
+                if sets.is_empty() {
+                    "no settings of its own".to_owned()
+                } else {
+                    sets.join(", ")
+                }
+            );
+            return Some(p.clone());
+        }
+        if let Some(problem) = found.problems.first() {
+            // It may be this game's profile: don't make a second one.
+            let problem = problem.to_string();
+            self.notify(Kind::Error, "A game profile has an error", &problem);
+            return None;
+        }
+        match profile::create(&dir, &target.game, &target.exe_name, steam_appid) {
+            Ok(p) => {
+                info!("made profile {} for {}", p.path.display(), target.game);
+                Some(p)
+            }
+            Err(e) => {
+                warning!("no profile for {}: {e}", target.game);
+                None
+            }
+        }
+    }
+
+    /// What clips say about the profile in use.
+    fn clip_profile(&self) -> Option<ClipProfile> {
+        self.profile.as_ref().map(|p| ClipProfile {
+            id: p.id.clone(),
+            player_names: p.player_names.clone(),
+        })
+    }
+
+    /// "Settings for" in the panel: `own` saves the panel's settings to the
+    /// game's profile; otherwise they are taken out of it and the config
+    /// file's apply again, in the running recording too.
+    fn set_profile_scope(&mut self, own: bool) {
+        let Some(p) = &self.profile else {
+            return;
+        };
+        let written = if own {
+            p.save_settings(&self.config, &self.global, &PANEL_KEYS)
+        } else {
+            p.clear_settings(&PANEL_KEYS)
+        };
+        match written.and_then(|()| Profile::load(&p.path)) {
+            Ok(p) => {
+                info!(
+                    "panel settings {} {}",
+                    if own { "saved to" } else { "taken out of" },
+                    p.path.display()
+                );
+                self.profile = Some(p);
+            }
+            Err(e) => {
+                error!("could not change the game's profile: {e}");
+                self.notify(
+                    Kind::Error,
+                    "Couldn't save the game's settings",
+                    &e.to_string(),
+                );
+                return;
+            }
+        }
+        let layered = self.layered();
+        let before = std::mem::replace(&mut self.config, layered);
+        self.apply_live(&before);
+    }
+
+    /// Applies the panel's settings that differ from `before` to the running
+    /// recording, as the panel applies them one at a time.
+    fn apply_live(&mut self, before: &Config) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let now = &self.config;
+        if now.replay.seconds != before.replay.seconds {
+            session.set_seconds(now.replay.seconds);
+        }
+        if now.video != before.video {
+            session.set_video_settings(&now.video);
+        }
+        for switch in AudioSwitch::ALL {
+            let on = switch.get(&now.audio);
+            if on != switch.get(&before.audio) {
+                session.set_switch(switch, on);
+            }
         }
     }
 
@@ -786,7 +963,9 @@ impl App {
             }
         };
         self.config_error = None;
-        self.config = config;
+        self.global = config;
+        // A running recording reads the profile again as it restarts below.
+        self.config = self.layered();
         self.hotkeys.register(self.hwnd, &self.config.hotkeys);
         // Restarted with the new combos by `refresh`.
         self.controller = None;
@@ -812,7 +991,9 @@ impl App {
     // ---- saving ----------------------------------------------------------------
 
     fn save(&mut self, seconds: Option<u32>, reply: Option<Sender<Response>>, trigger: Trigger) {
-        if let Some(session) = &self.session {
+        if let Some(session) = &self.session
+            && !(self.game_session.as_ref()).is_some_and(|g| g.continues(&session.target))
+        {
             let target = session.target.clone();
             self.enter_game_session(&target);
         }
@@ -860,6 +1041,7 @@ impl App {
                 session: game_session.info(),
                 levels: session.levels(),
                 sidecar: self.config.output.sidecar,
+                profile: self.clip_profile(),
             },
         };
         let events = self.events.clone();
@@ -1141,6 +1323,11 @@ impl App {
             alert,
             recording: session.is_some() && !self.paused,
             paused: self.paused,
+            profile: self.profile.as_ref().map(|p| ProfileScope {
+                game: (self.game_session.as_ref())
+                    .map_or_else(|| p.display_name().to_owned(), |g| g.info().game.clone()),
+                own: own_settings(p),
+            }),
             seconds: self.config.replay.seconds,
             quality,
             bitrate_kbps,
@@ -1230,13 +1417,14 @@ impl App {
                 self.close_panel(true);
                 self.star_last();
             }
+            Command::SetProfile(own) => self.set_profile_scope(own),
             Command::SetSeconds(seconds) => {
                 self.config.replay.seconds = seconds;
                 if let Some(session) = &mut self.session {
                     session.set_seconds(seconds);
                 }
                 info!("clip length set to {seconds} s");
-                self.persist(&["replay.seconds"]);
+                self.persist_panel(&["replay.seconds"], |c| c.replay.seconds = seconds);
             }
             Command::SetQuality(quality) => self.set_quality(quality),
             Command::SetAudio(AudioTarget::Switch(switch), on) => {
@@ -1255,7 +1443,7 @@ impl App {
                         " (from the next recording)"
                     }
                 );
-                self.persist(&[switch.key()]);
+                self.persist_panel(&[switch.key()], |c| switch.set(&mut c.audio, on));
             }
             Command::SetAudio(AudioTarget::Shared(input), on) => {
                 if let Some(session) = &mut self.session {
@@ -1294,7 +1482,10 @@ impl App {
             session.set_video_settings(&self.config.video);
         }
         info!("quality set to {quality:?}");
-        self.persist(&["video.quality", "video.bitrate_kbps"]);
+        self.persist_panel(&["video.quality", "video.bitrate_kbps"], |c| {
+            c.video.quality = quality;
+            c.video.bitrate_kbps = None;
+        });
     }
 
     fn folder_picked(&mut self, path: Option<PathBuf>) {
@@ -1302,7 +1493,9 @@ impl App {
             return;
         };
         info!("clips folder set to {}", path.display());
+        // Every game's: profiles can't set it.
         self.config.output.directory = Some(path.clone());
+        self.global.output.directory = Some(path.clone());
         prune::request(&self.config);
         if self.persist(&["output.directory"]) {
             self.notify(
@@ -1313,11 +1506,32 @@ impl App {
         }
     }
 
+    /// Saves panel settings already changed in `config`: to the game's
+    /// profile while the panel's settings are the game's own (see
+    /// [`own_settings`]), else to the settings file, after making the same
+    /// `change` to the settings every game starts from.
+    fn persist_panel(&mut self, keys: &[&str], change: impl FnOnce(&mut Config)) {
+        let Some(p) = self.profile.as_ref().filter(|p| own_settings(p)) else {
+            change(&mut self.global);
+            self.persist(keys);
+            return;
+        };
+        let saved = (p.save_settings(&self.config, &self.global, keys))
+            .and_then(|()| Profile::load(&p.path));
+        match saved {
+            Ok(p) => self.profile = Some(p),
+            Err(e) => {
+                error!("could not save the game's settings: {e}");
+                self.notify(Kind::Error, "Couldn't save the setting", &e.to_string());
+            }
+        }
+    }
+
     /// Writes settings changed in the panel to the settings file, leaving
     /// the rest of the file as the user wrote it. They apply right away
     /// either way; a failure only means they won't survive a restart.
     fn persist(&mut self, keys: &[&str]) -> bool {
-        match self.config.save_keys(&self.config_path, keys) {
+        match self.global.save_keys(&self.config_path, keys) {
             Ok(()) => true,
             Err(e) => {
                 error!("could not save settings: {e}");
@@ -1371,7 +1585,7 @@ impl App {
             }
             MenuCommand::OpenConfig => {
                 if !self.config_path.exists() {
-                    let _ = self.config.save(&self.config_path);
+                    let _ = self.global.save(&self.config_path);
                 }
                 open_text(&self.config_path);
             }
@@ -1420,5 +1634,30 @@ fn open(path: &Path) {
 fn open_text(path: &Path) {
     if !shell_open(path, None) && !shell_open(Path::new("notepad.exe"), Some(path)) {
         warning!("could not open {}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_keys_are_the_panels_settings_and_profiles_can_set_them() {
+        for switch in AudioSwitch::ALL {
+            assert!(PANEL_KEYS.contains(&switch.key()), "{}", switch.key());
+        }
+        for key in PANEL_KEYS {
+            assert!(profile::overridable(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn panel_settings_are_the_games_own_when_its_profile_sets_any() {
+        let parse = |text: &str| Profile::parse(Path::new("game.toml"), text).unwrap();
+        let template = profile::template("Game", "game.exe", None);
+        assert!(!own_settings(&parse(&template)));
+        assert!(!own_settings(&parse("[video]\nfps = 30\n")));
+        assert!(own_settings(&parse("[audio]\nmicrophone = true\n")));
+        assert!(own_settings(&parse("[video]\nbitrate_kbps = 0\n")));
     }
 }

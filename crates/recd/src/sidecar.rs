@@ -58,6 +58,17 @@ pub struct ClipContext {
     /// Write `<clip>.rec.json` (`output.sidecar`); the journal line is
     /// written either way.
     pub sidecar: bool,
+    /// The game's profile in use when the clip was saved, if any.
+    pub profile: Option<ClipProfile>,
+}
+
+/// What a clip says about the per-game profile (`rec_core::profile`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipProfile {
+    /// `game.profile`: the profile's file name without `.toml`.
+    pub id: String,
+    /// `player.names`: the player's names in the game, from the profile.
+    pub player_names: Vec<String>,
 }
 
 /// A saved clip's place in time, for the journal.
@@ -145,6 +156,9 @@ struct Sidecar<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     video: Option<Video>,
     audio: Vec<Audio<'a>>,
+    /// Only when the profile names the player: never guessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    player: Option<Player<'a>>,
     events: Vec<Event>,
     #[serde(skip_serializing_if = "Option::is_none")]
     loudness: Option<Loudness>,
@@ -168,6 +182,13 @@ struct Game<'a> {
     name: &'a str,
     exe: &'a str,
     steam_appid: Option<u32>,
+    /// The per-game profile in use (its file name without `.toml`).
+    profile: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct Player<'a> {
+    names: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -307,6 +328,7 @@ fn layer0<'a>(clip: &Path, ctx: &'a ClipContext, saved: &'a Saved) -> Sidecar<'a
             name: &session.game,
             exe: &session.exe_name,
             steam_appid: session.steam_appid,
+            profile: ctx.profile.as_ref().map(|p| p.id.as_str()),
         },
         time: Time {
             start_utc: format_utc(utc_at(saved.start)),
@@ -316,6 +338,11 @@ fn layer0<'a>(clip: &Path, ctx: &'a ClipContext, saved: &'a Saved) -> Sidecar<'a
         },
         video: None,
         audio: Vec::new(),
+        player: (ctx.profile.as_ref())
+            .filter(|p| !p.player_names.is_empty())
+            .map(|p| Player {
+                names: &p.player_names,
+            }),
         events,
         loudness: None,
     }
@@ -461,6 +488,10 @@ mod tests {
             session: Arc::new(session),
             levels: None,
             sidecar: true,
+            profile: Some(ClipProfile {
+                id: "tf2".into(),
+                player_names: vec!["RNDAOM".into()],
+            }),
         };
         let format = VideoFormat {
             codec: VideoCodec::Hevc,
@@ -514,6 +545,8 @@ mod tests {
         assert_eq!(v["clip"]["saved_at"], 1.8);
         assert_eq!(v["clip"]["trigger"], "hotkey");
         assert_eq!(v["game"]["steam_appid"], 440);
+        assert_eq!(v["game"]["profile"], "tf2");
+        assert_eq!(v["player"]["names"], serde_json::json!(["RNDAOM"]));
         assert_eq!(v["time"]["session_offset"], 60.0);
         assert_eq!(v["video"]["codec"], "hevc");
         assert_eq!(v["video"]["dropped_frames"], 3);
@@ -545,6 +578,11 @@ mod tests {
             session: Arc::new(session),
             levels: None,
             sidecar,
+            // A profile that doesn't name the player.
+            profile: Some(ClipProfile {
+                id: "tf_win64".into(),
+                player_names: Vec::new(),
+            }),
         }
     }
 
@@ -591,6 +629,8 @@ mod tests {
         assert_eq!(minimal["clip"]["trigger"], "panel");
         assert_eq!(minimal["clip"]["saved_at"], 1.8);
         assert_eq!(minimal["game"]["steam_appid"], 440);
+        assert_eq!(minimal["game"]["profile"], "tf_win64");
+        assert!(minimal.get("player").is_none());
         assert_eq!(minimal["time"]["session_offset"], 60.0);
         assert_eq!(minimal["events"][0]["t"], 1.5);
         assert_eq!(minimal["audio"], serde_json::json!([]));

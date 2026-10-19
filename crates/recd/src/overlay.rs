@@ -750,12 +750,15 @@ impl Scene<'_> {
             }
 
             match item {
-                Item::Length | Item::Quality => {
+                Item::Profile | Item::Length | Item::Quality => {
+                    let own = self.view.profile.as_ref().filter(|p| p.own);
                     let value = match item {
+                        Item::Profile => own.map_or("All games", |p| &p.game).to_string(),
                         Item::Length => format_seconds(self.view.seconds),
                         _ => quality_name(self.view.quality).to_string(),
                     };
                     let (back, forward) = match item {
+                        Item::Profile => (own.is_some(), own.is_none()),
                         Item::Length => (
                             panel::step_length(self.view.seconds, -1).is_some(),
                             panel::step_length(self.view.seconds, 1).is_some(),
@@ -856,6 +859,7 @@ fn label(view: &View, item: Item) -> Cow<'static, str> {
         }
         Item::Save => "Save clip",
         Item::Star => "Star last clip",
+        Item::Profile => "Settings for",
         Item::Length => "Clip length",
         Item::Quality => "Quality",
         Item::Audio(i) => view.audio.get(i).map_or("", |a| a.name),
@@ -975,11 +979,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::panel::{AudioRow, AudioTarget, ExtraClip, QualityChoice};
+    use crate::panel::{AudioRow, AudioTarget, ExtraClip, ProfileScope, QualityChoice};
     use crate::session::AudioSwitch;
 
     /// Shows the panel with extra clip rows for `REC_TEST_SECONDS` (default
-    /// 5), visible to screenshots, without running recd.
+    /// 5), visible to screenshots, without running recd. "Settings for"
+    /// shows the game with `REC_TEST_PROFILE` set, else "All games".
     /// `cargo test -p recd shows_the_panel -- --ignored`
     #[test]
     #[ignore = "opens the panel, which takes focus"]
@@ -996,6 +1001,10 @@ mod tests {
             alert: false,
             recording: true,
             paused: false,
+            profile: Some(ProfileScope {
+                game: "fake_game".into(),
+                own: std::env::var_os("REC_TEST_PROFILE").is_some(),
+            }),
             seconds: 60,
             quality: QualityChoice::Preset(Quality::Balanced),
             bitrate_kbps: Some(18_000),
