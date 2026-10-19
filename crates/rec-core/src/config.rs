@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::controller::Combo;
 use crate::hotkey::{Hotkey, Key, Modifiers};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -236,13 +237,38 @@ pub struct HotkeyConfig {
     /// Stars the clip saved last, so `output.quota_gb` never deletes it.
     pub star_last: Option<Hotkey>,
     pub pause: Option<Hotkey>,
+    /// Controller combo that saves a clip, e.g. `"LS+RS"`. Read with XInput,
+    /// only while a game is running. Off by default: the game sees the
+    /// buttons too, so the right combo depends on the games played.
+    pub controller_save: Option<Combo>,
+    pub controller_add_marker: Option<Combo>,
+    pub controller_star_last: Option<Combo>,
+    /// How long a controller combo must be held before it acts, so that
+    /// pressing the buttons together in play doesn't trigger it.
+    pub controller_hold_ms: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClipHotkey {
     pub hotkey: Hotkey,
     pub seconds: u32,
+    /// A controller combo for the same length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<Combo>,
 }
+
+impl HotkeyConfig {
+    /// Whether any controller combo is set.
+    pub fn any_controller(&self) -> bool {
+        self.controller_save.is_some()
+            || self.controller_add_marker.is_some()
+            || self.controller_star_last.is_some()
+            || self.extra_clips.iter().any(|c| c.controller.is_some())
+    }
+}
+
+pub const MIN_CONTROLLER_HOLD_MS: u32 = 100;
+pub const MAX_CONTROLLER_HOLD_MS: u32 = 5000;
 
 const ALT: Modifiers = Modifiers {
     ctrl: false,
@@ -260,6 +286,10 @@ impl Default for HotkeyConfig {
             add_marker: None,
             star_last: None,
             pause: None,
+            controller_save: None,
+            controller_add_marker: None,
+            controller_star_last: None,
+            controller_hold_ms: 500,
         }
     }
 }
@@ -438,6 +468,10 @@ impl Config {
         for clip in &mut self.hotkeys.extra_clips {
             clip.seconds = clip.seconds.clamp(MIN_REPLAY_SECONDS, MAX_REPLAY_SECONDS);
         }
+        let h = &mut self.hotkeys;
+        h.controller_hold_ms = h
+            .controller_hold_ms
+            .clamp(MIN_CONTROLLER_HOLD_MS, MAX_CONTROLLER_HOLD_MS);
         if self.output.quota_gb == Some(0) {
             self.output.quota_gb = None;
         }
@@ -859,6 +893,65 @@ quota_gb = 50
         assert_eq!(Config::default().hotkeys.star_last, None);
         let config = Config::from_toml("[hotkeys]\nstar_last = \"Alt+F9\"\n").unwrap();
         assert_eq!(config.hotkeys.star_last.unwrap().to_string(), "Alt+F9");
+    }
+
+    #[test]
+    fn controller_combos_are_off_by_default_and_parse() {
+        let h = Config::default().hotkeys;
+        assert!(!h.any_controller());
+        assert_eq!(h.controller_hold_ms, 500);
+
+        let config = Config::from_toml(
+            r#"[hotkeys]
+controller_save = "rs+ls"
+controller_star_last = "View+Y"
+controller_hold_ms = 20
+[[hotkeys.extra_clips]]
+hotkey = "Alt+F6"
+seconds = 15
+controller = "View+DPadDown"
+[[hotkeys.extra_clips]]
+hotkey = "Alt+F5"
+seconds = 300
+"#,
+        )
+        .unwrap();
+        let h = &config.hotkeys;
+        assert!(h.any_controller());
+        assert_eq!(h.controller_save.unwrap().to_string(), "LS+RS");
+        assert_eq!(h.controller_star_last.unwrap().to_string(), "View+Y");
+        assert_eq!(h.controller_add_marker, None);
+        assert_eq!(h.controller_hold_ms, MIN_CONTROLLER_HOLD_MS);
+        assert_eq!(
+            h.extra_clips[0].controller.unwrap().to_string(),
+            "View+DPadDown"
+        );
+        assert_eq!(h.extra_clips[1].controller, None);
+
+        // Round trip, with the canonical names.
+        let text = config.to_toml().unwrap();
+        assert!(text.contains(r#"controller_save = "LS+RS""#), "{text}");
+        assert_eq!(Config::from_toml(&text).unwrap(), config);
+
+        assert!(Config::from_toml("[hotkeys]\ncontroller_save = \"A\"\n").is_err());
+        assert!(Config::from_toml("[hotkeys]\ncontroller_save = \"Guide+A\"\n").is_err());
+    }
+
+    #[test]
+    fn save_keys_writes_a_controller_combo() {
+        let dir = std::env::temp_dir().join(format!("rec-config-combo-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "# mine\n[hotkeys]\nsave_clip = \"Alt+F8\" # keep\n").unwrap();
+        let mut config = Config::load(&path).unwrap();
+        config.hotkeys.controller_save = Some("LS+RS".parse().unwrap());
+        config
+            .save_keys(&path, &["hotkeys.controller_save"])
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep") && text.contains(r#"controller_save = "LS+RS""#));
+        assert_eq!(Config::load(&path).unwrap(), config);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
