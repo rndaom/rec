@@ -6,7 +6,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 
 **Read first:** [docs/decisions.md](docs/decisions.md) (the why), [docs/roadmap.md](docs/roadmap.md) (the what), [docs/research.md](docs/research.md) (the evidence).
 
-**Status (2026-10-18):** M1 done, verified on a live game. M2 in progress on branch `m2`: per-process audio, exclusive-fullscreen detection, pipeline recovery, the quick panel, HDR, AV1, the AMD AMF backend, AI-ready clips phases A and B, and the storage quota done.
+**Status (2026-10-19):** M1 done, verified on a live game. M2 features are all built on branch `m2`: per-process audio, exclusive-fullscreen detection, pipeline recovery, the quick panel, HDR, AV1, the AMD AMF backend, AI-ready clips phases A and B, the storage quota, controller combos, the DDA fallback, adaptive GPU priority and per-game profiles. Still open in M2: published benchmark numbers and NVENC/oneVPL (both need other hardware).
 
 | Crate | Role |
 |---|---|
@@ -29,7 +29,11 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 7. ~~Native encoders + AV1~~ (AV1 and AMD AMF done; NVENC and oneVPL need NVIDIA / Intel hardware)
 8. ~~AI-ready clips phase A~~ (done: `<clip>.rec.json` sidecar, marker hotkey and `rec mark`, session journal, loudness curves; see [docs/ai-clips.md](docs/ai-clips.md)). The marker hotkey has no default: set `hotkeys.add_marker`. Phase B is done too: `rec digest`, `rec analyze`, `rec mcp` and layer 2 analysis (thumbnail, scene cuts, brightness, motion, loud moments). Phases C and D (transcripts, game sources) are proposals.
 9. ~~Storage quota with auto-prune~~ (done: `output.quota_gb`, `rec star` / `unstar` / `prune`, decision D13; `recd/src/prune.rs`, `rec-core/src/store.rs`). In game, "Star last clip" stars the clip recd saved last: a quick-panel row, and the `hotkeys.star_last` hotkey, which has no default.
-10. Remaining M2 items: per-game profiles, extra clip-length hotkeys, controller combo, Win10 DDA fallback, adaptive GPU priority
+10. ~~Controller combos + extra clip rows in the panel~~ (done: `recd/src/controller.rs`, decision D7; untested with a real controller)
+11. ~~Win10 DDA fallback~~ (done: `rec-video/src/dda.rs`, `video.capture`, D14)
+12. ~~Adaptive GPU priority~~ (done: `rec-video/src/priority.rs`, `video.gpu_priority`, D15; also `video.dropped_frames` in sidecars)
+13. ~~Per-game profiles~~ (done: `rec-core/src/profile.rs`, D16, `rec profile list|show|path`, panel "Settings for" row)
+14. Remaining: a real benchmark run (admin + NVIDIA/Intel/hybrid hardware), a real Win10 + HDR display + controller check, then M3 (`rec-ui`)
 
 **Things learned**
 - Video:

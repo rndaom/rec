@@ -54,13 +54,13 @@ Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a liv
 - [ ] Native NVENC and oneVPL backends (need NVIDIA / Intel hardware to develop on)
 - [x] HDR: FP16 capture → HEVC Main10 / AV1 10-bit PQ with HDR10 metadata, or tone-map to SDR; restart on HDR switch
 - [x] Quick-panel overlay (DirectComposition, excluded from capture), keyboard and mouse navigation
-- [ ] Per-game profiles; extra clip-length hotkeys in the UI; controller combo
+- [x] Per-game profiles (`%APPDATA%ec\profiles\<id>.toml`, D16); extra clip-length rows in the quick panel; controller combos over XInput (`hotkeys.controller_*`, off by default)
 - [x] Marker hotkey and `rec mark`; AI-ready clips phase A: `<clip>.rec.json` sidecar, game-session journal, per-track loudness curves ([ai-clips.md](ai-clips.md))
 - [x] Storage quota with auto-prune (starred and read-only clips kept); `rec star`, `rec unstar`, `rec prune` (D13); "Star last clip" hotkey (`hotkeys.star_last`) and quick-panel row
-- [ ] Windows 10 path: DDA fallback (monitor capture without the yellow border)
+- [x] Windows 10 path: DDA fallback cropped to the game window (`video.capture`, D14; not yet run on a real Win10 machine)
 - [x] Exclusive-fullscreen black-frame detection with a "switch to borderless" hint
 - [x] Hybrid-GPU handling; device-lost / driver-update / resolution-change recovery without losing the buffer (`recd/src/recover.rs`; the GPU-switch path is not yet tested on a hybrid laptop)
-- [ ] Adaptive GPU priority when frames drop under full GPU load
+- [x] Adaptive GPU priority when frames drop under full GPU load (`video.gpu_priority`, D15; no measurable effect with hardware GPU scheduling on)
 - [x] Cached silent AAC packet instead of encoding silence
 
 ## M3: Library
