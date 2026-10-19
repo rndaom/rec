@@ -156,3 +156,24 @@ Where WGC cannot turn its yellow border off (no `IsBorderRequired` before build 
 - **Access lost** (UAC, lock screen, mode changes, fullscreen transitions): the duplication is recreated at once, then backing off to once a second, while the last picture repeats. The secure desktop is waited out however long it stays; other failures lasting 30 s, or a lost device, stop the pipeline for recd's recovery to restart.
 - **Costs, accepted:** whatever covers the game window is recorded (windows marked `WDA_EXCLUDEFROMCAPTURE`, like rec's overlay, are not); parts of the window off the display are not; the mouse cursor is not drawn (games hide it or draw their own). Compositing DDA's separate pointer shape can come later.
 - **Rotated displays** deliver the image unrotated. Rather than rotate it in the converter, `auto` uses WGC (border and all) there and `dda` fails with a clear error.
+
+## D15. GPU priority: normal, raised only while it helps
+
+`video.gpu_priority = "adaptive"` (default) | `"normal"` | `"high"`. Only rec's own D3D11 device changes; the game's process is never touched.
+
+**The knob:** `IDXGIDevice::SetGPUThreadPriority(7)` on rec's device (the capture copy and conversion; the hardware encoder runs on its own engine). It needs no privilege and stays in the normal scheduling band. Rejected:
+- **`D3DKMTSetProcessSchedulingPriorityClass`** (HIGH or REALTIME, what OBS and Sunshine set permanently): affects the whole process, REALTIME is linked to NVIDIA encoder freezes and driver crashes with hardware scheduling (Sunshine falls back to HIGH there), and it made no measurable difference here.
+- **Absolute priorities** (bit 30 of `SetGPUThreadPriority`; 16–29 "soft realtime" preempts lower priorities): accepted unelevated, but our work's latency got worse (p95 22 → 43 ms); hard realtime (30) is refused.
+
+**What it does, measured** (RX 7800 XT, driver 32.0.31041, Win11 26300, hardware-accelerated GPU scheduling on, unelevated; the `gpu_stress` example as the game):
+- Every knob above is accepted unelevated (`S_OK` / `STATUS_SUCCESS`), REALTIME class included.
+- A saturated GPU with short frames (~350 fps) delays rec's work by ≤ 5 ms at any priority: the scheduler already alternates.
+- With long game command buffers, rec's work waits for the buffer that is running: up to one game frame (22 ms at 44 fps, ~90 ms at 11 fps), the same at normal, thread 7, HIGH or REALTIME class. Nothing preempts a running game submission. With game frames this long the backlog reaches the encoder and frames drop, at any priority: 1–2/s with a 23 fps game, 2–4/s at 11 fps.
+- Raising priority never cost the stress game a frame (same fps), but it never helped either.
+- Without hardware scheduling (the OS scheduler, preemption requested on priority) raising is expected to help; unmeasured, this machine has it on and changing it needs a reboot.
+
+**The adaptive scheme** (`rec-video/src/priority.rs`): event queries on each tick's conversion measure GPU backlog. A tick is *starved* when a frame drops for want of a surface or encoder input, or its GPU work is still unfinished 3 frame periods later (the backlog that leads to drops; one frame late is normal under any GPU-bound game and harmless). Raise when 3 of 5 seconds have ≥ 5% starved ticks; if half of the next 10 s are still bad, it doesn't help: back to normal for 10 minutes. Otherwise hold ≥ 30 s and lower after 10 clean seconds, doubling the hold (to 10 minutes) when starvation returns within a minute, so a persistent load costs ~3 s of drops per probe at most every 10 minutes. Changes, with the reason and whether hardware scheduling is on, go to `recd.log`.
+
+**Why adaptive by default:** it does nothing while frames don't drop, gives up where priority can't help (as measured here), and where it can (no hardware scheduling, other drivers) it acts only while clips would otherwise lose frames. `"high"` is never needed while frames don't drop; `"normal"` turns it off.
+
+**Dropped frames in clips:** the sidecar's `video.dropped_frames` counts missing ticks in the clip's constant-rate video (gaps between packets), so it needs no counter history.
