@@ -83,6 +83,17 @@ rec save 30
 
 `rec help` lists every command. Configuration lives at `%APPDATA%\rec\config.toml`; `rec config` prints the exact path.
 
+Extra save lengths get their own hotkeys, and show up as rows in the quick panel:
+
+```toml
+[[hotkeys.extra_clips]]
+hotkey = "Alt+F6"
+seconds = 15
+controller = "View+DPadDown"   # optional
+```
+
+To save from a gamepad, set a controller combo under `[hotkeys]`, for example `controller_save = "LS+RS"` (also `controller_add_marker` and `controller_star_last`). Hold it for half a second (`controller_hold_ms = 500`). There is no default: the game sees the buttons too, so pick a combo your games ignore. Buttons: `A`, `B`, `X`, `Y`, `LB`, `RB`, `LT`, `RT`, `LS`, `RS`, `View`, `Menu`, `DPadUp`, `DPadDown`, `DPadLeft`, `DPadRight`. Combos work with Xbox controllers and anything Steam Input or DS4Windows presents as one; the Xbox button can't be used.
+
 To cap the space clips use, set `quota_gb` under `[output]`. rec then deletes its oldest clips after each save. `rec star` keeps the newest clip (or `rec star <clip>` a given one) out of that, and so does making a clip read-only. In game, "Star last clip" in the quick panel (Alt+F7) does the same for the clip you just saved, or set a hotkey for it: `star_last = "Alt+F9"` under `[hotkeys]` (there is no default). `rec prune --dry-run` lists what would go. Only clips rec saved are ever counted or deleted.
 
 ## Clips for AI tools

@@ -38,6 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
+use crate::controller;
 use crate::detect;
 use crate::feedback::{self, Kind, Toast};
 use crate::hotkeys::{Action, Hotkeys};
@@ -100,6 +101,8 @@ impl Failure {
 #[derive(Debug)]
 pub enum Event {
     Hotkey(i32),
+    /// A controller combo was held (see `crate::controller`).
+    Controller(Action),
     /// Notification-icon event (the low word of the callback's lParam).
     Tray(u32),
     TaskbarCreated,
@@ -314,6 +317,15 @@ struct App {
     /// The quick panel, while open.
     overlay: Option<Overlay>,
     hotkeys: Hotkeys,
+    /// Reads controller combos, while a game is running and one is set.
+    controller: Option<controller::Poller>,
+    /// Controller combos couldn't start (no XInput); not retried until the
+    /// settings are reloaded.
+    controller_failed: bool,
+    /// A game is in the foreground. Only tracked when recording doesn't
+    /// follow games (`record_when` other than `game_detected`), for the
+    /// controller combos.
+    foreground_game: bool,
     ipc: Option<IpcServer>,
     session: Option<Session>,
     /// The game run `session` records; it outlives sessions restarted by a
@@ -373,6 +385,9 @@ impl App {
             toast,
             overlay: None,
             hotkeys: Hotkeys::default(),
+            controller: None,
+            controller_failed: false,
+            foreground_game: false,
             ipc,
             session: None,
             game_session: None,
@@ -428,6 +443,7 @@ impl App {
         self.stop_session("shutting down");
         self.end_game_session("rec stopped");
         self.hotkeys.unregister();
+        self.controller = None;
         self.ipc = None;
     }
 
@@ -476,6 +492,8 @@ impl App {
         };
         let tip = format!("rec · {}", self.headline());
         self.tray.show(look, &tip);
+        // Every change of recording state ends up here.
+        self.sync_controller();
         if self.overlay.is_some() {
             let view = self.panel_view();
             if let Some(overlay) = &mut self.overlay {
@@ -716,6 +734,47 @@ impl App {
         self.refresh();
     }
 
+    /// Whether a game is running, for the controller combos: the game being
+    /// recorded, or a game in the foreground when recording doesn't follow
+    /// games.
+    fn game_running(&self) -> bool {
+        let recording_game = self.session.as_ref().is_some_and(|s| s.target.pid != 0);
+        recording_game || self.foreground_game
+    }
+
+    /// Starts reading the controller when a game is running and a combo
+    /// is set (decision D7: XInput is polled only then), stops it otherwise.
+    fn sync_controller(&mut self) {
+        let wanted = !self.paused
+            && !self.controller_failed
+            && self.config.hotkeys.any_controller()
+            && self.game_running();
+        if wanted == self.controller.is_some() {
+            return;
+        }
+        if !wanted {
+            self.controller = None;
+            info!("controller combos off");
+            return;
+        }
+        let events = self.events.clone();
+        let started = controller::Poller::start(
+            controller::bindings(&self.config.hotkeys),
+            self.config.hotkeys.controller_hold_ms,
+            move |action| events.send(Event::Controller(action)),
+        );
+        match started {
+            Ok(poller) => {
+                info!("controller combos on");
+                self.controller = Some(poller);
+            }
+            Err(e) => {
+                warning!("controller combos unavailable: {e}");
+                self.controller_failed = true;
+            }
+        }
+    }
+
     fn reload(&mut self) -> Result<(), String> {
         let config = Config::load(&self.config_path).map_err(|e| e.to_string());
         let config = match config {
@@ -729,6 +788,10 @@ impl App {
         self.config_error = None;
         self.config = config;
         self.hotkeys.register(self.hwnd, &self.config.hotkeys);
+        // Restarted with the new combos by `refresh`.
+        self.controller = None;
+        self.controller_failed = false;
+        self.foreground_game = false;
         if !self.hotkeys.failures.is_empty() {
             let failures = self.hotkeys.failures.join("; ");
             self.notify(Kind::Error, "Hotkey unavailable", &failures);
@@ -889,30 +952,41 @@ impl App {
 
     // ---- events ----------------------------------------------------------------
 
+    /// A hotkey (`trigger` is `Hotkey`) or controller combo (`Controller`).
+    fn act(&mut self, action: Action, trigger: Trigger) {
+        let src = match trigger {
+            Trigger::Controller => MarkSource::Controller,
+            _ => MarkSource::Hotkey,
+        };
+        match action {
+            Action::SaveClip => self.save(None, None, trigger),
+            Action::SaveSeconds(seconds) => self.save(Some(seconds), None, trigger),
+            Action::TogglePause => {
+                self.set_paused(!self.paused);
+                let title = if self.paused {
+                    "Recording paused"
+                } else {
+                    "Recording resumed"
+                };
+                self.notify(Kind::Info, title, &self.headline());
+            }
+            Action::ToggleOverlay => self.toggle_panel(),
+            Action::AddMarker => match self.mark(src) {
+                Ok(game) => self.notify(Kind::Info, "Marker added", &game),
+                Err(e) => self.notify(Kind::Error, "No marker added", &e),
+            },
+            Action::StarLast => self.star_last(),
+        }
+    }
+
     fn handle(&mut self, event: Event) -> Flow {
         match event {
-            Event::Hotkey(id) => match self.hotkeys.action(id) {
-                Some(Action::SaveClip) => self.save(None, None, Trigger::Hotkey),
-                Some(Action::SaveSeconds(seconds)) => {
-                    self.save(Some(seconds), None, Trigger::Hotkey)
+            Event::Hotkey(id) => {
+                if let Some(action) = self.hotkeys.action(id) {
+                    self.act(action, Trigger::Hotkey);
                 }
-                Some(Action::TogglePause) => {
-                    self.set_paused(!self.paused);
-                    let title = if self.paused {
-                        "Recording paused"
-                    } else {
-                        "Recording resumed"
-                    };
-                    self.notify(Kind::Info, title, &self.headline());
-                }
-                Some(Action::ToggleOverlay) => self.toggle_panel(),
-                Some(Action::AddMarker) => match self.mark(MarkSource::Hotkey) {
-                    Ok(game) => self.notify(Kind::Info, "Marker added", &game),
-                    Err(e) => self.notify(Kind::Error, "No marker added", &e),
-                },
-                Some(Action::StarLast) => self.star_last(),
-                None => {}
-            },
+            }
+            Event::Controller(action) => self.act(action, Trigger::Controller),
             Event::Tray(code) => {
                 if [WM_CONTEXTMENU, NIN_SELECT, NIN_KEYSELECT, WM_RBUTTONUP].contains(&code) {
                     let hotkey = self.config.hotkeys.toggle_overlay.to_string();
@@ -938,6 +1012,14 @@ impl App {
             Event::Timer(_) => {}
             Event::Foreground(hwnd) => {
                 self.consider(hwnd);
+                if self.config.behavior.record_when != RecordWhen::GameDetected
+                    && self.config.hotkeys.any_controller()
+                {
+                    self.foreground_game = detect::window_info(hwnd.get()).is_some_and(|info| {
+                        detect::is_game(&info, &self.config.behavior, self.own_pid)
+                    });
+                    self.sync_controller();
+                }
             }
             Event::Ipc(request, reply) => return self.ipc(request, reply),
             Event::Saved {
@@ -1066,6 +1148,15 @@ impl App {
             audio: self.audio_rows(),
             folder: paths::clips_dir(&self.config).display().to_string(),
             save_hotkey: self.config.hotkeys.save_clip.to_string(),
+            extra_clips: (self.config.hotkeys.extra_clips.iter())
+                .map(|c| panel::ExtraClip {
+                    seconds: c.seconds,
+                    keys: match c.controller {
+                        Some(combo) => format!("{} · {combo}", c.hotkey),
+                        None => c.hotkey.to_string(),
+                    },
+                })
+                .collect(),
             last_clip: self.last_clip.as_ref().map(|c| panel::LastClip {
                 name: c
                     .path
@@ -1130,6 +1221,10 @@ impl App {
             Command::Save => {
                 self.close_panel(true);
                 self.save(None, None, Trigger::Panel);
+            }
+            Command::SaveSeconds(seconds) => {
+                self.close_panel(true);
+                self.save(Some(seconds), None, Trigger::Panel);
             }
             Command::StarLast => {
                 self.close_panel(true);

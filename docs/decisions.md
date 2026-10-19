@@ -87,6 +87,7 @@ Closing the UI can never stop the recording.
 - **Defaults:** `Alt+F8` saves a clip, `Alt+F7` opens the quick panel. Neither collides with the NVIDIA, AMD, Xbox Game Bar or Steam defaults. Known conflicts are flagged in `rec-core::hotkey`.
 - **Mechanism:** `RegisterHotKey` for single actions. Raw Input (`RIDEV_INPUTSINK`) for chords it cannot claim. XInput polling, only while a game is running, for controller combos. **No `WH_KEYBOARD_LL`**: it adds input latency and looks like a keylogger to anti-cheat and antivirus software.
 - **Validation:** letters and digits need a modifier. F12 is rejected because Windows reserves it.
+- **Controller combos** (`hotkeys.controller_*`, off by default): XInput, read-only, polled on a below-normal thread at 30 Hz while a controller is connected and a game is running (empty slots once a second). A combo needs two or more buttons held for `controller_hold_ms` (500 ms) and acts once per hold. Windows.Gaming.Input would also read PlayStation and Switch pads, but a desktop app gets its input only while it has focus (the game has it); GameInput needs a redistributable and a COM-style SDK for the same gain. Those pads work through Steam Input or DS4Windows. The Guide button isn't in public XInput. No default combo: the game sees every press, so none is safe in every game (Menu pauses most games; Select+Start is RetroArch's).
 
 ## D8. In-game overlay without injection
 

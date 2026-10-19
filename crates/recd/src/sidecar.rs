@@ -27,6 +27,8 @@ pub const VERSION: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trigger {
     Hotkey,
+    /// A controller combo (`hotkeys.controller_*`).
+    Controller,
     Panel,
     Tray,
     /// `rec save`, or another program over IPC.
@@ -37,6 +39,7 @@ impl Trigger {
     fn name(self) -> &'static str {
         match self {
             Self::Hotkey => "hotkey",
+            Self::Controller => "controller",
             Self::Panel => "panel",
             Self::Tray => "tray",
             Self::Cli => "cli",
