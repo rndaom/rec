@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use rec_core::config::{self, Config};
 use rec_core::ipc::{self, RecorderState, Request, Response};
+use rec_core::profile::{self, Profile, Profiles};
 use rec_core::store::{self, BYTES_PER_GB, format_bytes};
 use rec_library::image::Imaging;
 use rec_library::journal::Journal;
@@ -25,6 +26,13 @@ usage:
   rec reload            reload the config file
   rec quit              stop the background service
   rec config            print the config file path
+
+per-game profiles (made when rec first records a game):
+  rec profile [list]    list the profiles and the settings each one sets
+  rec profile show NAME show a profile: its game, player names and settings.
+                        NAME is its file name or one of its executables
+  rec profile path [NAME]
+                        print the profiles folder, or a profile's file
 
 the clips folder:
   rec star [CLIP]       keep a clip: quota pruning never deletes it. CLIP is a
@@ -69,6 +77,15 @@ enum Command {
         dry_run: bool,
         quota_gb: Option<u32>,
     },
+    Profile(ProfileCommand),
+}
+
+#[derive(Debug, PartialEq)]
+enum ProfileCommand {
+    List,
+    Show(String),
+    /// The folder, or a profile's file.
+    Path(Option<String>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -140,6 +157,16 @@ fn parse(args: &[String]) -> Result<Command, String> {
             return Ok(Command::Prune { dry_run, quota_gb });
         }
         Some("config") => Command::ConfigPath,
+        Some("profile") => Command::Profile(match args.next() {
+            None | Some("list") => ProfileCommand::List,
+            Some("show") => ProfileCommand::Show(
+                args.next()
+                    .ok_or("`rec profile show` needs a profile name")?
+                    .to_owned(),
+            ),
+            Some("path") => ProfileCommand::Path(args.next().map(str::to_owned)),
+            Some(other) => return Err(format!("unknown profile command `{other}`")),
+        }),
         Some("status") => Command::Send(Request::Status),
         Some("save") => {
             let seconds = args
@@ -481,6 +508,77 @@ fn report(response: Response) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_profile(command: &ProfileCommand) -> ExitCode {
+    let dir = profile::default_dir();
+    if *command == ProfileCommand::Path(None) {
+        println!("{}", dir.display());
+        return ExitCode::SUCCESS;
+    }
+    let found = Profiles::load(&dir);
+    for problem in &found.problems {
+        eprintln!("rec: skipped {problem}");
+    }
+    let (ProfileCommand::Show(name) | ProfileCommand::Path(Some(name))) = command else {
+        if found.profiles.is_empty() {
+            println!(
+                "no profiles in {} yet: rec makes one the first time it records a game",
+                dir.display()
+            );
+        }
+        for p in &found.profiles {
+            println!("{}: {}", p.id, game_line(p));
+            let sets: Vec<String> = (p.overrides().into_iter())
+                .map(|(key, value)| format!("{key} = {value}"))
+                .collect();
+            if sets.is_empty() {
+                println!("  no settings of its own");
+            } else {
+                println!("  sets {}", sets.join(", "));
+            }
+        }
+        return ExitCode::SUCCESS;
+    };
+    let Some(p) = found.get(name) else {
+        eprintln!("rec: no profile `{name}` in {}", dir.display());
+        return ExitCode::FAILURE;
+    };
+    if let ProfileCommand::Path(_) = command {
+        println!("{}", p.path.display());
+        return ExitCode::SUCCESS;
+    }
+    println!("{}", p.path.display());
+    println!("game: {}", game_line(p));
+    if p.player_names.is_empty() {
+        println!("player names: none ([player] names, written into clips for AI tools)");
+    } else {
+        println!("player names: {}", p.player_names.join(", "));
+    }
+    let overrides = p.overrides();
+    if overrides.is_empty() {
+        println!("settings: none of its own, all from config.toml");
+    } else {
+        println!("settings (everything else from config.toml):");
+        for (key, value) in overrides {
+            println!("  {key} = {value}");
+        }
+    }
+    if !p.ignored.is_empty() {
+        println!("ignored, not per-game settings: {}", p.ignored.join(", "));
+    }
+    ExitCode::SUCCESS
+}
+
+/// "Team Fortress 2 (tf_win64.exe, Steam app 440)".
+fn game_line(p: &Profile) -> String {
+    let mut ids = p.exe.clone();
+    ids.extend(p.steam_appid.map(|app| format!("Steam app {app}")));
+    if ids.is_empty() {
+        p.display_name().to_owned()
+    } else {
+        format!("{} ({})", p.display_name(), ids.join(", "))
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse(&args) {
@@ -496,6 +594,7 @@ fn main() -> ExitCode {
         Ok(Command::Analyze { target, force }) => run_analyze(&target, force),
         Ok(Command::Star { clip, starred }) => run_star(clip.as_deref(), starred),
         Ok(Command::Prune { dry_run, quota_gb }) => run_prune(dry_run, quota_gb),
+        Ok(Command::Profile(command)) => run_profile(&command),
         Ok(Command::Mcp { dirs }) => {
             let dirs = if dirs.is_empty() {
                 vec![sys::clips_dir()]
@@ -551,6 +650,25 @@ mod tests {
             parse_str("reload"),
             Ok(Command::Send(Request::ReloadConfig))
         );
+    }
+
+    #[test]
+    fn parses_profile_commands() {
+        let p = |c| Ok(Command::Profile(c));
+        assert_eq!(parse_str("profile"), p(ProfileCommand::List));
+        assert_eq!(parse_str("profile list"), p(ProfileCommand::List));
+        assert_eq!(
+            parse_str("profile show tf2"),
+            p(ProfileCommand::Show("tf2".into()))
+        );
+        assert_eq!(parse_str("profile path"), p(ProfileCommand::Path(None)));
+        assert_eq!(
+            parse_str("profile path tf_win64.exe"),
+            p(ProfileCommand::Path(Some("tf_win64.exe".into())))
+        );
+        assert!(parse_str("profile show").is_err());
+        assert!(parse_str("profile edit tf2").is_err());
+        assert!(parse_str("profile list extra").is_err());
     }
 
     #[test]

@@ -177,3 +177,29 @@ Where WGC cannot turn its yellow border off (no `IsBorderRequired` before build 
 **Why adaptive by default:** it does nothing while frames don't drop, gives up where priority can't help (as measured here), and where it can (no hardware scheduling, other drivers) it acts only while clips would otherwise lose frames. `"high"` is never needed while frames don't drop; `"normal"` turns it off.
 
 **Dropped frames in clips:** the sidecar's `video.dropped_frames` counts missing ticks in the clip's constant-rate video (gaps between packets), so it needs no counter history.
+
+## D16. Per-game profiles: one plain file per game, layered over config.toml
+
+A profile is `%APPDATA%\rec\profiles\<id>.toml`, next to `config.toml`: plain TOML that can be edited, copied to another PC or shared as it is. Its `[game]` section says which game it is for, `[player] names` lists the player's names in that game, and it may set some `[replay]`, `[video]` and `[audio]` settings. While rec records the game, those replace the same settings in `config.toml`; **a setting the profile leaves out follows `config.toml`**, so a later change there (a new codec, say) still reaches every game that doesn't set it. Code: `rec-core/src/profile.rs`, applied in `recd/src/app.rs`.
+
+**Which game:** `exe` (file names, any case) and `steam_appid` (from the game's `steamapps` folder, as the sidecar already reads it). The same app id and exe fit best, then the app id alone, then the exe alone; the same exe name with a different app id never fits, because two games can both ship `Game.exe`. Among equals the first file name wins. The file name (`id`) is free: `tf_win64.toml` can be renamed `tf2.toml`.
+
+**What a profile may set:** `replay.seconds`, `post_roll_seconds`, `max_memory_mb`; `video.capture`, `fps`, `max_height`, `codec`, `quality`, `bitrate_kbps`, `encoder`, `cursor`, `hdr`, `gpu_priority`; every `audio` setting. Everything else stays global, and is ignored (and logged) in a profile, never an error, so profiles from newer versions still load:
+- **`output`** (folder, file names, quota, sidecars): clips land in one place and one quota counts them all.
+- **`hotkeys` and controller combos:** a key should do the same thing in every game, and re-registering global hotkeys at every game start could fail mid-game with a toast over it. Per-game lengths are what `hotkeys.extra_clips` are for.
+- **`behavior` and `video.target` / `display`:** they decide what counts as a game and what to capture before the game's profile can be known.
+
+**Layering:** the global config is serialized to a TOML table, the profile's keys replace their entries, and the result is parsed and clamped like any config, so a profile value is checked exactly like the same value in `config.toml` (a wrong type is an error when the profile is read). Optional settings have no "unset" in TOML, so `0` or `""` now means unset for `video.bitrate_kbps`, `video.max_height` and `audio.microphone_device`, in both files: a profile can then undo a bitrate `config.toml` sets.
+
+**Made when a game is first recorded:** with no profile fitting the game, rec writes one with the game's name, exe and app id filled in, an empty `names = []`, and every section's settings commented out, so it changes nothing. Made automatically because the file is then already there to edit, with the identifiers (the app id is tedious to look up) right; it costs about 1 KB per game. Never overwritten (`create_new`): a second game with the same exe name gets `<exe>-<appid>.toml`. If any profile fails to parse, none is made (the broken one may be this game's) and rec shows the error. Deleting a profile resets it to the template next time.
+
+**When it applies:** the profile is read again whenever recording starts (the game starts, recording resumes, settings are reloaded with `rec reload`, a failed start is retried), so edits apply then. A new game always starts a new pipeline, so every setting applies from its start; nothing changes a running recording except the quick panel.
+
+**Quick panel:** a "Settings for" row switches between **All games** and the game. It shows the game while its profile sets any of the panel's settings (clip length, quality, the four audio sources). Switching to the game saves those settings in the profile; from then on panel changes are saved there instead of `config.toml`. Switching back takes them out of the profile and puts the config file's values into the running recording the way the panel applies its changes (`ReplayBuffer::set_limits`, the encoder's bitrate, `set_muted`; a source with no input applies from the next recording). Files are edited with the same comment-keeping line editor as `config.toml` (`config::edit_keys`).
+
+**Clips:** the sidecar's `game.profile` is the profile's id, and `player.names` comes from the profile, written only when it lists names (never guessed, `docs/ai-clips.md`). The journal's `start` line has `profile` and `player_names`. `[hud]` and `[sources]` are reserved for layer 3 game sources.
+
+**Rejected:**
+- **Profiles inside `config.toml`** (`[profiles.tf2]` tables): nothing to share on its own, a broken profile would break every setting, and the comment-keeping line editor doesn't handle nested tables.
+- **A full copy of the settings per game:** global changes would no longer reach games with a profile, and a shared profile would carry someone else's folder and hotkeys.
+- **Matching by exe name only:** ambiguous for generic names (`Game.exe`, `Launcher.exe`, Unity and Unreal defaults).

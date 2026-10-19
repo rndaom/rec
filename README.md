@@ -94,6 +94,26 @@ controller = "View+DPadDown"   # optional
 
 To save from a gamepad, set a controller combo under `[hotkeys]`, for example `controller_save = "LS+RS"` (also `controller_add_marker` and `controller_star_last`). Hold it for half a second (`controller_hold_ms = 500`). There is no default: the game sees the buttons too, so pick a combo your games ignore. Buttons: `A`, `B`, `X`, `Y`, `LB`, `RB`, `LT`, `RT`, `LS`, `RS`, `View`, `Menu`, `DPadUp`, `DPadDown`, `DPadLeft`, `DPadRight`. Combos work with Xbox controllers and anything Steam Input or DS4Windows presents as one; the Xbox button can't be used.
 
+Each game gets its own settings file the first time rec records it, in `%APPDATA%\rec\profiles\` (`rec profile path`). It sets nothing until you do; whatever it leaves out comes from `config.toml`. A game can have its own clip length, quality, codec, frame rate and audio sources, and your in-game names for AI tools:
+
+```toml
+[game]
+name = "Team Fortress 2"
+exe = ["tf_win64.exe"]
+steam_appid = 440
+
+[player]
+names = ["RNDAOM"]
+
+[replay]
+seconds = 30
+
+[audio]
+microphone = true
+```
+
+Only `[replay]`, `[video]` and `[audio]` settings can be set per game; folders, quota and hotkeys stay global. In game, the quick panel's "Settings for" row saves the panel's settings for just that game, or switches it back to the settings for all games. `rec profile` lists the profiles and what each one sets. Edits apply the next time rec starts recording the game, or after `rec reload`.
+
 To cap the space clips use, set `quota_gb` under `[output]`. rec then deletes its oldest clips after each save. `rec star` keeps the newest clip (or `rec star <clip>` a given one) out of that, and so does making a clip read-only. In game, "Star last clip" in the quick panel (Alt+F7) does the same for the clip you just saved, or set a hotkey for it: `star_last = "Alt+F9"` under `[hotkeys]` (there is no default). `rec prune --dry-run` lists what would go. Only clips rec saved are ever counted or deleted.
 
 ## Clips for AI tools

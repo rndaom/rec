@@ -33,6 +33,20 @@ pub struct Game {
     pub name: String,
     pub exe: String,
     pub steam_appid: Option<u32>,
+    /// The per-game profile recd used (`game.profile`).
+    pub profile: Option<String>,
+    /// The player's names in the game, from the profile (`player.names`).
+    pub player_names: Vec<String>,
+}
+
+impl Game {
+    /// `player_names` from a JSON array of strings.
+    pub(crate) fn names(value: &Value) -> Vec<String> {
+        (value.as_array().into_iter().flatten())
+            .filter_map(|n| n.as_str())
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -175,6 +189,8 @@ impl Clip {
                 name: str_of(&game["name"]).unwrap_or_default(),
                 exe: str_of(&game["exe"]).unwrap_or_default(),
                 steam_appid: game["steam_appid"].as_u64().map(|n| n as u32),
+                profile: str_of(&game["profile"]),
+                player_names: Game::names(&raw["player"]["names"]),
             },
             start_utc: time["start_utc"].as_str().and_then(parse_utc),
             utc_offset_min: time["utc_offset_min"].as_i64().map(|n| n as i32),
@@ -214,7 +230,7 @@ impl Clip {
         let start_utc = session_start_utc.map(|s| s + from);
         let duration = (to - from).max(0.0);
         let events_json: Vec<Value> = markers.iter().map(|m| m.raw.clone()).collect();
-        let raw = json!({
+        let mut raw = json!({
             "rec": SIDECAR_VERSION,
             "source": "journal",
             "clip": {
@@ -228,6 +244,7 @@ impl Clip {
                 "name": game.name,
                 "exe": game.exe,
                 "steam_appid": game.steam_appid,
+                "profile": game.profile,
             },
             "time": {
                 "start_utc": start_utc.map(format_utc),
@@ -238,6 +255,10 @@ impl Clip {
             "audio": [],
             "events": events_json,
         });
+        // Like recd's sidecar: only when the profile names the player.
+        if !game.player_names.is_empty() {
+            raw["player"] = json!({ "names": game.player_names });
+        }
         Self {
             source: Source::Journal,
             id: id.to_owned(),
@@ -422,6 +443,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reads_the_profile_and_player_names() {
+        let clip = Clip::from_value(sample()).unwrap();
+        assert_eq!(clip.game.profile, None);
+        assert!(clip.game.player_names.is_empty());
+        let mut raw = sample();
+        raw["game"]["profile"] = json!("tf2");
+        raw["player"] = json!({ "names": ["RNDAOM", 7, "rnd"] });
+        let clip = Clip::from_value(raw).unwrap();
+        assert_eq!(clip.game.profile.as_deref(), Some("tf2"));
+        assert_eq!(clip.game.player_names, ["RNDAOM", "rnd"]);
+    }
+
+    #[test]
     fn reads_a_phase_a_sidecar() {
         let clip = Clip::from_value(sample()).unwrap();
         assert_eq!(clip.id, "01TESTCLIP0000000000000000");
@@ -487,6 +521,8 @@ pub(crate) mod tests {
                 name: "Game".into(),
                 exe: "game.exe".into(),
                 steam_appid: None,
+                profile: Some("game".into()),
+                player_names: vec!["RNDAOM".into()],
             },
             Some(1000.0),
             Some(60),
@@ -498,6 +534,8 @@ pub(crate) mod tests {
         assert_eq!(clip.start_utc, Some(1100.0));
         let reread = Clip::from_value(clip.raw.clone()).unwrap();
         assert_eq!(reread.session_range(), Some(("01SESSION", 100.0, 130.0)));
+        assert_eq!(reread.game, clip.game);
+        assert_eq!(reread.game.player_names, ["RNDAOM"]);
         assert_eq!(reread.events.len(), 1);
         assert_eq!(reread.raw["source"], "journal");
     }

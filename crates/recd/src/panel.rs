@@ -64,6 +64,17 @@ pub struct ExtraClip {
     pub keys: String,
 }
 
+/// Where the panel's settings (clip length, quality, audio) are saved while
+/// a game with a profile is recorded (`rec_core::profile`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileScope {
+    /// The game's name.
+    pub game: String,
+    /// Saved to the game's profile, used only in this game; otherwise to
+    /// the config file, for every game.
+    pub own: bool,
+}
+
 /// Everything the panel shows, rebuilt by `app` whenever it changes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct View {
@@ -75,6 +86,8 @@ pub struct View {
     pub alert: bool,
     pub recording: bool,
     pub paused: bool,
+    /// `None` without a game, or when it has no profile.
+    pub profile: Option<ProfileScope>,
     pub seconds: u32,
     pub quality: QualityChoice,
     /// Video bitrate in use (or that would be used), for the size estimate.
@@ -98,6 +111,8 @@ pub enum Item {
     SaveExtra(usize),
     /// Star the clip saved last, so quota pruning keeps it.
     Star,
+    /// "Settings for": all games, or the game's profile.
+    Profile,
     Length,
     Quality,
     /// An index into [`View::audio`].
@@ -110,14 +125,17 @@ pub enum Item {
 impl Item {
     /// Whether Left/Right change the row's value.
     pub fn steps(self) -> bool {
-        matches!(self, Item::Length | Item::Quality | Item::Audio(_))
+        matches!(
+            self,
+            Item::Profile | Item::Length | Item::Quality | Item::Audio(_)
+        )
     }
 
     /// The group the row belongs to; groups are drawn with a gap between.
     fn group(self) -> u8 {
         match self {
             Item::Save | Item::SaveExtra(_) | Item::Star => 0,
-            Item::Length | Item::Quality => 1,
+            Item::Profile | Item::Length | Item::Quality => 1,
             Item::Audio(_) => 2,
             Item::Folder | Item::OpenFolder | Item::Pause => 3,
         }
@@ -131,6 +149,10 @@ pub enum Command {
     /// Save the last this many seconds.
     SaveSeconds(u32),
     StarLast,
+    /// `true`: save the panel's settings to the game's profile, and save
+    /// changes there from now on. `false`: take them out of the profile, so
+    /// the game uses the config file's again.
+    SetProfile(bool),
     SetSeconds(u32),
     SetQuality(Quality),
     SetAudio(AudioTarget, bool),
@@ -241,7 +263,11 @@ impl Panel {
     pub fn items(view: &View) -> Vec<Item> {
         let mut items = vec![Item::Save];
         items.extend((0..view.extra_clips.len()).map(Item::SaveExtra));
-        items.extend([Item::Star, Item::Length, Item::Quality]);
+        items.push(Item::Star);
+        if view.profile.is_some() {
+            items.push(Item::Profile);
+        }
+        items.extend([Item::Length, Item::Quality]);
         items.extend((0..view.audio.len()).map(Item::Audio));
         items.extend([Item::Folder, Item::OpenFolder, Item::Pause]);
         items
@@ -349,7 +375,7 @@ impl Panel {
         }
         self.selected = row;
         match item {
-            Item::Length | Item::Quality if side != 0 => change(view, item, side),
+            Item::Profile | Item::Length | Item::Quality if side != 0 => change(view, item, side),
             // Clicking a stepper's label moves it forward.
             Item::Length | Item::Quality => change(view, item, 1),
             _ => activate(view, item),
@@ -369,6 +395,11 @@ impl Panel {
 
 fn change(view: &View, item: Item, dir: i32) -> Option<Command> {
     match item {
+        // Two values: all games on the left, the game on the right.
+        Item::Profile => {
+            let own = dir > 0;
+            (view.profile.as_ref()?.own != own).then_some(Command::SetProfile(own))
+        }
         Item::Length => step_length(view.seconds, dir).map(Command::SetSeconds),
         Item::Quality => step_quality(view.quality, dir).map(Command::SetQuality),
         Item::Audio(i) => {
@@ -385,6 +416,7 @@ fn activate(view: &View, item: Item) -> Option<Command> {
         Item::Save => Some(Command::Save),
         Item::SaveExtra(i) => Some(Command::SaveSeconds(view.extra_clips.get(i)?.seconds)),
         Item::Star => Some(Command::StarLast),
+        Item::Profile => Some(Command::SetProfile(!view.profile.as_ref()?.own)),
         Item::Length | Item::Quality => change(view, item, 1),
         Item::Audio(i) => {
             let row = view.audio.get(i)?;
@@ -484,6 +516,7 @@ mod tests {
             alert: false,
             recording: true,
             paused: false,
+            profile: None,
             seconds: 60,
             quality: QualityChoice::Preset(Quality::Balanced),
             bitrate_kbps: Some(18_000),
@@ -555,6 +588,44 @@ mod tests {
         assert!(!Panel::enabled(&v, Item::SaveExtra(0)));
         assert_eq!(Panel::new(&v).selected(&v), Some(Item::Length));
         assert_eq!(Panel::new(&v).click(&v, 1, 0), None);
+    }
+
+    #[test]
+    fn profile_row_switches_between_all_games_and_the_game() {
+        let mut v = view();
+        assert!(!Panel::items(&v).contains(&Item::Profile));
+        v.profile = Some(ProfileScope {
+            game: "Team Fortress 2".into(),
+            own: false,
+        });
+        let items = Panel::items(&v);
+        // First in the settings group, above what it decides about.
+        assert_eq!(items[1..4], [Item::Star, Item::Profile, Item::Length]);
+        let row = 2;
+        let layout = Layout::new(&v);
+        assert_eq!(layout.rows[row], layout.rows[1] + size::ROW + size::GAP);
+        assert_eq!(layout.rows[row + 1], layout.rows[row] + size::ROW);
+
+        let mut p = Panel::new(&v);
+        // Star is disabled: Down goes straight to it.
+        p.key(&v, Key::Down);
+        assert_eq!(p.selected(&v), Some(Item::Profile));
+        assert_eq!(p.key(&v, Key::Activate), Some(Command::SetProfile(true)));
+        assert_eq!(p.key(&v, Key::Right), Some(Command::SetProfile(true)));
+        // Already all games.
+        assert_eq!(p.key(&v, Key::Left), None);
+        assert_eq!(p.wheel(&v, row, 1), Some(Command::SetProfile(true)));
+        assert_eq!(p.click(&v, row, -1), None);
+        assert_eq!(p.click(&v, row, 0), Some(Command::SetProfile(true)));
+
+        v.profile.as_mut().unwrap().own = true;
+        assert_eq!(p.key(&v, Key::Activate), Some(Command::SetProfile(false)));
+        assert_eq!(p.key(&v, Key::Left), Some(Command::SetProfile(false)));
+        assert_eq!(p.key(&v, Key::Right), None);
+        assert_eq!(p.click(&v, row, 1), None);
+        assert_eq!(p.click(&v, row, -1), Some(Command::SetProfile(false)));
+        p.key(&v, Key::Down);
+        assert_eq!(p.selected(&v), Some(Item::Length));
     }
 
     #[test]

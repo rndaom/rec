@@ -439,51 +439,38 @@ impl Config {
     ///
     /// The config file is meant to be edited by hand, and a full [`save`]
     /// would throw away the user's comments and any setting `self` does not
-    /// know about. So the file's text is patched line by line instead. The
-    /// patched text is re-parsed and checked to differ from the original in
-    /// exactly the requested keys; layouts the line editor does not understand
-    /// (dotted keys, inline tables, multi-line values) fail that check and
-    /// fall back to editing the parsed table and re-serializing it, which
-    /// loses comments but still keeps every other setting.
+    /// know about. So the file's text is patched by [`edit_keys`] instead.
     ///
     /// [`save`]: Config::save
     pub fn save_keys(&self, path: &Path, keys: &[&str]) -> Result<(), ConfigError> {
-        let names = keys
-            .iter()
-            .map(|key| split_key(key))
-            .collect::<Result<Vec<_>, _>>()?;
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return self.save(path),
-            Err(source) => {
-                return Err(ConfigError::Read {
-                    path: path.to_owned(),
-                    source,
-                });
+        let edits = self.key_values(keys)?;
+        match edit_keys(path, &edits) {
+            Err(ConfigError::Read { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                self.save(path)
             }
-        };
-        let original: toml::Table = toml::from_str(&text).map_err(|source| ConfigError::Parse {
-            path: path.to_owned(),
-            source,
-        })?;
+            result => result,
+        }
+    }
+
+    /// The values `self` has for dotted `"section.key"` names, as they would
+    /// be written to a file; `None` for a key that is absent when serialized
+    /// (an unset optional setting).
+    pub fn key_values<'k>(
+        &self,
+        keys: &[&'k str],
+    ) -> Result<Vec<(&'k str, Option<toml::Value>)>, ConfigError> {
         let ours = toml::Table::try_from(self)?;
-        let wanted: Vec<Wanted> = names
-            .into_iter()
-            .map(|(section, key)| Wanted {
-                section,
-                key,
-                value: ours
+        keys.iter()
+            .map(|&dotted| {
+                let (section, key) = split_key(dotted)?;
+                let value = ours
                     .get(section)
                     .and_then(toml::Value::as_table)
-                    .and_then(|table| table.get(key)),
+                    .and_then(|table| table.get(key))
+                    .cloned();
+                Ok((dotted, value))
             })
-            .collect();
-
-        let new_text = match patch_text(&text, &original, &wanted) {
-            Some(patched) => patched,
-            None => rewrite_table(&text, &original, &wanted)?,
-        };
-        write_atomic(path, &new_text)
+            .collect()
     }
 
     /// Clamps values to supported ranges.
@@ -493,12 +480,21 @@ impl Config {
         r.post_roll_seconds = r.post_roll_seconds.min(60);
         r.max_memory_mb = r.max_memory_mb.clamp(64, 16 * 1024);
 
+        // 0 and "" mean "unset" for optional settings, so a per-game profile
+        // (`crate::profile`) can undo one the config file sets.
         let v = &mut self.video;
         v.fps = v.fps.clamp(10, 240);
-        v.max_height = v.max_height.map(|h| h.clamp(360, 4320));
-        v.bitrate_kbps = v.bitrate_kbps.map(|b| b.clamp(1_000, 200_000));
+        v.max_height = (v.max_height.filter(|&h| h != 0)).map(|h| h.clamp(360, 4320));
+        v.bitrate_kbps = (v.bitrate_kbps.filter(|&b| b != 0)).map(|b| b.clamp(1_000, 200_000));
 
-        self.audio.bitrate_kbps = self.audio.bitrate_kbps.clamp(64, 512);
+        let a = &mut self.audio;
+        a.bitrate_kbps = a.bitrate_kbps.clamp(64, 512);
+        if a.microphone_device
+            .as_deref()
+            .is_some_and(|d| d.trim().is_empty())
+        {
+            a.microphone_device = None;
+        }
 
         for clip in &mut self.hotkeys.extra_clips {
             clip.seconds = clip.seconds.clamp(MIN_REPLAY_SECONDS, MAX_REPLAY_SECONDS);
@@ -516,9 +512,48 @@ impl Config {
     }
 }
 
+/// Sets or removes (`None`) dotted `"section.key"` settings in the TOML file
+/// at `path`, leaving everything else in it as it is: comments, order,
+/// formatting and keys rec doesn't know. Used for the config file and for
+/// per-game profiles (`crate::profile`). The file must exist (a missing one
+/// is a [`ConfigError::Read`] with `NotFound`), and a file that doesn't parse
+/// is never touched: that returns the parse error.
+///
+/// The text is patched line by line, then re-parsed and checked to differ
+/// from the original in exactly the requested keys; layouts the line editor
+/// does not understand (dotted keys, inline tables, multi-line values) fail
+/// that check and fall back to editing the parsed table and re-serializing
+/// it, which loses comments but still keeps every other setting.
+pub fn edit_keys(path: &Path, edits: &[(&str, Option<toml::Value>)]) -> Result<(), ConfigError> {
+    let wanted = edits
+        .iter()
+        .map(|(dotted, value)| {
+            let (section, key) = split_key(dotted)?;
+            Ok(Wanted {
+                section,
+                key,
+                value: value.as_ref(),
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    let original: toml::Table = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        path: path.to_owned(),
+        source,
+    })?;
+    let new_text = match patch_text(&text, &original, &wanted) {
+        Some(patched) => patched,
+        None => rewrite_table(&text, &original, &wanted)?,
+    };
+    write_atomic(path, &new_text)
+}
+
 /// Writes via a temp file next to the target, then renames over it, so a
 /// crash never leaves a half-written config.
-fn write_atomic(path: &Path, text: &str) -> Result<(), ConfigError> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), ConfigError> {
     let write_err = |source| ConfigError::Write {
         path: path.to_owned(),
         source,
@@ -921,6 +956,20 @@ quota_gb = 50
         )
         .unwrap();
         assert_eq!(config.output.quota_gb, Some(50));
+    }
+
+    #[test]
+    fn zero_and_empty_unset_optional_settings() {
+        let c = Config::from_toml(
+            "[video]\nbitrate_kbps = 0\nmax_height = 0\n[audio]\nmicrophone_device = \"\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.video.bitrate_kbps, None);
+        assert_eq!(c.video.max_height, None);
+        assert_eq!(c.audio.microphone_device, None);
+        let c = Config::from_toml("[video]\nbitrate_kbps = 12\nmax_height = 1080\n").unwrap();
+        assert_eq!(c.video.bitrate_kbps, Some(1_000));
+        assert_eq!(c.video.max_height, Some(1080));
     }
 
     #[test]

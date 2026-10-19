@@ -121,6 +121,8 @@ pub fn parse(id: &str, text: &str) -> SessionLog {
                     name: v["game"].as_str().unwrap_or_default().to_owned(),
                     exe: v["exe"].as_str().unwrap_or_default().to_owned(),
                     steam_appid: v["steam_appid"].as_u64().map(|n| n as u32),
+                    profile: v["profile"].as_str().map(str::to_owned),
+                    player_names: Game::names(&v["player_names"]),
                 };
                 log.start_utc = v["utc"].as_str().and_then(parse_utc);
                 log.utc_offset_min = v["utc_offset_min"].as_i64().map(|n| n as i32);
@@ -164,7 +166,7 @@ pub fn parse(id: &str, text: &str) -> SessionLog {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"{"type":"start","session":"01S","game":"Team Fortress 2","exe":"tf_win64.exe","steam_appid":440,"utc_offset_min":-240,"utc":"2026-10-18T01:00:00.000Z"}
+    const SAMPLE: &str = r#"{"type":"start","session":"01S","game":"Team Fortress 2","exe":"tf_win64.exe","steam_appid":440,"profile":"tf2","player_names":["RNDAOM"],"utc_offset_min":-240,"utc":"2026-10-18T01:00:00.000Z"}
 {"type":"marker","t":12.5,"src":"hotkey","utc":"2026-10-18T01:00:12.500Z"}
 {"type":"clip","clip":"01B","file":"C:\\clips\\b.mp4","from":40.0,"to":70.0,"trigger_t":69.0,"utc":"x"}
 {"type":"clip","clip":"01A","file":"C:\\clips\\a.mp4","from":0.0,"to":30.0,"trigger_t":29.0,"utc":"x"}
@@ -177,6 +179,8 @@ mod tests {
         let log = parse("file-stem", SAMPLE);
         assert_eq!(log.id, "01S");
         assert_eq!(log.game.steam_appid, Some(440));
+        assert_eq!(log.game.profile.as_deref(), Some("tf2"));
+        assert_eq!(log.game.player_names, ["RNDAOM"]);
         assert_eq!(log.start_utc, parse_utc("2026-10-18T01:00:00Z"));
         assert_eq!(log.utc_offset_min, Some(-240));
         assert_eq!(log.markers.len(), 2);
