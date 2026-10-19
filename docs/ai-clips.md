@@ -175,7 +175,8 @@ A per-game profile (the planned M2 feature) holds the source settings and `playe
 What phase A writes differs from the sketch above in a few places:
 - **Loudness** sits on each audio entry as `audio[i].loudness`, one number per 100 ms from t = 0. The top-level `loudness` object gives `hz` and `scale` (RMS, 0 = -60 dBFS or quieter, 255 = 0 dBFS, linear in dB). Muted inputs and near-silence read 0, matching what is encoded.
 - **`video.hdr`** is a boolean.
-- **Not yet written:** `game.profile`, `player`, `privacy` and `video.vfr`/`dropped_frames`. They come with per-game profiles. `analysis` is added by `rec analyze` (phase B).
+- **`video.dropped_frames`** counts the encode ticks inside the clip that have no picture (gaps in the constant-rate video track: the GPU or encoder could not keep up, or the encode thread woke up late). Players show the previous picture for them. Repeated pictures (a game rendering below the clip's frame rate) are not counted.
+- **Not yet written:** `game.profile`, `player`, `privacy` and `video.vfr`. They come with per-game profiles. `analysis` is added by `rec analyze` (phase B).
 - **`clip.trigger`** is `hotkey`, `controller`, `panel`, `tray` or `cli`.
 - **Events** from recd are only markers: `{ "t", "kind": "marker", "src": "hotkey" | "controller" | "cli", "conf": 1 }`. `rec analyze` adds `cut` and `loud` events.
 - **`time.utc_offset_min`** sits next to `start_utc` (which is UTC, with a `Z`).
