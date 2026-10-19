@@ -1,4 +1,4 @@
-//! Adaptive GPU priority (decision D14): rec's GPU work (the capture copy and
+//! Adaptive GPU priority (decision D15): rec's GPU work (the capture copy and
 //! the colour conversion) runs at normal priority, like every other app,
 //! and is raised only while a game that saturates the GPU starves it badly
 //! enough to drop frames, and only for as long as raising it helps.
@@ -38,7 +38,7 @@ pub(crate) const NORMAL: i32 = 0;
 /// The raised value: the top of the relative range (-7..=7). It needs no
 /// privilege and stays in the normal scheduling band; the absolute
 /// soft-realtime levels made latency worse in measurements and hard
-/// realtime is refused without privilege (D14).
+/// realtime is refused without privilege (D15).
 pub(crate) const HIGH: i32 = 7;
 
 /// GPU work unfinished this many frame periods after it was queued is a
@@ -500,7 +500,7 @@ mod imp {
         second: Second,
         stats: Arc<SharedStats>,
         /// " (hardware GPU scheduling on)" or similar, for the log: what
-        /// priority can do differs with it (D14).
+        /// priority can do differs with it (D15).
         scheduling: &'static str,
     }
 

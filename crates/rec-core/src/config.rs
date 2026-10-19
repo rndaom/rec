@@ -179,7 +179,7 @@ pub enum HdrMode {
 #[serde(rename_all = "snake_case")]
 pub enum GpuPriority {
     /// Normal like any app; raised only while a GPU-saturating game makes
-    /// frames drop and raising helps, then lowered again (decision D14).
+    /// frames drop and raising helps, then lowered again (decision D15).
     Adaptive,
     /// Always normal.
     Normal,

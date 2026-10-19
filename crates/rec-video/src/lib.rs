@@ -133,7 +133,7 @@ pub enum EncoderBackend {
 }
 
 /// How rec's own GPU work (the capture copy and colour conversion) is
-/// scheduled against other apps' (the game's); see decision D14. Only
+/// scheduled against other apps' (the game's); see decision D15. Only
 /// rec's device changes: the game is never touched.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GpuPriority {
