@@ -176,8 +176,8 @@ What phase A writes differs from the sketch above in a few places:
 - **Loudness** sits on each audio entry as `audio[i].loudness`, one number per 100 ms from t = 0. The top-level `loudness` object gives `hz` and `scale` (RMS, 0 = -60 dBFS or quieter, 255 = 0 dBFS, linear in dB). Muted inputs and near-silence read 0, matching what is encoded.
 - **`video.hdr`** is a boolean.
 - **Not yet written:** `game.profile`, `player`, `privacy` and `video.vfr`/`dropped_frames`. They come with per-game profiles. `analysis` is added by `rec analyze` (phase B).
-- **`clip.trigger`** is `hotkey`, `panel`, `tray` or `cli`.
-- **Events** from recd are only markers: `{ "t", "kind": "marker", "src": "hotkey" | "cli", "conf": 1 }`. `rec analyze` adds `cut` and `loud` events.
+- **`clip.trigger`** is `hotkey`, `controller`, `panel`, `tray` or `cli`.
+- **Events** from recd are only markers: `{ "t", "kind": "marker", "src": "hotkey" | "controller" | "cli", "conf": 1 }`. `rec analyze` adds `cut` and `loud` events.
 - **`time.utc_offset_min`** sits next to `start_utc` (which is UTC, with a `Z`).
 - **`starred`** (top level, boolean) is set by `rec star` and `rec unstar`, and by recd's "Star last clip" (the `hotkeys.star_last` hotkey, no default, and the quick-panel row), which stars the clip recd saved last in this run. Quota pruning never deletes a starred clip (D13). Starring a clip that has no sidecar writes one: `rec star` builds it from the journal line, recd from the same facts kept from the save (layer 0 only: no `video`, no loudness, `audio: []`). `rec analyze` keeps the flag from the file on disk, so starring during analysis sticks.
 

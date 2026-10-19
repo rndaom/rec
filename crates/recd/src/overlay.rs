@@ -25,6 +25,7 @@
 //!   antialiased text on a translucent card, which DirectWrite does
 //!   properly and GDI does not.
 
+use std::borrow::Cow;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -737,7 +738,7 @@ impl Scene<'_> {
                 1.0,
             );
             text(
-                label(self.view, item),
+                &label(self.view, item),
                 &self.text.label,
                 row(pad + 4.0, label_w),
             );
@@ -800,6 +801,12 @@ impl Scene<'_> {
                     let value = format!("Last {}", format_seconds(self.view.seconds));
                     text(&value, &self.text.value, row(value_x, size::VALUE));
                 }
+                Item::SaveExtra(i) => {
+                    // Its hotkey (and combo): the way to do this mid-fight.
+                    let keys = self.view.extra_clips.get(i).map_or("", |c| &c.keys);
+                    set(if enabled { color::DIM } else { color::DISABLED }, 1.0);
+                    text(keys, &self.text.detail, row(value_x, size::VALUE));
+                }
                 Item::Star => {
                     let value = match &self.view.last_clip {
                         None => "No clip saved yet",
@@ -841,8 +848,12 @@ impl Scene<'_> {
     }
 }
 
-fn label(view: &View, item: Item) -> &'static str {
-    match item {
+fn label(view: &View, item: Item) -> Cow<'static, str> {
+    Cow::Borrowed(match item {
+        Item::SaveExtra(i) => {
+            let seconds = view.extra_clips.get(i).map_or(0, |c| c.seconds);
+            return Cow::Owned(format!("Save last {}", format_seconds(seconds)));
+        }
         Item::Save => "Save clip",
         Item::Star => "Star last clip",
         Item::Length => "Clip length",
@@ -852,7 +863,7 @@ fn label(view: &View, item: Item) -> &'static str {
         Item::OpenFolder => "Open clips folder",
         Item::Pause if view.paused => "Resume recording",
         Item::Pause => "Pause recording",
-    }
+    })
 }
 
 /// A row's grey detail, and whether it is a warning.
@@ -951,5 +962,77 @@ fn show_picker(initial: &std::path::Path) -> windows::core::Result<PathBuf> {
         })();
         CoUninitialize();
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use rec_core::config::Quality;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+    };
+
+    use super::*;
+    use crate::panel::{AudioRow, AudioTarget, ExtraClip, QualityChoice};
+    use crate::session::AudioSwitch;
+
+    /// Shows the panel with extra clip rows for `REC_TEST_SECONDS` (default
+    /// 5), visible to screenshots, without running recd.
+    /// `cargo test -p recd shows_the_panel -- --ignored`
+    #[test]
+    #[ignore = "opens the panel, which takes focus"]
+    fn shows_the_panel() {
+        // SAFETY: set before anything in this test reads it.
+        unsafe { std::env::set_var("REC_DEBUG_CAPTURE_UI", "1") };
+        let seconds = std::env::var("REC_TEST_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        let view = View {
+            title: "Recording fake_game".into(),
+            status: "1 min buffered · HEVC 1080p60".into(),
+            alert: false,
+            recording: true,
+            paused: false,
+            seconds: 60,
+            quality: QualityChoice::Preset(Quality::Balanced),
+            bitrate_kbps: Some(18_000),
+            memory_cap_mb: 1024,
+            audio: vec![AudioRow {
+                target: AudioTarget::Switch(AudioSwitch::Game),
+                name: "Game",
+                on: true,
+                note: None,
+            }],
+            folder: r"C:\Users\me\Videos\rec".into(),
+            save_hotkey: "Alt+F8".into(),
+            extra_clips: vec![
+                ExtraClip {
+                    seconds: 15,
+                    keys: "Alt+F6 · View+DPadDown".into(),
+                },
+                ExtraClip {
+                    seconds: 300,
+                    keys: "Alt+F5".into(),
+                },
+            ],
+            last_clip: None,
+        };
+        let overlay = Overlay::open(view, None).unwrap();
+        let until = Instant::now() + Duration::from_secs(seconds);
+        while Instant::now() < until {
+            let mut msg = MSG::default();
+            // SAFETY: pumping this thread's own messages.
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        overlay.close(true);
     }
 }

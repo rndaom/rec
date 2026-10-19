@@ -30,6 +30,8 @@ const MARKER_HISTORY: Hns = secs(MAX_REPLAY_SECONDS as i64 + 60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkSource {
     Hotkey,
+    /// A controller combo (`hotkeys.controller_add_marker`).
+    Controller,
     /// `rec mark`, or another program over IPC.
     Cli,
 }
@@ -38,6 +40,7 @@ impl MarkSource {
     pub fn name(self) -> &'static str {
         match self {
             Self::Hotkey => "hotkey",
+            Self::Controller => "controller",
             Self::Cli => "cli",
         }
     }

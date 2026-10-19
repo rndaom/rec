@@ -55,6 +55,15 @@ pub struct LastClip {
     pub starred: bool,
 }
 
+/// A save with its own length (`hotkeys.extra_clips`), shown as a row
+/// under "Save clip".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtraClip {
+    pub seconds: u32,
+    /// Its hotkey, and controller combo if it has one: "Alt+F6 · View+DPadDown".
+    pub keys: String,
+}
+
 /// Everything the panel shows, rebuilt by `app` whenever it changes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct View {
@@ -75,6 +84,8 @@ pub struct View {
     pub folder: String,
     /// The save hotkey, for the footer.
     pub save_hotkey: String,
+    /// Saves of other lengths, in config order.
+    pub extra_clips: Vec<ExtraClip>,
     /// `None` until a clip is saved.
     pub last_clip: Option<LastClip>,
 }
@@ -83,6 +94,8 @@ pub struct View {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     Save,
+    /// Save with a length of its own: an index into [`View::extra_clips`].
+    SaveExtra(usize),
     /// Star the clip saved last, so quota pruning keeps it.
     Star,
     Length,
@@ -103,7 +116,7 @@ impl Item {
     /// The group the row belongs to; groups are drawn with a gap between.
     fn group(self) -> u8 {
         match self {
-            Item::Save | Item::Star => 0,
+            Item::Save | Item::SaveExtra(_) | Item::Star => 0,
             Item::Length | Item::Quality => 1,
             Item::Audio(_) => 2,
             Item::Folder | Item::OpenFolder | Item::Pause => 3,
@@ -115,6 +128,8 @@ impl Item {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Save,
+    /// Save the last this many seconds.
+    SaveSeconds(u32),
     StarLast,
     SetSeconds(u32),
     SetQuality(Quality),
@@ -224,7 +239,9 @@ impl Panel {
     }
 
     pub fn items(view: &View) -> Vec<Item> {
-        let mut items = vec![Item::Save, Item::Star, Item::Length, Item::Quality];
+        let mut items = vec![Item::Save];
+        items.extend((0..view.extra_clips.len()).map(Item::SaveExtra));
+        items.extend([Item::Star, Item::Length, Item::Quality]);
         items.extend((0..view.audio.len()).map(Item::Audio));
         items.extend([Item::Folder, Item::OpenFolder, Item::Pause]);
         items
@@ -233,7 +250,7 @@ impl Panel {
     /// Rows that can't do anything right now; skipped by the keyboard.
     pub fn enabled(view: &View, item: Item) -> bool {
         match item {
-            Item::Save => view.recording,
+            Item::Save | Item::SaveExtra(_) => view.recording,
             // Starring twice would do nothing.
             Item::Star => view.last_clip.as_ref().is_some_and(|c| !c.starred),
             _ => true,
@@ -366,6 +383,7 @@ fn change(view: &View, item: Item, dir: i32) -> Option<Command> {
 fn activate(view: &View, item: Item) -> Option<Command> {
     match item {
         Item::Save => Some(Command::Save),
+        Item::SaveExtra(i) => Some(Command::SaveSeconds(view.extra_clips.get(i)?.seconds)),
         Item::Star => Some(Command::StarLast),
         Item::Length | Item::Quality => change(view, item, 1),
         Item::Audio(i) => {
@@ -486,8 +504,57 @@ mod tests {
             ],
             folder: r"C:\Users\me\Videos\rec".into(),
             save_hotkey: "Alt+F8".into(),
+            extra_clips: Vec::new(),
             last_clip: None,
         }
+    }
+
+    #[test]
+    fn extra_clips_are_save_rows_after_save_clip() {
+        let mut v = view();
+        v.extra_clips = vec![
+            ExtraClip {
+                seconds: 15,
+                keys: "Alt+F6 · View+DPadDown".into(),
+            },
+            ExtraClip {
+                seconds: 300,
+                keys: "Alt+F5".into(),
+            },
+        ];
+        let items = Panel::items(&v);
+        assert_eq!(
+            items[..5],
+            [
+                Item::Save,
+                Item::SaveExtra(0),
+                Item::SaveExtra(1),
+                Item::Star,
+                Item::Length
+            ]
+        );
+        let mut p = Panel::new(&v);
+        p.key(&v, Key::Down);
+        assert_eq!(p.selected(&v), Some(Item::SaveExtra(0)));
+        assert_eq!(p.key(&v, Key::Activate), Some(Command::SaveSeconds(15)));
+        // Not steppers.
+        assert_eq!(p.key(&v, Key::Right), None);
+        assert_eq!(p.wheel(&v, 2, 1), None);
+        assert_eq!(p.click(&v, 2, 1), Some(Command::SaveSeconds(300)));
+        // Star (no clip yet) is skipped on the way to Length.
+        p.key(&v, Key::Down);
+        assert_eq!(p.selected(&v), Some(Item::Length));
+
+        // One group with Save and Star: no gap between them.
+        let layout = Layout::new(&v);
+        assert_eq!(layout.rows[3], layout.rows[0] + 3.0 * size::ROW);
+        assert_eq!(layout.rows[4], layout.rows[3] + size::ROW + size::GAP);
+
+        // Like Save, they need a recording.
+        v.recording = false;
+        assert!(!Panel::enabled(&v, Item::SaveExtra(0)));
+        assert_eq!(Panel::new(&v).selected(&v), Some(Item::Length));
+        assert_eq!(Panel::new(&v).click(&v, 1, 0), None);
     }
 
     #[test]
