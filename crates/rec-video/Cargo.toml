@@ -42,6 +42,7 @@ windows = { workspace = true, features = [
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
+    "Wdk_Graphics_Direct3D",
     "Win32_UI_WindowsAndMessaging",
 ] }
 # Already a dependency of `windows`; `#[implement]` (the tracked-sample

@@ -83,6 +83,28 @@ pub fn clip_range(packets: &[Packet]) -> Option<(Hns, Hns)> {
     Some((start, end))
 }
 
+/// Encode ticks the clip has no picture for: the video is constant frame
+/// rate, one packet per tick, so a gap of n ticks between two packets is
+/// n - 1 frames the pipeline dropped (the GPU or encoder could not keep up,
+/// or the encode thread woke up late). Players show the previous picture
+/// for them.
+pub fn dropped_frames(packets: &[Packet]) -> u64 {
+    let mut video = packets.iter().filter(|p| p.track == VIDEO_TRACK);
+    let Some(mut prev) = video.next() else {
+        return 0;
+    };
+    let mut dropped = 0;
+    for p in video {
+        if prev.duration > 0 {
+            // Rounded: tick times are whole 100 ns units of a fraction.
+            let ticks = (p.pts - prev.pts + prev.duration / 2) / prev.duration;
+            dropped += (ticks - 1).max(0) as u64;
+        }
+        prev = p;
+    }
+    dropped
+}
+
 /// `<clip>.rec.json` for `clip.mp4`.
 pub fn path_for(clip: &Path) -> PathBuf {
     clip.with_extension("rec.json")
@@ -104,7 +126,8 @@ pub fn describe(
         minimal: None,
     };
     if ctx.sidecar {
-        let json = render(clip, ctx, &saved, tracks, format)?;
+        let dropped = dropped_frames(packets);
+        let json = render(clip, ctx, &saved, tracks, format, dropped)?;
         let path = path_for(clip);
         std::fs::write(&path, json).map_err(|e| format!("can't write {}: {e}", path.display()))?;
     } else {
@@ -165,6 +188,8 @@ struct Video {
     height: u32,
     fps: u32,
     hdr: bool,
+    /// See [`dropped_frames`].
+    dropped_frames: u64,
 }
 
 #[derive(Serialize)]
@@ -199,6 +224,7 @@ fn render(
     saved: &Saved,
     tracks: &[TrackInfo],
     format: &VideoFormat,
+    dropped_frames: u64,
 ) -> Result<String, String> {
     let duration = saved.end - saved.start;
     let samples =
@@ -228,6 +254,7 @@ fn render(
             height: format.height,
             fps: format.fps,
             hdr: format.color.is_hdr(),
+            dropped_frames,
         }),
         audio,
         loudness: Some(Loudness {
@@ -388,6 +415,23 @@ mod tests {
     }
 
     #[test]
+    fn dropped_frames_are_gaps_between_ticks() {
+        // Ticks every 10 units; audio packets don't count.
+        let at = |ts: &[Hns]| ts.iter().map(|&t| packet(0, t)).collect::<Vec<_>>();
+        assert_eq!(dropped_frames(&[]), 0);
+        assert_eq!(dropped_frames(&at(&[0, 10, 20, 30])), 0);
+        let mut packets = at(&[0, 10, 40, 50, 70]);
+        packets.insert(2, packet(1, 15));
+        assert_eq!(dropped_frames(&packets), 3);
+        // Tick times rounded to whole units (60 fps: 166666.67) are no gap.
+        let mut ticks = at(&[0, 166_667, 333_333, 500_000]);
+        for p in &mut ticks {
+            p.duration = 166_666;
+        }
+        assert_eq!(dropped_frames(&ticks), 0);
+    }
+
+    #[test]
     fn renders_a_complete_sidecar() {
         use crate::journal::{MarkSource, Marker};
         use rec_core::media::{AudioCodec, AudioFormat, VideoCodec, VideoColor};
@@ -460,6 +504,7 @@ mod tests {
             &saved,
             &tracks,
             &format,
+            3,
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -471,6 +516,7 @@ mod tests {
         assert_eq!(v["game"]["steam_appid"], 440);
         assert_eq!(v["time"]["session_offset"], 60.0);
         assert_eq!(v["video"]["codec"], "hevc");
+        assert_eq!(v["video"]["dropped_frames"], 3);
         assert_eq!(v["audio"][1]["index"], 1);
         assert_eq!(v["audio"][1]["role"], "game");
         assert_eq!(v["audio"][0]["loudness"].as_array().unwrap().len(), 20);

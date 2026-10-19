@@ -81,6 +81,45 @@ pub(crate) fn luid_key(luid: LUID) -> i64 {
     (i64::from(luid.HighPart) << 32) | i64::from(luid.LowPart)
 }
 
+/// Whether hardware-accelerated GPU scheduling is on for the adapter
+/// (`D3DKMT_WDDM_2_7_CAPS::HwSchEnabled`); `None` if the driver does not
+/// say (WDDM before 2.7).
+pub(crate) fn hardware_scheduling(luid: LUID) -> Option<bool> {
+    use windows::Wdk::Graphics::Direct3D::{
+        D3DKMT_CLOSEADAPTER, D3DKMT_OPENADAPTERFROMLUID, D3DKMT_QUERYADAPTERINFO,
+        D3DKMT_WDDM_2_7_CAPS, D3DKMTCloseAdapter, D3DKMTOpenAdapterFromLuid,
+        D3DKMTQueryAdapterInfo, KMTQAITYPE_WDDM_2_7_CAPS,
+    };
+    let mut open = D3DKMT_OPENADAPTERFROMLUID {
+        AdapterLuid: luid,
+        hAdapter: 0,
+    };
+    // SAFETY: valid in/out struct; the handle is closed below.
+    if unsafe { D3DKMTOpenAdapterFromLuid(&mut open) }.is_err() {
+        return None;
+    }
+    let mut caps = D3DKMT_WDDM_2_7_CAPS::default();
+    let mut query = D3DKMT_QUERYADAPTERINFO {
+        hAdapter: open.hAdapter,
+        Type: KMTQAITYPE_WDDM_2_7_CAPS,
+        pPrivateDriverData: (&raw mut caps).cast(),
+        PrivateDriverDataSize: size_of::<D3DKMT_WDDM_2_7_CAPS>() as u32,
+    };
+    // SAFETY: `caps` is the struct this query type writes, sized right.
+    let ok = unsafe { D3DKMTQueryAdapterInfo(&mut query) }.is_ok();
+    // SAFETY: the handle opened above.
+    let _ = unsafe {
+        D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER {
+            hAdapter: open.hAdapter,
+        })
+    };
+    // Bit 0 HwSchSupported, bit 1 HwSchEnabled.
+    // SAFETY: both union views are a plain u32 (zeroed by default); it is
+    // copied out of the packed union before use.
+    let bits = unsafe { caps.Anonymous.Value };
+    ok.then_some(bits & 2 != 0)
+}
+
 /// LUID of the adapter [`create_for_source`] would pick for `source` now.
 pub(crate) fn adapter_luid(source: CaptureSource) -> Result<i64, VideoError> {
     let (adapter, _) = find_adapter(target_monitor(source))?;

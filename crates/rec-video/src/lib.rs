@@ -44,6 +44,7 @@ pub mod annexb;
 mod api;
 pub mod geometry;
 pub mod obu;
+mod priority;
 mod probe;
 pub mod sei;
 
@@ -76,7 +77,7 @@ pub use api::CaptureApi;
 #[cfg(windows)]
 pub use display::{DisplayColor, DisplayState, display_for};
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use rec_core::media::{VideoCodec, VideoFormat};
@@ -131,6 +132,35 @@ pub enum EncoderBackend {
     MediaFoundation,
 }
 
+/// How rec's own GPU work (the capture copy and colour conversion) is
+/// scheduled against other apps' (the game's); see decision D15. Only
+/// rec's device changes: the game is never touched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpuPriority {
+    /// Normal, raised to high while a saturated GPU makes frames drop, and
+    /// lowered again (with hysteresis) once they do not, or when raising it
+    /// does not help.
+    #[default]
+    Adaptive,
+    /// Always normal, like any other app.
+    Normal,
+    /// Always high.
+    High,
+}
+
+/// A GPU priority change (or a note about it) made by the encode thread;
+/// see [`VideoCapture::take_gpu_priority_changes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuPriorityChange {
+    /// QPC time.
+    pub time: Hns,
+    /// `IDXGIDevice::SetGPUThreadPriority` level now in force: 0 normal,
+    /// 7 high.
+    pub level: i32,
+    /// Why, for the log.
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoCaptureConfig {
     pub source: CaptureSource,
@@ -152,13 +182,15 @@ pub struct VideoCaptureConfig {
     /// Draw the mouse cursor into the capture (WGC only: Desktop
     /// Duplication never draws it).
     pub cursor: bool,
+    pub gpu_priority: GpuPriority,
     pub track: TrackId,
     pub segment: u32,
 }
 
 impl VideoCaptureConfig {
     /// Defaults: 60 fps, native size, capture API, codec, encoder and HDR auto,
-    /// 20 Mbit/s, cursor on, video track 0, segment 0.
+    /// 20 Mbit/s, cursor on, adaptive GPU priority, video track 0,
+    /// segment 0.
     pub fn new(source: CaptureSource) -> Self {
         Self {
             source,
@@ -171,6 +203,7 @@ impl VideoCaptureConfig {
             assume_hdr_display: false,
             bitrate_kbps: 20_000,
             cursor: true,
+            gpu_priority: GpuPriority::Adaptive,
             track: rec_core::media::VIDEO_TRACK,
             segment: 0,
         }
@@ -217,6 +250,13 @@ pub struct VideoStats {
     /// Encode ticks with no frame submitted: the encoder could not accept
     /// input, no NV12 surface was free, or the encode thread woke up late.
     pub frames_dropped: u64,
+    /// Converted frames whose GPU work was still unfinished three frame
+    /// periods after it was queued: the GPU is too busy (a game saturating
+    /// it) to run rec's work on time, and frames start to drop. Such frames
+    /// are still encoded, late.
+    pub frames_late: u64,
+    /// The GPU priority level in force (0 normal, 7 high).
+    pub gpu_priority: i32,
     /// Keyframes that lacked parameter sets and had cached ones inserted.
     pub parameter_sets_inserted: u64,
     /// QPC time the newest frame was captured; `None` before the first.
@@ -316,6 +356,10 @@ pub(crate) struct SharedStats {
     pub repeated: AtomicU64,
     pub encoded: AtomicU64,
     pub dropped: AtomicU64,
+    pub late: AtomicU64,
+    pub gpu_priority: AtomicI32,
+    /// Changes not yet taken by the caller, oldest first (a few at most).
+    pub priority_changes: Mutex<Vec<GpuPriorityChange>>,
     pub ps_inserted: AtomicU64,
     /// QPC time of the newest captured frame; 0 = none yet.
     pub last_frame: AtomicI64,
@@ -337,6 +381,18 @@ impl SharedStats {
         }
     }
 
+    /// Queues a priority change for the caller; keeps the newest 16 if
+    /// nobody takes them.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn push_priority(&self, change: GpuPriorityChange) {
+        if let Ok(mut changes) = self.priority_changes.lock() {
+            if changes.len() >= 16 {
+                changes.remove(0);
+            }
+            changes.push(change);
+        }
+    }
+
     pub(crate) fn fail(&self, err: impl ToString) {
         self.set_error(err);
         self.failed.store(true, Ordering::Release);
@@ -349,6 +405,8 @@ impl SharedStats {
             frames_repeated: self.repeated.load(Ordering::Relaxed),
             frames_encoded: self.encoded.load(Ordering::Relaxed),
             frames_dropped: self.dropped.load(Ordering::Relaxed),
+            frames_late: self.late.load(Ordering::Relaxed),
+            gpu_priority: self.gpu_priority.load(Ordering::Relaxed),
             parameter_sets_inserted: self.ps_inserted.load(Ordering::Relaxed),
             last_frame_time: Some(self.last_frame.load(Ordering::Relaxed)).filter(|&t| t != 0),
             black_since: Some(self.black_since.load(Ordering::Relaxed)).filter(|&t| t != 0),
@@ -458,6 +516,17 @@ impl VideoCapture {
 
     pub fn stats(&self) -> VideoStats {
         self.stats.snapshot()
+    }
+
+    /// GPU priority changes since the last call, oldest first: worth
+    /// logging. Empty unless the priority is adaptive and the GPU got
+    /// saturated, or it is fixed at high.
+    pub fn take_gpu_priority_changes(&self) -> Vec<GpuPriorityChange> {
+        self.stats
+            .priority_changes
+            .lock()
+            .map(|mut c| std::mem::take(&mut *c))
+            .unwrap_or_default()
     }
 
     /// Changes the encoder's mean bit rate to `kbps` kbit/s (peak 1.5 x mean)

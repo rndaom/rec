@@ -75,6 +75,8 @@ pub struct VideoConfig {
     pub encoder: EncoderPreference,
     pub cursor: bool,
     pub hdr: HdrMode,
+    /// GPU scheduling priority of rec's capture work against the game's.
+    pub gpu_priority: GpuPriority,
 }
 
 impl Default for VideoConfig {
@@ -91,6 +93,7 @@ impl Default for VideoConfig {
             encoder: EncoderPreference::Auto,
             cursor: true,
             hdr: HdrMode::Auto,
+            gpu_priority: GpuPriority::Adaptive,
         }
     }
 }
@@ -170,6 +173,19 @@ pub enum HdrMode {
     Tonemap,
     /// Capture SDR as Windows presents it; HDR highlights clip.
     Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuPriority {
+    /// Normal like any app; raised only while a GPU-saturating game makes
+    /// frames drop and raising helps, then lowered again (decision D15).
+    Adaptive,
+    /// Always normal.
+    Normal,
+    /// Always high. Costs the game nothing measurable where it does not
+    /// help, but is never needed while frames don't drop.
+    High,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -855,6 +871,20 @@ mod tests {
         );
         assert_eq!(config.video.codec, Codec::Av1);
         assert_eq!(config.video.fps, 60);
+        assert_eq!(config.video.gpu_priority, GpuPriority::Adaptive);
+    }
+
+    #[test]
+    fn gpu_priority_parses() {
+        for (text, want) in [
+            ("adaptive", GpuPriority::Adaptive),
+            ("normal", GpuPriority::Normal),
+            ("high", GpuPriority::High),
+        ] {
+            let config = Config::from_toml(&format!("[video]\ngpu_priority = \"{text}\"\n"));
+            assert_eq!(config.unwrap().video.gpu_priority, want);
+        }
+        assert!(Config::from_toml("[video]\ngpu_priority = \"realtime\"\n").is_err());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use rec_audio::levels::Levels;
 use rec_audio::{AudioCapture, AudioCaptureConfig, AudioInput, AudioSource, ProcessTarget};
 use rec_core::config::{
-    AudioConfig, Codec, Config, EncoderPreference, HdrMode, Quality, VideoConfig,
+    AudioConfig, Codec, Config, EncoderPreference, GpuPriority, HdrMode, Quality, VideoConfig,
 };
 use rec_core::media::{TrackInfo, TrackKind, VIDEO_TRACK, VideoFormat};
 use rec_core::replay::{Limits, Packet, ReplayBuffer, TrackId};
@@ -378,6 +378,11 @@ fn open_video(
         rec_core::config::CaptureApi::Wgc => CaptureApi::Wgc,
         rec_core::config::CaptureApi::Dda => CaptureApi::Dda,
     };
+    let gpu_priority = match v.gpu_priority {
+        GpuPriority::Adaptive => rec_video::GpuPriority::Adaptive,
+        GpuPriority::Normal => rec_video::GpuPriority::Normal,
+        GpuPriority::High => rec_video::GpuPriority::High,
+    };
     let (src_w, src_h) = source_size(source, target.hwnd);
     let (out_w, out_h) = output_size(src_w, src_h, v.max_height);
     let bitrate_kbps = v
@@ -403,6 +408,7 @@ fn open_video(
         assume_hdr_display: assume_hdr_display(),
         bitrate_kbps,
         cursor: v.cursor,
+        gpu_priority,
         track: VIDEO_TRACK,
         segment,
     };
@@ -567,6 +573,14 @@ impl Session {
             }
             return self.restart_video(now, None);
         };
+        for change in video.take_gpu_priority_changes() {
+            info!(
+                "{}: GPU priority {}: {}",
+                self.target.game,
+                if change.level > 0 { "high" } else { "normal" },
+                change.reason
+            );
+        }
         let stats = video.stats();
         if stats.source_closed {
             return Health::SourceClosed;
