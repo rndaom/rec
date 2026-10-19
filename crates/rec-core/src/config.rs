@@ -62,6 +62,9 @@ pub struct VideoConfig {
     /// Display index for `target = "display"`. `None` follows the display the
     /// foreground game is on, falling back to the primary display.
     pub display: Option<u32>,
+    /// How the picture is captured. Leave on `auto`; the others are for
+    /// troubleshooting.
+    pub capture: CaptureApi,
     pub fps: u32,
     /// Downscale to this height (e.g. 1080). `None` keeps native resolution.
     pub max_height: Option<u32>,
@@ -79,6 +82,7 @@ impl Default for VideoConfig {
         Self {
             target: CaptureTarget::Game,
             display: None,
+            capture: CaptureApi::Auto,
             fps: 60,
             max_height: None,
             codec: Codec::Auto,
@@ -99,6 +103,21 @@ pub enum CaptureTarget {
     Game,
     /// A whole display.
     Display,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureApi {
+    /// Windows.Graphics.Capture where it can hide its yellow border
+    /// (Windows 11), else Desktop Duplication.
+    Auto,
+    /// Windows.Graphics.Capture. On Windows 10 it draws a yellow border
+    /// around the game.
+    Wgc,
+    /// Desktop Duplication of the game's display, cropped to its window:
+    /// anything on top of the game is recorded too, and the mouse cursor is
+    /// not. Cannot capture a rotated display.
+    Dda,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -872,6 +891,39 @@ quota_gb = 50
         )
         .unwrap();
         assert_eq!(config.output.quota_gb, Some(50));
+    }
+
+    #[test]
+    fn capture_api_parses() {
+        assert_eq!(Config::default().video.capture, CaptureApi::Auto);
+        for (text, api) in [
+            ("auto", CaptureApi::Auto),
+            ("wgc", CaptureApi::Wgc),
+            ("dda", CaptureApi::Dda),
+        ] {
+            let c = Config::from_toml(&format!("[video]\ncapture = \"{text}\"\n")).unwrap();
+            assert_eq!(c.video.capture, api);
+            assert!(
+                c.to_toml()
+                    .unwrap()
+                    .contains(&format!("capture = \"{text}\""))
+            );
+        }
+        assert!(Config::from_toml("[video]\ncapture = \"gdi\"\n").is_err());
+    }
+
+    #[test]
+    fn save_keys_writes_the_capture_api() {
+        let dir = TempDir::new();
+        let path =
+            dir.write("[video]\n# troubleshooting\ncapture = \"auto\" # was wgc\nfps = 60\n");
+        let mut config = Config::load(&path).unwrap();
+        config.video.capture = CaptureApi::Dda;
+        config.save_keys(&path, &["video.capture"]).unwrap();
+        assert_eq!(
+            dir.read(),
+            "[video]\n# troubleshooting\ncapture = \"dda\" # was wgc\nfps = 60\n"
+        );
     }
 
     #[test]

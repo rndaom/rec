@@ -19,6 +19,37 @@ impl Rect {
     }
 }
 
+/// A rectangle in virtual-screen coordinates, which can be negative (a
+/// monitor left of the primary one), `right`/`bottom` exclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// The part of `window` that `output` shows, relative to the output's
+/// top-left corner: what Desktop Duplication crops from the output's desktop
+/// image. `None` when less than 2 x 2 pixels of the window are on the output
+/// (minimised windows sit at -32000, or the window moved to another display).
+pub fn crop(window: ScreenRect, output: ScreenRect) -> Option<Rect> {
+    let left = i64::from(window.left.max(output.left));
+    let top = i64::from(window.top.max(output.top));
+    let right = i64::from(window.right.min(output.right));
+    let bottom = i64::from(window.bottom.min(output.bottom));
+    if right - left < 2 || bottom - top < 2 {
+        return None;
+    }
+    let (ox, oy) = (i64::from(output.left), i64::from(output.top));
+    Some(Rect {
+        left: (left - ox) as u32,
+        top: (top - oy) as u32,
+        right: (right - ox) as u32,
+        bottom: (bottom - oy) as u32,
+    })
+}
+
 /// Rounds down to an even number, never below 2. NV12 and the encoders need
 /// even dimensions.
 pub fn even(v: u32) -> u32 {
@@ -91,6 +122,68 @@ pub fn letterbox(src_width: u32, src_height: u32, dst_width: u32, dst_height: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const fn screen(left: i32, top: i32, right: i32, bottom: i32) -> ScreenRect {
+        ScreenRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    const PRIMARY: ScreenRect = screen(0, 0, 2560, 1440);
+    /// A 1080p monitor left of the primary one.
+    const LEFT: ScreenRect = screen(-1920, 0, 0, 1080);
+
+    #[test]
+    fn crop_is_relative_to_the_output() {
+        // Borderless fullscreen: the whole output.
+        assert_eq!(
+            crop(PRIMARY, PRIMARY),
+            Some(Rect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440
+            })
+        );
+        // A window on the left monitor.
+        let r = crop(screen(-1500, 100, -220, 820), LEFT).unwrap();
+        assert_eq!(
+            (r.left, r.top, r.width(), r.height()),
+            (420, 100, 1280, 720)
+        );
+    }
+
+    #[test]
+    fn crop_clips_to_the_output() {
+        // Hanging off the bottom-right corner.
+        let r = crop(screen(2000, 1000, 2900, 1700), PRIMARY).unwrap();
+        assert_eq!((r.left, r.top, r.right, r.bottom), (2000, 1000, 2560, 1440));
+        // Straddling two monitors: only this output's part.
+        let r = crop(screen(-400, 0, 400, 600), PRIMARY).unwrap();
+        assert_eq!((r.left, r.width()), (0, 400));
+        let r = crop(screen(-400, 0, 400, 600), LEFT).unwrap();
+        assert_eq!((r.left, r.right), (1520, 1920));
+    }
+
+    #[test]
+    fn crop_of_a_window_not_on_the_output_is_none() {
+        // Minimised windows are parked at -32000.
+        assert_eq!(crop(screen(-32000, -32000, -31840, -31972), PRIMARY), None);
+        assert_eq!(crop(screen(100, 100, 900, 700), LEFT), None);
+        // Touching edges and slivers.
+        assert_eq!(crop(screen(2560, 0, 3000, 600), PRIMARY), None);
+        assert_eq!(crop(screen(2559, 0, 3000, 600), PRIMARY), None);
+        assert_eq!(crop(screen(10, 10, 10, 600), PRIMARY), None);
+        assert!(crop(screen(2558, 0, 3000, 600), PRIMARY).is_some());
+        // Extreme coordinates do not overflow.
+        assert_eq!(
+            crop(screen(i32::MIN, i32::MIN, i32::MAX, i32::MAX), PRIMARY),
+            crop(PRIMARY, PRIMARY)
+        );
+    }
 
     #[test]
     fn align_up_rounds_to_the_next_multiple() {

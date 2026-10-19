@@ -1,4 +1,5 @@
-//! rec's video pipeline: Windows.Graphics.Capture → D3D11 colour conversion
+//! rec's video pipeline: Windows.Graphics.Capture (or, where WGC cannot hide
+//! its yellow border, Desktop Duplication; see `api.rs`) → D3D11 colour conversion
 //! (scale, letterbox; BGRA → NV12, or for HDR displays FP16 → P010 HDR10 or
 //! tone-mapped NV12) → hardware encoder (AMD AMF or Media Foundation) →
 //! H.264 / HEVC / AV1 [`Packet`]s that follow the contract in
@@ -40,6 +41,7 @@
 //!   AUD + (VPS) + SPS + PPS + IDR, with no B-frames.
 
 pub mod annexb;
+mod api;
 pub mod geometry;
 pub mod obu;
 mod probe;
@@ -56,6 +58,8 @@ mod convert;
 #[cfg(windows)]
 mod d3d;
 #[cfg(windows)]
+mod dda;
+#[cfg(windows)]
 mod display;
 #[cfg(windows)]
 mod encoder;
@@ -68,6 +72,7 @@ mod shader;
 #[cfg(windows)]
 mod util;
 
+pub use api::CaptureApi;
 #[cfg(windows)]
 pub use display::{DisplayColor, DisplayState, display_for};
 
@@ -129,6 +134,8 @@ pub enum EncoderBackend {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoCaptureConfig {
     pub source: CaptureSource,
+    /// Which OS capture API to use; see [`CaptureApi`].
+    pub capture: CaptureApi,
     /// Encode tick rate (constant frame rate), 1..=240.
     pub fps: u32,
     /// Downscale so the encoded height is at most this (aspect ratio kept).
@@ -142,18 +149,20 @@ pub struct VideoCaptureConfig {
     pub assume_hdr_display: bool,
     /// Mean bitrate in kbit/s.
     pub bitrate_kbps: u32,
-    /// Draw the mouse cursor into the capture.
+    /// Draw the mouse cursor into the capture (WGC only: Desktop
+    /// Duplication never draws it).
     pub cursor: bool,
     pub track: TrackId,
     pub segment: u32,
 }
 
 impl VideoCaptureConfig {
-    /// Defaults: 60 fps, native size, codec, encoder and HDR auto,
+    /// Defaults: 60 fps, native size, capture API, codec, encoder and HDR auto,
     /// 20 Mbit/s, cursor on, video track 0, segment 0.
     pub fn new(source: CaptureSource) -> Self {
         Self {
             source,
+            capture: CaptureApi::Auto,
             fps: 60,
             max_height: None,
             codec: CodecPreference::Auto,
@@ -218,7 +227,8 @@ pub struct VideoStats {
     /// While the encoded picture is black: since when (QPC time of the first
     /// black picture checked). Checked every two seconds.
     pub black_since: Option<Hns>,
-    /// Size of the newest captured frame. It follows the source (a window
+    /// Size of the newest captured frame (with Desktop Duplication, of the
+    /// window's part of its display). It follows the source (a window
     /// resized, a game switching resolution) while the encoded size stays
     /// fixed for the pipeline's lifetime: the picture is scaled to fit, and
     /// the caller decides when a restart at the new size is worth it.
@@ -240,6 +250,8 @@ pub struct VideoStats {
 pub struct VideoInfo {
     /// Codec, size, rate and colour (SDR, or HDR10 with its metadata).
     pub format: VideoFormat,
+    /// The capture API in use: [`CaptureApi::Wgc`] or [`CaptureApi::Dda`].
+    pub capture: CaptureApi,
     /// Which encoder runs: the native backend or the Media Foundation MFT's
     /// friendly name.
     pub encoder_name: String,
@@ -262,9 +274,11 @@ pub struct VideoInfo {
     pub source_width: u32,
     pub source_height: u32,
     /// Whether Windows draws the yellow capture border: `Some(false)` when it
-    /// was turned off, `None` when the OS has no `IsBorderRequired` property.
+    /// was turned off, `None` when the OS has no `IsBorderRequired` property
+    /// or Desktop Duplication captures (it has no border).
     pub border_required: Option<bool>,
-    /// `MinUpdateInterval` applied to the capture session, if supported.
+    /// `MinUpdateInterval` applied to the capture session, if supported; with
+    /// Desktop Duplication, the least time between two acquired frames.
     pub min_update_interval_hns: Option<i64>,
     /// The source's display was in HDR mode (or assumed to be) at start;
     /// compare with [`display_for`] to notice HDR being switched.

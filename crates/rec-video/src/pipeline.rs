@@ -13,10 +13,12 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::annexb::{self, KeyframeFix, ParameterSets};
+use crate::api::{self, CaptureApi, Facts};
 use crate::backend::Backend;
-use crate::capture::{Capture, CaptureShared};
+use crate::capture::{self, Capture, CaptureFormat, CaptureShared};
 use crate::convert::{Conversion, Converter};
 use crate::d3d::{self, Gpu};
+use crate::dda::{self, DdaCapture};
 use crate::display::{self, DisplayColor};
 use crate::encoder::EncoderParams;
 use crate::geometry::output_size;
@@ -107,7 +109,7 @@ pub(crate) fn run(
 struct Pipeline {
     // Field order is drop order: stop capture callbacks first, then the
     // encoder (which returns its input samples), then the NV12 pool.
-    _capture: Capture,
+    _capture: Source,
     encoder: Backend,
     converter: Converter,
     shared: Arc<CaptureShared>,
@@ -316,6 +318,7 @@ impl Pipeline {
                 None
             }
         };
+        let really_hdr = display.is_some_and(|d| d.hdr);
         let display = if config.assume_hdr_display {
             Some(DisplayColor::assume_hdr(display))
         } else {
@@ -328,19 +331,25 @@ impl Pipeline {
             latest: Mutex::default(),
             stats: stats.clone(),
         });
-        let capture = Capture::new(
-            config.source,
+        let mut capture = open_source(
+            config,
             &gpu,
-            config.fps,
-            config.cursor,
             plans[0].0.capture_format(),
-            shared.clone(),
+            &shared,
+            &mut notes,
         )?;
-        let (width, height) = output_size(
-            capture.source_width,
-            capture.source_height,
-            config.max_height,
-        );
+        if capture.api() == CaptureApi::Dda
+            && plans[0].0.capture_format() == CaptureFormat::Fp16
+            && !really_hdr
+        {
+            // Measured on Windows 11 26200: an SDR desktop duplicated as FP16
+            // holds the sRGB-encoded values, not linear scRGB as from WGC.
+            notes.push(
+                "Desktop Duplication of an SDR display in FP16 is not linear; the assumed-HDR picture comes out too bright".into(),
+            );
+        }
+        let (source_width, source_height) = capture.size();
+        let (width, height) = output_size(source_width, source_height, config.max_height);
         let (encoder, converter, conversion, color) =
             start_encoder(&gpu, config, width, height, &plans, &mut notes)?;
         let picture = (width, height);
@@ -357,6 +366,7 @@ impl Pipeline {
                 fps: config.fps,
                 color,
             },
+            capture: capture.api(),
             encoder_name: encoder.name().to_string(),
             adapter_name: gpu.adapter_name.clone(),
             adapter_owns_monitor: gpu.owns_monitor,
@@ -364,10 +374,10 @@ impl Pipeline {
             rate_control: encoder.rate_control().to_string(),
             picture_width: picture.0,
             picture_height: picture.1,
-            source_width: capture.source_width,
-            source_height: capture.source_height,
-            border_required: capture.border_required,
-            min_update_interval_hns: capture.min_update_interval_hns,
+            source_width,
+            source_height,
+            border_required: capture.border_required(),
+            min_update_interval_hns: capture.min_update_interval_hns(),
             display_hdr: hdr_display.is_some(),
             notes,
         };
@@ -527,6 +537,92 @@ impl Pipeline {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
+    }
+}
+
+/// The capture side of a pipeline: either API fills the same "latest"
+/// texture in the same format.
+#[derive(Debug)]
+enum Source {
+    Wgc(Capture),
+    Dda(DdaCapture),
+}
+
+impl Source {
+    fn api(&self) -> CaptureApi {
+        match self {
+            Source::Wgc(_) => CaptureApi::Wgc,
+            Source::Dda(_) => CaptureApi::Dda,
+        }
+    }
+
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Source::Wgc(c) => (c.source_width, c.source_height),
+            Source::Dda(c) => (c.source_width, c.source_height),
+        }
+    }
+
+    fn border_required(&self) -> Option<bool> {
+        match self {
+            Source::Wgc(c) => c.border_required,
+            Source::Dda(_) => None,
+        }
+    }
+
+    fn min_update_interval_hns(&self) -> Option<i64> {
+        match self {
+            Source::Wgc(c) => c.min_update_interval_hns,
+            Source::Dda(c) => Some(c.min_update_interval_hns),
+        }
+    }
+
+    fn start(&mut self) -> Result<(), VideoError> {
+        match self {
+            Source::Wgc(c) => c.start(),
+            Source::Dda(c) => c.start(),
+        }
+    }
+}
+
+/// Creates the capture source with the API `config.capture` and the system
+/// call for (see [`crate::api`]).
+fn open_source(
+    config: &VideoCaptureConfig,
+    gpu: &Gpu,
+    format: CaptureFormat,
+    shared: &Arc<CaptureShared>,
+    notes: &mut Vec<String>,
+) -> Result<Source, VideoError> {
+    let dda_usable = dda::usable(gpu, d3d::target_monitor(config.source));
+    let facts = Facts {
+        wgc: capture::supported(),
+        border_property: capture::border_property_present(),
+        dda: dda_usable,
+    };
+    let dda =
+        || DdaCapture::new(config.source, gpu, config.fps, format, shared.clone()).map(Source::Dda);
+    match api::first_choice(config.capture, facts) {
+        CaptureApi::Dda => dda(),
+        _ => {
+            let wgc = Capture::new(
+                config.source,
+                gpu,
+                config.fps,
+                config.cursor,
+                format,
+                shared.clone(),
+            )?;
+            if api::dda_instead(config.capture, wgc.border_required, dda_usable) {
+                // Not started yet, so the border was never shown.
+                drop(wgc);
+                notes.push(
+                    "Windows.Graphics.Capture could not turn off the yellow border; capturing with Desktop Duplication".into(),
+                );
+                return dda();
+            }
+            Ok(Source::Wgc(wgc))
+        }
     }
 }
 

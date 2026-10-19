@@ -15,7 +15,9 @@ use rec_core::media::{TrackInfo, TrackKind, VIDEO_TRACK, VideoFormat};
 use rec_core::replay::{Limits, Packet, ReplayBuffer, TrackId};
 use rec_core::time::{Hns, as_secs_f64, qpc_now, secs};
 use rec_video::geometry::output_size;
-use rec_video::{CaptureSource, CodecPreference, EncoderBackend, VideoCapture, VideoCaptureConfig};
+use rec_video::{
+    CaptureApi, CaptureSource, CodecPreference, EncoderBackend, VideoCapture, VideoCaptureConfig,
+};
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
@@ -371,6 +373,11 @@ fn open_video(
         HdrMode::Tonemap => rec_video::HdrMode::Tonemap,
         HdrMode::Off => rec_video::HdrMode::Off,
     };
+    let capture = match v.capture {
+        rec_core::config::CaptureApi::Auto => CaptureApi::Auto,
+        rec_core::config::CaptureApi::Wgc => CaptureApi::Wgc,
+        rec_core::config::CaptureApi::Dda => CaptureApi::Dda,
+    };
     let (src_w, src_h) = source_size(source, target.hwnd);
     let (out_w, out_h) = output_size(src_w, src_h, v.max_height);
     let bitrate_kbps = v
@@ -387,6 +394,7 @@ fn open_video(
 
     let config = VideoCaptureConfig {
         source,
+        capture,
         fps: v.fps,
         max_height: v.max_height,
         codec,
@@ -401,6 +409,11 @@ fn open_video(
     let video = VideoCapture::start(config, sink(buffer)).map_err(|e| e.to_string())?;
     for note in &video.info().notes {
         warning!("video: {note}");
+    }
+    if video.info().capture == CaptureApi::Dda {
+        // DDA failures stop the pipeline like any other, and the session's
+        // recovery restarts it (see crate::recover).
+        info!("video: Desktop Duplication of the display, cropped to the source");
     }
     let format = video.info().format.clone();
     let description = describe(&video, bitrate_kbps);

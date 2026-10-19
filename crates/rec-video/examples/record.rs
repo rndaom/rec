@@ -3,13 +3,15 @@
 //!
 //! ```text
 //! cargo run --release -p rec-video --example record -- --seconds 10 --fps 60 \
-//!     [--monitor N | --window-title "<substring>"] [--codec h264|hevc|av1|auto] \
+//!     [--monitor N | --window-title "<substring>"] [--capture auto|wgc|dda] \
+//!     [--codec h264|hevc|av1|auto] \
 //!     [--encoder auto|amf|mf] [--hdr auto|tonemap|off] [--assume-hdr] \
 //!     [--bitrate KBPS] [--max-height N] [--no-cursor] [--request-borderless] \
 //!     --out out.h265
 //! ```
 //!
-//! `--assume-hdr` runs the HDR path (FP16 capture, HDR10 or tone-mapped
+//! `--capture dda` forces Desktop Duplication (the Windows 10 path: the
+//! display cropped to the window) on Windows 11. `--assume-hdr` runs the HDR path (FP16 capture, HDR10 or tone-mapped
 //! output) on an SDR display. AV1 is written as a low-overhead OBU stream
 //! (`ffprobe -f obu out.obu`).
 
@@ -34,7 +36,7 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use rec_video::{
-        CaptureSource, CodecPreference, EncoderBackend, HdrMode, Packet, VideoCapture,
+        CaptureApi, CaptureSource, CodecPreference, EncoderBackend, HdrMode, Packet, VideoCapture,
         VideoCaptureConfig, annexb, obu,
     };
     use windows::Win32::Foundation::{
@@ -66,6 +68,7 @@ mod imp {
         fps: u32,
         monitor: Option<usize>,
         window_title: Option<String>,
+        capture: CaptureApi,
         codec: CodecPreference,
         encoder: EncoderBackend,
         hdr: HdrMode,
@@ -95,6 +98,14 @@ mod imp {
                 "--fps" => a.fps = num(value()?)? as u32,
                 "--monitor" => a.monitor = Some(num(value()?)? as usize),
                 "--window-title" => a.window_title = Some(value()?),
+                "--capture" => {
+                    a.capture = match value()?.as_str() {
+                        "auto" => CaptureApi::Auto,
+                        "wgc" => CaptureApi::Wgc,
+                        "dda" => CaptureApi::Dda,
+                        other => return Err(format!("unknown capture API {other}")),
+                    }
+                }
                 "--codec" => {
                     a.codec = match value()?.as_str() {
                         "h264" => CodecPreference::H264,
@@ -296,6 +307,7 @@ mod imp {
         };
 
         let config = VideoCaptureConfig {
+            capture: args.capture,
             fps: args.fps,
             max_height: args.max_height,
             codec: args.codec,
@@ -349,6 +361,7 @@ mod imp {
             "adapter: {} (owns monitor: {})",
             info.adapter_name, info.adapter_owns_monitor
         );
+        println!("capture: {:?}", info.capture);
         println!("encoder: {}", info.encoder_name);
         println!(
             "format: {} {}x{} @ {} fps (source {}x{})",

@@ -11,7 +11,12 @@
 //! - **Failures** (device removed or hung, a driver update, any error that
 //!   stops the encode thread): retried after [`RETRY_DELAYS`], about 40 s
 //!   in all, which covers a driver reinstall. A pipeline that then runs for
-//!   [`HEALTHY_AFTER`] earns a fresh set of retries.
+//!   [`HEALTHY_AFTER`] earns a fresh set of retries. Desktop Duplication
+//!   (the Windows 10 capture) rides out desktop switches, mode changes and
+//!   fullscreen transitions itself; what it cannot (a lost device, the game
+//!   moved to a rotated display, duplication failing for 30 s) stops the
+//!   pipeline and lands here. With `video.capture = "auto"` the restart
+//!   picks the API afresh, so a rotated display gets WGC.
 //! - **Resolution changes**: the pipeline keeps running at its first size
 //!   and scales the picture to fit, so a game that starts in a small window
 //!   and then goes fullscreen at 1440p would be recorded at the window's
