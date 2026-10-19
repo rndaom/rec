@@ -79,6 +79,15 @@ Handoff file so any session can pick up quickly. Keep it short and current.
   - Starring lives in the sidecar, so a journal-only clip gets a sidecar when starred. `analysis::save` re-reads `starred` from disk because `rec mcp` holds clips in memory for a long time.
   - "Star last clip" (`hotkeys.star_last`, quick-panel row) writes through `store::set_starred` on recd's main thread, only when used: nothing is added while recording. recd doesn't depend on rec-library (MF/D3D11 decoding, WIC), so the sidecar write lives in rec-core and rec-library's `write_sidecar` calls it. rec-core's `serde_json` has `preserve_order`, so a star keeps the file's key order in recd-only builds too. With `output.sidecar = false`, the save thread keeps a layer-0 sidecar (`sidecar::minimal`, the same facts `rec star` builds from the journal) in memory for the last clip, written only when it is starred. Unit-tested only: not run live, for the same reason as the prune after a save.
   - Ideas not done: a low-disk warning, pruning folders the clips used to be saved to, unstarring from the panel.
+- Controller combos: an empty XInput slot read costs ~16–20 µs, so empty slots are checked once a second; with a pad, 30 Hz costs ~0.08% of a core. Hardware run: `cargo test --release -p recd poll_cost -- --ignored --nocapture` (`REC_TEST_SECONDS`). `cargo test -p recd shows_the_panel -- --ignored` shows the panel without recd.
+- DDA:
+  - `AcquireNextFrame` with a timeout holds the D3D11 device lock while waiting (a 50 ms wait dropped 84 of 150 ticks), so DDA polls with no wait every half tick.
+  - DDA in FP16 on an SDR display returns sRGB-encoded values, so `--assume-hdr` with DDA is too bright.
+  - DISPLAY1 on this machine is a rotated portrait monitor; `auto` keeps WGC there. 0x887A0026 is `DXGI_ERROR_ACCESS_LOST`.
+  - No cursor with DDA; windows covering the game are recorded.
+- GPU priority: unelevated, every priority setting is accepted except hard realtime. With hardware GPU scheduling on (RDNA3) nothing preempts a running game command buffer, so priority changed nothing; drops start once the game's frames take over ~40 ms. Untested with HAGS off (needs a reboot). Test: `gpu_stress --iterations 32000 --draws 1` + `record --window-title "rec gpu stress" --gpu-priority adaptive`.
+- Profiles: driving the panel from a test needs a real Alt+F7 then `keybd_event` arrows (`FindWindow("rec.panel")` returned 0). The line editor keeps empty `[section]` headers, so templates use real headers with commented examples. A profile doesn't mark its exe as a game; that still needs `game_apps`.
+- Agent worktrees may start from `main`, not `m2`: check the base first.
 - Logs: `%LOCALAPPDATA%\rec\recd.log`. Config: `%APPDATA%\rec\config.toml`.
 - Testing: set `REC_DEBUG_CAPTURE_UI=1` to make toasts visible in screenshots.
 

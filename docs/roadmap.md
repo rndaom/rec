@@ -54,7 +54,7 @@ Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a liv
 - [ ] Native NVENC and oneVPL backends (need NVIDIA / Intel hardware to develop on)
 - [x] HDR: FP16 capture → HEVC Main10 / AV1 10-bit PQ with HDR10 metadata, or tone-map to SDR; restart on HDR switch
 - [x] Quick-panel overlay (DirectComposition, excluded from capture), keyboard and mouse navigation
-- [x] Per-game profiles (`%APPDATA%ec\profiles\<id>.toml`, D16); extra clip-length rows in the quick panel; controller combos over XInput (`hotkeys.controller_*`, off by default)
+- [x] Per-game profiles (`%APPDATA%\rec\profiles\<id>.toml`, D16); extra clip-length rows in the quick panel; controller combos over XInput (`hotkeys.controller_*`, off by default)
 - [x] Marker hotkey and `rec mark`; AI-ready clips phase A: `<clip>.rec.json` sidecar, game-session journal, per-track loudness curves ([ai-clips.md](ai-clips.md))
 - [x] Storage quota with auto-prune (starred and read-only clips kept); `rec star`, `rec unstar`, `rec prune` (D13); "Star last clip" hotkey (`hotkeys.star_last`) and quick-panel row
 - [x] Windows 10 path: DDA fallback cropped to the game window (`video.capture`, D14; not yet run on a real Win10 machine)
