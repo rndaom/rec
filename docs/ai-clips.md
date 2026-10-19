@@ -168,7 +168,7 @@ Every source must be official and local. That means reading a file the game writ
 | Replay files | Rocket League, Fortnite | Post-hoc | Lower priority |
 | **HUD profile** | **Any game** | Post-hoc OCR on the saved clip | A data file per game describing HUD regions, for example the killfeed rectangle at 1080p, the local-player highlight colour and the death-screen cue. One engine runs every profile. This is the TF2 session's pipeline, generalised and fixed: scan at the clip's real frame rate and keep separate boxes separate. Profiles are plain files users can share |
 
-A per-game profile (the planned M2 feature) holds the source settings and `player.names`. That settles "which name is me" once, instead of guessing it from OCR.
+A per-game profile (`%APPDATA%\rec\profiles\<id>.toml`, decision D16) holds `player.names`, and its `[sources]` and `[hud]` sections are reserved for these sources' settings. That settles "which name is me" once, instead of guessing it from OCR.
 
 ## Sidecar v1 as built
 
@@ -176,7 +176,8 @@ What phase A writes differs from the sketch above in a few places:
 - **Loudness** sits on each audio entry as `audio[i].loudness`, one number per 100 ms from t = 0. The top-level `loudness` object gives `hz` and `scale` (RMS, 0 = -60 dBFS or quieter, 255 = 0 dBFS, linear in dB). Muted inputs and near-silence read 0, matching what is encoded.
 - **`video.hdr`** is a boolean.
 - **`video.dropped_frames`** counts the encode ticks inside the clip that have no picture (gaps in the constant-rate video track: the GPU or encoder could not keep up, or the encode thread woke up late). Players show the previous picture for them. Repeated pictures (a game rendering below the clip's frame rate) are not counted.
-- **Not yet written:** `game.profile`, `player`, `privacy` and `video.vfr`. They come with per-game profiles. `analysis` is added by `rec analyze` (phase B).
+- **`game.profile`** is the id (file name without `.toml`) of the game's per-game profile, `null` without one (decision D16). **`player.names`** comes from that profile's `[player] names`; `player` is left out when the profile lists none.
+- **Not yet written:** `privacy` and `video.vfr`. `analysis` is added by `rec analyze` (phase B).
 - **`clip.trigger`** is `hotkey`, `controller`, `panel`, `tray` or `cli`.
 - **Events** from recd are only markers: `{ "t", "kind": "marker", "src": "hotkey" | "controller" | "cli", "conf": 1 }`. `rec analyze` adds `cut` and `loud` events.
 - **`time.utc_offset_min`** sits next to `start_utc` (which is UTC, with a `Z`).
@@ -188,14 +189,14 @@ The session journal is `%LOCALAPPDATA%\rec\sessions\<session id>.jsonl`. Every l
 
 | `type` | Other fields |
 |---|---|
-| `start` | `session`, `game`, `exe`, `steam_appid`, `utc_offset_min` |
+| `start` | `session`, `game`, `exe`, `steam_appid`, `profile`, `player_names`, `utc_offset_min` |
 | `marker` | `t` (seconds from session start), `src` |
 | `clip` | `clip` (id), `file`, `from`, `to`, `trigger_t` (session seconds) |
 | `end` | `t`, `why` |
 
 A game session is one run of one game: same process id and exe path. It continues through pauses, settings reloads and pipeline restarts, and ends when the game closes, another game starts or rec stops.
 
-Code: `crates/recd/src/journal.rs` (game sessions, ids, UTC, Steam app id), `crates/recd/src/sidecar.rs` (the file) and `crates/rec-audio/src/levels.rs` (the loudness meter).
+Code: `crates/recd/src/journal.rs` (game sessions, ids, UTC, Steam app id), `crates/recd/src/sidecar.rs` (the file), `crates/rec-audio/src/levels.rs` (the loudness meter) and `crates/rec-core/src/profile.rs` (per-game profiles). `summary.md` from `rec digest` names the player when the profile does.
 
 ## How an AI uses it
 
