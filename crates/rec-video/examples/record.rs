@@ -7,13 +7,17 @@
 //!     [--codec h264|hevc|av1|auto] \
 //!     [--encoder auto|amf|mf] [--hdr auto|tonemap|off] [--assume-hdr] \
 //!     [--bitrate KBPS] [--max-height N] [--no-cursor] [--request-borderless] \
-//!     --out out.h265
+//!     [--gpu-priority adaptive|normal|high] --out out.h265
 //! ```
 //!
 //! `--capture dda` forces Desktop Duplication (the Windows 10 path: the
 //! display cropped to the window) on Windows 11. `--assume-hdr` runs the HDR path (FP16 capture, HDR10 or tone-mapped
 //! output) on an SDR display. AV1 is written as a low-overhead OBU stream
-//! (`ffprobe -f obu out.obu`).
+//! (`ffprobe -f obu out.obu`). Each second's line shows the frames dropped
+//! and late (GPU work unfinished three frame periods after it was queued) in
+//! that second and the GPU priority level; priority changes are printed as
+//! they happen. Pair it with the `gpu_stress` example to see the adaptive
+//! GPU priority work.
 
 #[cfg(not(windows))]
 fn main() {
@@ -36,8 +40,8 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use rec_video::{
-        CaptureApi, CaptureSource, CodecPreference, EncoderBackend, HdrMode, Packet, VideoCapture,
-        VideoCaptureConfig, annexb, obu,
+        CaptureApi, CaptureSource, CodecPreference, EncoderBackend, GpuPriority, HdrMode, Packet,
+        VideoCapture, VideoCaptureConfig, annexb, obu,
     };
     use windows::Win32::Foundation::{
         CloseHandle, FILETIME, HLOCAL, HWND, LPARAM, LocalFree, RECT,
@@ -77,6 +81,7 @@ mod imp {
         max_height: Option<u32>,
         cursor: bool,
         request_borderless: bool,
+        gpu_priority: GpuPriority,
         out: String,
     }
 
@@ -136,6 +141,14 @@ mod imp {
                 "--max-height" => a.max_height = Some(num(value()?)? as u32),
                 "--no-cursor" => a.cursor = false,
                 "--request-borderless" => a.request_borderless = true,
+                "--gpu-priority" => {
+                    a.gpu_priority = match value()?.as_str() {
+                        "adaptive" => GpuPriority::Adaptive,
+                        "normal" => GpuPriority::Normal,
+                        "high" => GpuPriority::High,
+                        other => return Err(format!("unknown GPU priority {other}")),
+                    }
+                }
                 "--out" => a.out = value()?,
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -316,6 +329,7 @@ mod imp {
             assume_hdr_display: args.assume_hdr,
             bitrate_kbps: args.bitrate,
             cursor: args.cursor,
+            gpu_priority: args.gpu_priority,
             ..VideoCaptureConfig::new(source)
         };
 
@@ -387,17 +401,24 @@ mod imp {
         let steady_cpu0 = cpu_seconds();
         let steady_wall0 = Instant::now();
         let mut last_bytes = 0;
+        let (mut last_dropped, mut last_late) = (0, 0);
         for s in 1..=args.seconds {
             std::thread::sleep(Duration::from_secs(1));
+            for c in capture.take_gpu_priority_changes() {
+                println!("GPU priority {}: {}", c.level, c.reason);
+            }
             let st = capture.stats();
             let bytes = tally.lock().unwrap().bytes;
             println!(
-                "[{s:>3}s] captured {} submitted {} (repeated {}) encoded {} dropped {} | {:.1} Mbit/s{}{}",
+                "[{s:>3}s] captured {} submitted {} (repeated {}) encoded {} dropped {} (+{}) late +{} prio {} | {:.1} Mbit/s{}{}",
                 st.frames_captured,
                 st.frames_submitted,
                 st.frames_repeated,
                 st.frames_encoded,
                 st.frames_dropped,
+                st.frames_dropped - last_dropped,
+                st.frames_late - last_late,
+                st.gpu_priority,
                 (bytes - last_bytes) as f64 * 8.0 / 1e6,
                 st.black_since
                     .map(|t| format!(
@@ -411,6 +432,7 @@ mod imp {
                     .unwrap_or_default()
             );
             last_bytes = bytes;
+            (last_dropped, last_late) = (st.frames_dropped, st.frames_late);
             if !st.running {
                 println!("pipeline stopped (source closed: {})", st.source_closed);
                 break;

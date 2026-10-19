@@ -23,6 +23,7 @@ use crate::display::{self, DisplayColor};
 use crate::encoder::EncoderParams;
 use crate::geometry::output_size;
 use crate::obu::{self, SequenceHeaderCache};
+use crate::priority;
 use crate::probe::BlackProbe;
 use crate::sei;
 use crate::util::{ComApartment, Context, Event, Timer, wait_any};
@@ -112,6 +113,7 @@ struct Pipeline {
     _capture: Source,
     encoder: Backend,
     converter: Converter,
+    priority: priority::Control,
     shared: Arc<CaptureShared>,
     gpu: Gpu,
     info: VideoInfo,
@@ -390,9 +392,11 @@ impl Pipeline {
             config,
             duration,
         );
+        let priority = priority::Control::new(&gpu, config.gpu_priority, qpc_now(), stats.clone())?;
         capture.start()?;
         Ok(Self {
             out,
+            priority,
             _capture: capture,
             encoder,
             converter,
@@ -447,7 +451,9 @@ impl Pipeline {
             #[cfg(debug_assertions)]
             debug_fail(start, due)?;
             if tick % fps == 0 {
-                // Once a second: device health and source liveness.
+                // Once a second: GPU priority, device health and source
+                // liveness.
+                self.priority.end_second(due);
                 // SAFETY: plain status query.
                 unsafe { self.gpu.device.GetDeviceRemovedReason() }.ctx("GPU device removed")?;
                 if !d3d::source_alive(self.source) {
@@ -499,8 +505,15 @@ impl Pipeline {
             // Nothing captured yet; the stream starts with the first frame.
             return Ok(());
         }
+        // GPU work queued 3 periods ago and not done yet: the tick is
+        // starved (frames are about to drop) even when its own frame
+        // still makes it.
+        let late = self
+            .priority
+            .late_work(&self.gpu.context, time, self.duration);
         if !self.encoder.wants_input() {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            self.priority.tick(true);
             return Ok(());
         }
         let fresh = latest.seq != self.last_seq;
@@ -511,12 +524,14 @@ impl Pipeline {
             _ => match self.converter.free_slot(self.last_slot) {
                 Some(s) => {
                     self.converter.blit(&latest, s)?;
+                    self.priority.fence(&self.gpu.context, time);
                     self.probe
                         .offer(&self.gpu.context, self.converter.texture(s), time);
                     s
                 }
                 None => {
                     self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    self.priority.tick(true);
                     return Ok(());
                 }
             },
@@ -533,8 +548,10 @@ impl Pipeline {
             if !fresh {
                 self.stats.repeated.fetch_add(1, Ordering::Relaxed);
             }
+            self.priority.tick(late);
         } else {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            self.priority.tick(true);
         }
         Ok(())
     }
