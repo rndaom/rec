@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rec_video::{
-    CaptureSource, CodecPreference, Packet, VideoCapture, VideoCaptureConfig, VideoCodec, annexb,
+    CaptureApi, CaptureSource, CodecPreference, Packet, VideoCapture, VideoCaptureConfig,
+    VideoCodec, annexb,
 };
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
 use windows::Win32::System::ProcessStatus::{
@@ -41,21 +42,30 @@ fn private_bytes() -> usize {
 }
 
 fn record(codec: CodecPreference, duration: Duration) -> (VideoCodec, Vec<Packet>) {
-    let packets = Arc::new(Mutex::new(Vec::new()));
-    let sink_packets = packets.clone();
     let config = VideoCaptureConfig {
         codec,
         max_height: Some(720),
         ..VideoCaptureConfig::new(CaptureSource::PrimaryMonitor)
     };
+    record_with(config, duration)
+}
+
+fn record_with(config: VideoCaptureConfig, duration: Duration) -> (VideoCodec, Vec<Packet>) {
+    let packets = Arc::new(Mutex::new(Vec::new()));
+    let sink_packets = packets.clone();
+    let api = config.capture;
     let capture = VideoCapture::start(
         config,
         Box::new(move |p| sink_packets.lock().unwrap().push(p)),
     )
     .expect("start");
     let codec = capture.format().codec;
+    if api != CaptureApi::Auto {
+        assert_eq!(capture.info().capture, api);
+    }
     std::thread::sleep(duration);
     let stats = capture.stats();
+    println!("{stats:?}");
     assert!(stats.running, "{stats:?}");
     assert_eq!(stats.last_error, None);
     capture.stop();
@@ -101,6 +111,25 @@ fn hevc_and_h264_follow_the_packet_contract() {
         println!("{codec:?}: {} packets", packets.len());
         check_contract(codec, &packets);
     }
+}
+
+/// The Windows 10 path, forced: the primary display through Desktop
+/// Duplication (it must not be rotated).
+#[test]
+#[ignore = "needs a GPU, a desktop session and a hardware encoder"]
+fn desktop_duplication_follows_the_packet_contract() {
+    mf_startup();
+    let config = VideoCaptureConfig {
+        capture: CaptureApi::Dda,
+        codec: CodecPreference::Hevc,
+        max_height: Some(720),
+        ..VideoCaptureConfig::new(CaptureSource::PrimaryMonitor)
+    };
+    let (codec, packets) = record_with(config, Duration::from_millis(2500));
+    println!("{codec:?} via DDA: {} packets", packets.len());
+    check_contract(codec, &packets);
+    // The tick repeats the last picture while the desktop is still.
+    assert!(packets.len() >= 120, "only {} packets", packets.len());
 }
 
 #[test]

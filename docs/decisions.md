@@ -147,3 +147,12 @@ When Windows HDR is on for the captured display, rec captures the compositor's F
 - **Deleted for good:** the Recycle Bin sits on the same drive, so moving clips there would free nothing. The quota is off by default; turning it on is the user's choice. A video a player has open can't be deleted and is skipped until the next prune.
 - **Cheap when under:** the sizes of every video in the folder are summed first, without reading a sidecar. Only when that total is over the quota are sidecars and journals read (just the fields pruning needs).
 - **GB** means what Explorer shows (2^30 bytes).
+
+## D14. Windows 10: Desktop Duplication cropped to the game window
+
+Where WGC cannot turn its yellow border off (no `IsBorderRequired` before build 20348, or setting it fails), rec captures with Desktop Duplication (DDA) instead: the display the game is on, cropped to the game window (DWM's extended frame bounds), in the same BGRA8 or FP16 format WGC delivers, so conversion and encoding are shared. `video.capture = "auto" | "wgc" | "dda"` picks it; `auto` is the default and the others are for troubleshooting and testing the Windows 10 path on Windows 11. Implemented in `rec-video/src/dda.rs`, chosen in `api.rs`.
+- **Why not WGC with the border:** a yellow frame around the game while playing is not acceptable, and hooks are out (D3).
+- **Polled, not waited on:** `AcquireNextFrame` with a timeout holds the D3D11 device's multithread lock while it waits, which starved the encode thread (84 of 150 ticks dropped on a still desktop). A capture thread polls without waiting every half encode tick, like WGC's `MinUpdateInterval`; DDA accumulates the updates in between.
+- **Access lost** (UAC, lock screen, mode changes, fullscreen transitions): the duplication is recreated at once, then backing off to once a second, while the last picture repeats. The secure desktop is waited out however long it stays; other failures lasting 30 s, or a lost device, stop the pipeline for recd's recovery to restart.
+- **Costs, accepted:** whatever covers the game window is recorded (windows marked `WDA_EXCLUDEFROMCAPTURE`, like rec's overlay, are not); parts of the window off the display are not; the mouse cursor is not drawn (games hide it or draw their own). Compositing DDA's separate pointer shape can come later.
+- **Rotated displays** deliver the image unrotated. Rather than rotate it in the converter, `auto` uses WGC (border and all) there and `dda` fails with a clear error.

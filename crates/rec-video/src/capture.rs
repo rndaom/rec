@@ -19,6 +19,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::WinRT::Direct3D11::{
@@ -100,6 +101,16 @@ fn property_present(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Windows.Graphics.Capture is available (Win10 1903+).
+pub(crate) fn supported() -> bool {
+    GraphicsCaptureSession::IsSupported().unwrap_or(false)
+}
+
+/// The session can be asked to drop the yellow border (build 20348+).
+pub(crate) fn border_property_present() -> bool {
+    property_present("IsBorderRequired")
+}
+
 fn create_item(source: CaptureSource) -> Result<GraphicsCaptureItem, VideoError> {
     let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
         .ctx("IGraphicsCaptureItemInterop")?;
@@ -128,7 +139,7 @@ impl Capture {
         format: CaptureFormat,
         shared: Arc<CaptureShared>,
     ) -> Result<Self, VideoError> {
-        if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+        if !supported() {
             return Err(VideoError::CaptureUnsupported);
         }
         let item = create_item(source)?;
@@ -193,7 +204,7 @@ impl Capture {
                 .ctx("SetIsCursorCaptureEnabled")?;
         }
 
-        let border_required = if property_present("IsBorderRequired") {
+        let border_required = if border_property_present() {
             Some(disable_border(&session))
         } else {
             None
@@ -326,7 +337,12 @@ impl FrameHandler {
                 || latest.tex_width != desc.Width
                 || latest.tex_height != desc.Height
             {
-                latest.texture = Some(self.create_latest(&desc)?);
+                latest.texture = Some(create_latest(
+                    &self.device,
+                    desc.Width,
+                    desc.Height,
+                    desc.Format,
+                )?);
                 latest.tex_width = desc.Width;
                 latest.tex_height = desc.Height;
             }
@@ -363,31 +379,38 @@ impl FrameHandler {
         }
         Ok(())
     }
-
-    fn create_latest(&self, src: &D3D11_TEXTURE2D_DESC) -> Result<ID3D11Texture2D, VideoError> {
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: src.Width,
-            Height: src.Height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: src.Format,
-            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let mut texture = None;
-        // SAFETY: valid descriptor; out-pointer valid for writes.
-        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }
-            .ctx("CreateTexture2D(latest)")?;
-        texture.ok_or_else(|| VideoError::Other("CreateTexture2D returned null".into()))
-    }
 }
 
-fn poisoned() -> VideoError {
+/// A texture the converter can read a `width` x `height` frame of `format`
+/// from (shader resource) and the video processor can take as input.
+pub(crate) fn create_latest(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+) -> Result<ID3D11Texture2D, VideoError> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    // SAFETY: valid descriptor; out-pointer valid for writes.
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+        .ctx("CreateTexture2D(latest)")?;
+    texture.ok_or_else(|| VideoError::Other("CreateTexture2D returned null".into()))
+}
+
+pub(crate) fn poisoned() -> VideoError {
     VideoError::Other("capture state lock poisoned".into())
 }
