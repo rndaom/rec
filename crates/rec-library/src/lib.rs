@@ -14,6 +14,8 @@
 //! - [`analysis`] is layer 2: thumbnail, scene cuts, brightness and motion,
 //!   computed after saving and kept in the sidecar.
 //! - [`digest`] writes the self-contained bundle of `rec digest`.
+//! - [`export`] re-encodes a clip to an H.264/AAC MP4 under a size limit
+//!   ("Discord-ready").
 //!
 //! Nothing here runs inside `recd`, so none of it costs anything while a
 //! game is being recorded (D11).
@@ -23,6 +25,7 @@ pub mod b64;
 pub mod clip;
 pub mod decode;
 pub mod digest;
+pub mod export;
 pub mod image;
 pub mod journal;
 pub mod library;
