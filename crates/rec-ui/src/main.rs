@@ -100,7 +100,11 @@ fn clip_star(app: State<'_, App>, key: String, starred: bool) -> Result<(), Stri
 
 /// Moves clips (video, sidecar and `<clip>.rec`) to the Recycle Bin.
 #[tauri::command(async)]
-fn clip_delete(app: State<'_, App>, window: WebviewWindow, keys: Vec<String>) -> Result<(), String> {
+fn clip_delete(
+    app: State<'_, App>,
+    window: WebviewWindow,
+    keys: Vec<String>,
+) -> Result<(), String> {
     let mut files = Vec::new();
     let mut thumbs = Vec::new();
     for key in &keys {
@@ -113,6 +117,43 @@ fn clip_delete(app: State<'_, App>, window: WebviewWindow, keys: Vec<String>) ->
         let _ = std::fs::remove_file(t);
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct Cut {
+    start: f64,
+    end: f64,
+}
+
+/// Where a lossless trim of `[start, end]` would really cut: the start
+/// snaps back to a keyframe.
+#[tauri::command(async)]
+fn trim_plan(key: String, start: f64, end: f64) -> Result<Cut, String> {
+    let (start, end) = rec_library::trim::plan(std::path::Path::new(&key), start, end)?;
+    Ok(Cut { start, end })
+}
+
+#[derive(Serialize)]
+struct TrimDone {
+    key: String,
+    start: f64,
+    end: f64,
+}
+
+/// Saves `[start, end]` of a clip as a new clip next to it, without
+/// re-encoding.
+#[tauri::command(async)]
+fn trim(app: State<'_, App>, key: String, start: f64, end: f64) -> Result<TrimDone, String> {
+    let clip = app.library.clip(&key)?;
+    let done = rec_library::trim::trim(&clip, start, end, None)?;
+    // Show it at once, then let the worker make its thumbnail.
+    app.library.with_fresh(|_| ());
+    app.signal.poke();
+    Ok(TrimDone {
+        key: done.video.to_string_lossy().into_owned(),
+        start: done.start,
+        end: done.end,
+    })
 }
 
 #[tauri::command(async)]
@@ -176,6 +217,8 @@ fn main() {
             clip_star,
             clip_delete,
             clip_copy,
+            trim_plan,
+            trim,
             reveal,
             open_path,
         ])

@@ -41,3 +41,8 @@ export function resolution(w: number | null, h: number | null, fps: number | nul
   if (!w || !h) return "";
   return `${h}p${fps ? fps : ""}`;
 }
+
+/** Whether a key press is typing into a form field (shortcuts stay out of it). */
+export function inField(e: KeyboardEvent): boolean {
+  return e.target instanceof Element && !!e.target.closest("input, textarea, select");
+}

@@ -96,51 +96,368 @@ const fn choice(options: &'static [(&'static str, &'static str)]) -> Kind {
 /// Every setting the UI edits, in display order.
 pub fn schema() -> Vec<Field> {
     let mut fields = vec![
-        field!("replay.seconds", "Replay", "Clip length", "Seconds of gameplay the save hotkey keeps.", num(config::MIN_REPLAY_SECONDS, config::MAX_REPLAY_SECONDS, 5, "s")),
-        field!("replay.post_roll_seconds", "Replay", "Keep recording after saving", "Seconds recorded after the hotkey before the clip is closed.", num(0, 60, 1, "s")),
-        field!("replay.max_memory_mb", "Replay", "Buffer memory limit", "Hard cap on the replay buffer's memory. 60 s at 50 Mbit/s is about 375 MB.", num(64, 16 * 1024, 64, "MB")),
-        field!("video.fps", "Video", "Frame rate", "Frames per second recorded.", num(10, 240, 1, "fps")),
-        field!("video.max_height", "Video", "Maximum height", "Downscale to this height, e.g. 1080. Empty keeps the game's resolution.", opt_num(360, 4320, 1, "px")),
-        field!("video.quality", "Video", "Quality", "Bitrate preset for the encoder.", choice(&[("performance", "Performance"), ("balanced", "Balanced"), ("quality", "Quality")])),
-        field!("video.bitrate_kbps", "Video", "Bitrate", "Overrides the quality preset. Empty uses the preset.", opt_num(1_000, 200_000, 500, "kbit/s")),
-        field!("video.codec", "Video", "Codec", "Auto picks HEVC where the GPU has it, else H.264. H.264 plays everywhere; AV1 makes the smallest files.", choice(&[("auto", "Auto"), ("h264", "H.264"), ("hevc", "HEVC"), ("av1", "AV1")])),
-        field!("video.encoder", "Video", "Encoder", "Auto uses the GPU vendor's native encoder where rec has one, else Media Foundation.", choice(&[("auto", "Auto"), ("amd", "AMD AMF"), ("nvidia", "NVIDIA"), ("intel", "Intel"), ("media_foundation", "Media Foundation")])),
-        field!("video.hdr", "Video", "HDR", "Auto keeps HDR (10-bit HEVC or AV1) when the display is in HDR mode; Tone-map makes SDR clips that look right everywhere.", choice(&[("auto", "Auto"), ("tonemap", "Tone-map to SDR"), ("off", "Off")])),
-        field!("video.cursor", "Video", "Record the mouse cursor", "", Kind::Bool),
-        field!("video.target", "Video", "Capture", "Game records only the game's window: no notifications or second monitor in clips.", choice(&[("game", "Game window"), ("display", "Whole display")])),
-        field!("video.capture", "Video", "Capture method", "Leave on Auto; the others are for troubleshooting.", choice(&[("auto", "Auto"), ("wgc", "Windows.Graphics.Capture"), ("dda", "Desktop Duplication")])),
-        field!("video.gpu_priority", "Video", "GPU priority", "Adaptive raises rec's GPU priority only while a GPU-bound game makes frames drop.", choice(&[("adaptive", "Adaptive"), ("normal", "Normal"), ("high", "High")])),
-        field!("audio.game", "Audio", "Game audio", "Sound from the game's process tree.", Kind::Bool),
-        field!("audio.voice_chat", "Audio", "Voice chat", "Voice chat apps on their own track.", Kind::Bool),
-        field!("audio.voice_chat_apps", "Audio", "Voice chat apps", "Executables recorded as voice chat, one per line.", Kind::List),
-        field!("audio.microphone", "Audio", "Microphone", "Applies from the next recording when turned on mid-game.", Kind::Bool),
-        field!("audio.microphone_device", "Audio", "Microphone device", "Endpoint ID. Empty uses the default communications device.", Kind::Text { optional: true, placeholder: "Default device" }),
-        field!("audio.other_apps", "Audio", "Other apps", "All other system sound.", Kind::Bool),
-        field!("audio.mixed_track", "Audio", "Mixed track first", "A single mixed track for players and sites that play only one.", Kind::Bool),
-        field!("audio.bitrate_kbps", "Audio", "Audio bitrate", "", num(64, 512, 32, "kbit/s")),
-        field!("output.directory", "Saving", "Clips folder", "Empty saves to Videos\\rec.", Kind::Folder),
-        field!("output.folder_per_game", "Saving", "A folder per game", "", Kind::Bool),
-        field!("output.filename", "Saving", "File name", "Placeholders: {game}, {date}, {time}, {seconds}.", Kind::Text { optional: false, placeholder: "{game}_{date}_{time}" }),
-        field!("output.quota_gb", "Saving", "Storage limit", "Keeps rec's clips under this size by deleting the oldest for good. Starred and read-only clips are never deleted. Empty: no limit.", opt_num(1, 100_000, 1, "GB")),
-        field!("output.sidecar", "Saving", "Clip details file", "Writes <clip>.rec.json next to each clip: game, markers, audio tracks and loudness, for the library and AI tools.", Kind::Bool),
-        field!("hotkeys.save_clip", "Hotkeys", "Save clip", "", Kind::Hotkey { optional: false }),
-        field!("hotkeys.toggle_overlay", "Hotkeys", "Quick panel", "", Kind::Hotkey { optional: false }),
-        field!("hotkeys.extra_clips", "Hotkeys", "Extra clip lengths", "More save hotkeys, each with its own length.", Kind::ExtraClips),
-        field!("hotkeys.add_marker", "Hotkeys", "Add marker", "Marks a moment; markers show on the clip's timeline.", Kind::Hotkey { optional: true }),
-        field!("hotkeys.star_last", "Hotkeys", "Star last clip", "Starred clips are never deleted by the storage limit.", Kind::Hotkey { optional: true }),
-        field!("hotkeys.pause", "Hotkeys", "Pause / resume", "", Kind::Hotkey { optional: true }),
-        field!("hotkeys.controller_save", "Controller", "Save clip", "Buttons held together, e.g. LS+RS. Off by default: the game sees the buttons too.", Kind::Combo),
-        field!("hotkeys.controller_add_marker", "Controller", "Add marker", "", Kind::Combo),
-        field!("hotkeys.controller_star_last", "Controller", "Star last clip", "", Kind::Combo),
-        field!("hotkeys.controller_hold_ms", "Controller", "Hold time", "How long a combo must be held before it acts.", num(config::MIN_CONTROLLER_HOLD_MS, config::MAX_CONTROLLER_HOLD_MS, 50, "ms")),
-        field!("behavior.record_when", "Behavior", "Record", "Game detected costs almost nothing while no game is running.", choice(&[("game_detected", "When a game is running"), ("always", "Always"), ("manual", "Only when started by hand")])),
-        field!("behavior.save_sound", "Behavior", "Sound when a clip is saved", "", Kind::Bool),
-        field!("behavior.save_toast", "Behavior", "Notification when a clip is saved", "", Kind::Bool),
-        field!("behavior.pause_on_battery", "Behavior", "Pause on battery", "", Kind::Bool),
-        field!("behavior.start_with_windows", "Behavior", "Start with Windows", "", Kind::Bool),
-        field!("behavior.game_apps", "Games", "Always games", "Executables always recorded, even windowed.", Kind::List),
-        field!("behavior.ignored_apps", "Games", "Never games", "Executables never treated as games.", Kind::List),
-        field!("behavior.private_apps", "Games", "Private apps", "Recording pauses while one of these is in front.", Kind::List),
+        field!(
+            "replay.seconds",
+            "Replay",
+            "Clip length",
+            "Seconds of gameplay the save hotkey keeps.",
+            num(
+                config::MIN_REPLAY_SECONDS,
+                config::MAX_REPLAY_SECONDS,
+                5,
+                "s"
+            )
+        ),
+        field!(
+            "replay.post_roll_seconds",
+            "Replay",
+            "Keep recording after saving",
+            "Seconds recorded after the hotkey before the clip is closed.",
+            num(0, 60, 1, "s")
+        ),
+        field!(
+            "replay.max_memory_mb",
+            "Replay",
+            "Buffer memory limit",
+            "Hard cap on the replay buffer's memory. 60 s at 50 Mbit/s is about 375 MB.",
+            num(64, 16 * 1024, 64, "MB")
+        ),
+        field!(
+            "video.fps",
+            "Video",
+            "Frame rate",
+            "Frames per second recorded.",
+            num(10, 240, 1, "fps")
+        ),
+        field!(
+            "video.max_height",
+            "Video",
+            "Maximum height",
+            "Downscale to this height, e.g. 1080. Empty keeps the game's resolution.",
+            opt_num(360, 4320, 1, "px")
+        ),
+        field!(
+            "video.quality",
+            "Video",
+            "Quality",
+            "Bitrate preset for the encoder.",
+            choice(&[
+                ("performance", "Performance"),
+                ("balanced", "Balanced"),
+                ("quality", "Quality")
+            ])
+        ),
+        field!(
+            "video.bitrate_kbps",
+            "Video",
+            "Bitrate",
+            "Overrides the quality preset. Empty uses the preset.",
+            opt_num(1_000, 200_000, 500, "kbit/s")
+        ),
+        field!(
+            "video.codec",
+            "Video",
+            "Codec",
+            "Auto picks HEVC where the GPU has it, else H.264. H.264 plays everywhere; AV1 makes the smallest files.",
+            choice(&[
+                ("auto", "Auto"),
+                ("h264", "H.264"),
+                ("hevc", "HEVC"),
+                ("av1", "AV1")
+            ])
+        ),
+        field!(
+            "video.encoder",
+            "Video",
+            "Encoder",
+            "Auto uses the GPU vendor's native encoder where rec has one, else Media Foundation.",
+            choice(&[
+                ("auto", "Auto"),
+                ("amd", "AMD AMF"),
+                ("nvidia", "NVIDIA"),
+                ("intel", "Intel"),
+                ("media_foundation", "Media Foundation")
+            ])
+        ),
+        field!(
+            "video.hdr",
+            "Video",
+            "HDR",
+            "Auto keeps HDR (10-bit HEVC or AV1) when the display is in HDR mode; Tone-map makes SDR clips that look right everywhere.",
+            choice(&[
+                ("auto", "Auto"),
+                ("tonemap", "Tone-map to SDR"),
+                ("off", "Off")
+            ])
+        ),
+        field!(
+            "video.cursor",
+            "Video",
+            "Record the mouse cursor",
+            "",
+            Kind::Bool
+        ),
+        field!(
+            "video.target",
+            "Video",
+            "Capture",
+            "Game records only the game's window: no notifications or second monitor in clips.",
+            choice(&[("game", "Game window"), ("display", "Whole display")])
+        ),
+        field!(
+            "video.capture",
+            "Video",
+            "Capture method",
+            "Leave on Auto; the others are for troubleshooting.",
+            choice(&[
+                ("auto", "Auto"),
+                ("wgc", "Windows.Graphics.Capture"),
+                ("dda", "Desktop Duplication")
+            ])
+        ),
+        field!(
+            "video.gpu_priority",
+            "Video",
+            "GPU priority",
+            "Adaptive raises rec's GPU priority only while a GPU-bound game makes frames drop.",
+            choice(&[
+                ("adaptive", "Adaptive"),
+                ("normal", "Normal"),
+                ("high", "High")
+            ])
+        ),
+        field!(
+            "audio.game",
+            "Audio",
+            "Game audio",
+            "Sound from the game's process tree.",
+            Kind::Bool
+        ),
+        field!(
+            "audio.voice_chat",
+            "Audio",
+            "Voice chat",
+            "Voice chat apps on their own track.",
+            Kind::Bool
+        ),
+        field!(
+            "audio.voice_chat_apps",
+            "Audio",
+            "Voice chat apps",
+            "Executables recorded as voice chat, one per line.",
+            Kind::List
+        ),
+        field!(
+            "audio.microphone",
+            "Audio",
+            "Microphone",
+            "Applies from the next recording when turned on mid-game.",
+            Kind::Bool
+        ),
+        field!(
+            "audio.microphone_device",
+            "Audio",
+            "Microphone device",
+            "Endpoint ID. Empty uses the default communications device.",
+            Kind::Text {
+                optional: true,
+                placeholder: "Default device"
+            }
+        ),
+        field!(
+            "audio.other_apps",
+            "Audio",
+            "Other apps",
+            "All other system sound.",
+            Kind::Bool
+        ),
+        field!(
+            "audio.mixed_track",
+            "Audio",
+            "Mixed track first",
+            "A single mixed track for players and sites that play only one.",
+            Kind::Bool
+        ),
+        field!(
+            "audio.bitrate_kbps",
+            "Audio",
+            "Audio bitrate",
+            "",
+            num(64, 512, 32, "kbit/s")
+        ),
+        field!(
+            "output.directory",
+            "Saving",
+            "Clips folder",
+            "Empty saves to Videos\\rec.",
+            Kind::Folder
+        ),
+        field!(
+            "output.folder_per_game",
+            "Saving",
+            "A folder per game",
+            "",
+            Kind::Bool
+        ),
+        field!(
+            "output.filename",
+            "Saving",
+            "File name",
+            "Placeholders: {game}, {date}, {time}, {seconds}.",
+            Kind::Text {
+                optional: false,
+                placeholder: "{game}_{date}_{time}"
+            }
+        ),
+        field!(
+            "output.quota_gb",
+            "Saving",
+            "Storage limit",
+            "Keeps rec's clips under this size by deleting the oldest for good. Starred and read-only clips are never deleted. Empty: no limit.",
+            opt_num(1, 100_000, 1, "GB")
+        ),
+        field!(
+            "output.sidecar",
+            "Saving",
+            "Clip details file",
+            "Writes <clip>.rec.json next to each clip: game, markers, audio tracks and loudness, for the library and AI tools.",
+            Kind::Bool
+        ),
+        field!(
+            "hotkeys.save_clip",
+            "Hotkeys",
+            "Save clip",
+            "",
+            Kind::Hotkey { optional: false }
+        ),
+        field!(
+            "hotkeys.toggle_overlay",
+            "Hotkeys",
+            "Quick panel",
+            "",
+            Kind::Hotkey { optional: false }
+        ),
+        field!(
+            "hotkeys.extra_clips",
+            "Hotkeys",
+            "Extra clip lengths",
+            "More save hotkeys, each with its own length.",
+            Kind::ExtraClips
+        ),
+        field!(
+            "hotkeys.add_marker",
+            "Hotkeys",
+            "Add marker",
+            "Marks a moment; markers show on the clip's timeline.",
+            Kind::Hotkey { optional: true }
+        ),
+        field!(
+            "hotkeys.star_last",
+            "Hotkeys",
+            "Star last clip",
+            "Starred clips are never deleted by the storage limit.",
+            Kind::Hotkey { optional: true }
+        ),
+        field!(
+            "hotkeys.pause",
+            "Hotkeys",
+            "Pause / resume",
+            "",
+            Kind::Hotkey { optional: true }
+        ),
+        field!(
+            "hotkeys.controller_save",
+            "Controller",
+            "Save clip",
+            "Buttons held together, e.g. LS+RS. Off by default: the game sees the buttons too.",
+            Kind::Combo
+        ),
+        field!(
+            "hotkeys.controller_add_marker",
+            "Controller",
+            "Add marker",
+            "",
+            Kind::Combo
+        ),
+        field!(
+            "hotkeys.controller_star_last",
+            "Controller",
+            "Star last clip",
+            "",
+            Kind::Combo
+        ),
+        field!(
+            "hotkeys.controller_hold_ms",
+            "Controller",
+            "Hold time",
+            "How long a combo must be held before it acts.",
+            num(
+                config::MIN_CONTROLLER_HOLD_MS,
+                config::MAX_CONTROLLER_HOLD_MS,
+                50,
+                "ms"
+            )
+        ),
+        field!(
+            "behavior.record_when",
+            "Behavior",
+            "Record",
+            "Game detected costs almost nothing while no game is running.",
+            choice(&[
+                ("game_detected", "When a game is running"),
+                ("always", "Always"),
+                ("manual", "Only when started by hand")
+            ])
+        ),
+        field!(
+            "behavior.save_sound",
+            "Behavior",
+            "Sound when a clip is saved",
+            "",
+            Kind::Bool
+        ),
+        field!(
+            "behavior.save_toast",
+            "Behavior",
+            "Notification when a clip is saved",
+            "",
+            Kind::Bool
+        ),
+        field!(
+            "behavior.pause_on_battery",
+            "Behavior",
+            "Pause on battery",
+            "",
+            Kind::Bool
+        ),
+        field!(
+            "behavior.start_with_windows",
+            "Behavior",
+            "Start with Windows",
+            "",
+            Kind::Bool
+        ),
+        field!(
+            "behavior.game_apps",
+            "Games",
+            "Always games",
+            "Executables always recorded, even windowed.",
+            Kind::List
+        ),
+        field!(
+            "behavior.ignored_apps",
+            "Games",
+            "Never games",
+            "Executables never treated as games.",
+            Kind::List
+        ),
+        field!(
+            "behavior.private_apps",
+            "Games",
+            "Private apps",
+            "Recording pauses while one of these is in front.",
+            Kind::List
+        ),
     ];
     for f in &mut fields {
         f.per_game = profile::overridable(f.key);
@@ -358,8 +675,7 @@ fn with_values(base: &Config, changes: &[&Change]) -> Result<Config, String> {
         if c.value.is_null() {
             target.remove(key);
         } else {
-            let value = toml::Value::try_from(&c.value)
-                .map_err(|e| format!("{}: {e}", c.key))?;
+            let value = toml::Value::try_from(&c.value).map_err(|e| format!("{}: {e}", c.key))?;
             target.insert(key.to_owned(), value);
         }
     }
@@ -443,7 +759,7 @@ mod tests {
     #[test]
     fn duplicate_hotkeys_warn() {
         let mut config = Config::default();
-        config.hotkeys.pause = Some(config.hotkeys.save_clip.clone());
+        config.hotkeys.pause = Some(config.hotkeys.save_clip);
         assert!(warnings(&config).iter().any(|w| w.contains("both use")));
     }
 }

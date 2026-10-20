@@ -3,6 +3,7 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
@@ -45,7 +46,10 @@ pub fn recycle(owner: Option<HWND>, paths: &[PathBuf]) -> Result<(), String> {
         hwnd: owner.unwrap_or_default(),
         wFunc: FO_DELETE,
         pFrom: PCWSTR(from.as_ptr()),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_WANTNUKEWARNING
+        fFlags: (FOF_ALLOWUNDO
+            | FOF_NOCONFIRMATION
+            | FOF_SILENT
+            | FOF_WANTNUKEWARNING
             | FOF_NOERRORUI)
             .0 as u16,
         ..Default::default()
@@ -53,7 +57,9 @@ pub fn recycle(owner: Option<HWND>, paths: &[PathBuf]) -> Result<(), String> {
     // SAFETY: `from` is a double-NUL-terminated list that outlives the call.
     let result = unsafe { SHFileOperationW(&mut op) };
     if result != 0 {
-        return Err(format!("couldn't move to the Recycle Bin (error {result:#x}); is the clip open in a player?"));
+        return Err(format!(
+            "couldn't move to the Recycle Bin (error {result:#x}); is the clip open in a player?"
+        ));
     }
     if op.fAnyOperationsAborted.as_bool() {
         return Err("cancelled".into());
@@ -82,8 +88,7 @@ pub fn copy_files(owner: HWND, paths: &[PathBuf]) -> Result<(), String> {
         OpenClipboard(Some(owner)).map_err(|e| format!("clipboard busy: {e}"))?;
         let result = (|| {
             EmptyClipboard().map_err(|e| e.to_string())?;
-            SetClipboardData(CF_HDROP.0.into(), Some(HANDLE(drop.0)))
-                .map_err(|e| e.to_string())?;
+            SetClipboardData(CF_HDROP.0.into(), Some(HANDLE(drop.0))).map_err(|e| e.to_string())?;
             let format = RegisterClipboardFormatW(w!("Preferred DropEffect"));
             SetClipboardData(format, Some(HANDLE(effect.0))).map_err(|e| e.to_string())?;
             Ok::<(), String>(())
@@ -134,7 +139,14 @@ pub fn open(path: &Path) -> Result<(), String> {
     let file = wide(path.as_os_str());
     // SAFETY: NUL-terminated strings that outlive the call.
     let result = unsafe {
-        ShellExecuteW(None, w!("open"), PCWSTR(file.as_ptr()), None, None, SW_SHOWNORMAL)
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(file.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
     };
     // Values above 32 mean success.
     if result.0 as isize > 32 {
@@ -143,5 +155,3 @@ pub fn open(path: &Path) -> Result<(), String> {
         Err(format!("can't open {}", path.display()))
     }
 }
-
-use std::os::windows::process::CommandExt;

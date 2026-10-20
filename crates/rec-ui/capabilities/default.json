@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "The main window: rec's own commands, events and dragging clips out.",
   "windows": ["main"],
-  "permissions": ["core:default", "drag:default", "dialog:allow-open", "dialog:allow-save"]
+  "permissions": ["core:default", "drag:default", "dialog:allow-open", "dialog:allow-save", "dialog:allow-ask", "dialog:allow-message"]
 }

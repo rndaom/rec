@@ -3,7 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { api, type ClipItem, type Listing } from "../lib/api";
-  import { bytes } from "../lib/format";
+  import { bytes, inField } from "../lib/format";
   import ClipCard from "./ClipCard.svelte";
   import ClipView from "./ClipView.svelte";
 
@@ -97,7 +97,7 @@
   }
 
   function onkey(e: KeyboardEvent) {
-    if (openKey || (e.target as HTMLElement).closest("input, textarea, select")) return;
+    if (openKey || inField(e)) return;
     if (e.key === "Delete" && selected.size) deleteSelected();
     else if (e.key === "a" && e.ctrlKey) {
       selected = new Set(shown.map((c) => c.key));
@@ -127,6 +127,7 @@
 <svelte:window onkeydown={onkey} />
 
 {#if openKey}
+  {#key openKey}
   <ClipView
     key={openKey}
     {recording}
@@ -140,6 +141,7 @@
     }}
     onsay={say}
   />
+  {/key}
 {:else}
   <header>
     <h1>Clips</h1>

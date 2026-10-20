@@ -3,7 +3,7 @@
   import { ask } from "@tauri-apps/plugin-dialog";
   import { api, fileUrl, type Detail } from "../lib/api";
   import { dragOut } from "../lib/drag";
-  import { bytes, duration as fmt, precise, when } from "../lib/format";
+  import { bytes, duration as fmt, inField, precise, when } from "../lib/format";
   import Timeline from "./Timeline.svelte";
   import ExportDialog from "./ExportDialog.svelte";
 
@@ -159,7 +159,7 @@
   }
 
   function onkey(e: KeyboardEvent) {
-    if (exporting || (e.target as HTMLElement).closest("input, textarea, select")) return;
+    if (exporting || inField(e)) return;
     const k = e.key;
     if (k === " " || k === "k") toggle();
     else if (k === "ArrowLeft") seek((video?.currentTime ?? 0) - (e.shiftKey ? 1 : 5));
@@ -191,12 +191,11 @@
       <strong>{detail.game || detail.file}</strong>
       <span class="faint">{when(detail.start_utc ?? detail.modified)} · {fmt(detail.duration)} · {bytes(detail.bytes)}{detail.codec ? ` · ${detail.codec.toUpperCase()}` : ""}{detail.height ? ` ${detail.height}p${detail.fps ?? ""}` : ""}{detail.hdr ? " HDR" : ""}</span>
     </div>
-    <div class="grow"></div>
     <button class="star" class:on={detail.starred} onclick={star} title="Starred clips are never deleted by the storage limit">★ {detail.starred ? "Starred" : "Star"}</button>
     <button onclick={copy} title="Copy the file, to paste into Discord, a chat or Explorer">Copy</button>
     <button draggable="true" ondragstart={(e) => dragOut(e, [key], detail?.thumb ?? null)} title="Drag the file into another app">Drag out</button>
     <button onclick={() => (exporting = true)}>Export for Discord…</button>
-    <button class="ghost" onclick={() => api.reveal(key)} title="Show in Explorer">Show in folder</button>
+    <button class="ghost" onclick={() => api.reveal(key)} title="Show in Explorer">Folder</button>
     <button class="ghost" onclick={() => api.open(key)} title="Open in the default player">Open</button>
     <button class="ghost danger" onclick={remove} title="Move to the Recycle Bin (Delete)">Delete</button>
   {/if}
@@ -291,13 +290,21 @@
     gap: 8px;
     padding: 10px 16px;
     border-bottom: 1px solid var(--line);
-    flex-wrap: wrap;
+  }
+  header button {
+    flex: none;
   }
   .title {
     display: flex;
     flex-direction: column;
+    flex: 1 1 0;
     min-width: 0;
     margin-left: 6px;
+  }
+  .title > * {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .title span {
     font-size: 12px;
