@@ -4,7 +4,7 @@ A free, open-source instant-replay recorder for Windows that stays out of your g
 
 rec runs quietly in the background and keeps the last minute (or however long you choose) of your game. Press **Alt+F8** and that moment is saved as a clip. That's the whole idea. It works in any game or app, needs no account, never uploads anything, and is built so your game keeps its frame rate.
 
-> **Status: pre-alpha (milestone 1 done).** rec records games, keeps a replay buffer and saves clips with sound. There is no settings UI yet (edit the config file from the tray menu), no installer, and only one combined audio track. See the [roadmap](docs/roadmap.md).
+> **Status: pre-alpha (milestones 1 and 2 done, 3 in progress).** rec records games with per-app audio tracks, HDR and AV1, and has a settings and clip library app (`rec-ui`): settings, per-game profiles, a player with a marker timeline, lossless trim, star, delete and a Discord-sized export. There is no installer yet. See the [roadmap](docs/roadmap.md).
 
 ## Measured cost
 These are early numbers from one machine (Ryzen 7 9800X3D, RX 7800 XT, Windows 11 25H2). They were taken while recording a live Deadlock match at 1080p60, HEVC, 18 Mbit/s, with a 60 s buffer. Proper PresentMon frame-time benchmarks are still to be run.
@@ -42,6 +42,8 @@ crates/
   rec-cli/    `rec` command-line control (rec save 30, rec status, rec digest, rec mcp, ...)
   rec-library/ saved clips for AI tools: sidecars, journals, overlaps, frame decoding, analysis
   rec-bench/  benchmark harness: PresentMon with and without recd, recd idle cost
+  rec-ui/     settings and clip library app (Tauri 2), runs only while open
+ui/           rec-ui's frontend (Svelte 5 + TypeScript, Vite)
 bench/
   README.md     how to run a fair benchmark and read the results
   results/      published summaries (raw PresentMon CSVs are git-ignored)
@@ -63,6 +65,18 @@ cargo build --release
 cargo test
 ```
 
+The app (`rec-ui.exe`) embeds its frontend, which needs Node.js to build first. Without it, `cargo build` still works and the app shows how to build the UI.
+
+```bash
+npm --prefix ui install
+```
+
+```bash
+npm --prefix ui run build
+```
+
+Then `cargo build --release -p rec-ui`. For UI work with live reload, run `npx tauri dev -- --no-default-features` from `crates/rec-ui` (it starts the Vite dev server).
+
 ## Running
 Start `target\release\recd.exe`. A dot appears in the notification area:
 - **Red:** recording.
@@ -71,6 +85,8 @@ Start `target\release\recd.exe`. A dot appears in the notification area:
 - **Orange ring:** a problem. Hover over it or open its menu to see why.
 
 Start a game and press **Alt+F8** to save the last 60 seconds to `Videos\rec\<game>\`.
+
+Open **Clips and settings** from the tray menu (or run `rec-ui.exe`, kept next to `recd.exe`) to watch, trim, star, share and delete clips and to change settings. Closing it never stops recording.
 
 ## Using the CLI
 ```bash
