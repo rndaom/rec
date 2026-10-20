@@ -14,6 +14,8 @@
 //! - [`analysis`] is layer 2: thumbnail, scene cuts, brightness and motion,
 //!   computed after saving and kept in the sidecar.
 //! - [`digest`] writes the self-contained bundle of `rec digest`.
+//! - [`trim`] cuts a clip losslessly at its GOP fragments, with a sidecar
+//!   whose `parent` is the source.
 //!
 //! Nothing here runs inside `recd`, so none of it costs anything while a
 //! game is being recorded (D11).
@@ -31,6 +33,7 @@ pub mod summary;
 pub mod sys;
 pub mod time;
 pub mod timeline;
+pub mod trim;
 
 pub use clip::Clip;
 pub use library::Library;

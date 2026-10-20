@@ -183,6 +183,8 @@ What phase A writes differs from the sketch above in a few places:
 - **`time.utc_offset_min`** sits next to `start_utc` (which is UTC, with a `Z`).
 - **`starred`** (top level, boolean) is set by `rec star` and `rec unstar`, and by recd's "Star last clip" (the `hotkeys.star_last` hotkey, no default, and the quick-panel row), which stars the clip recd saved last in this run. Quota pruning never deletes a starred clip (D13). Starring a clip that has no sidecar writes one: `rec star` builds it from the journal line, recd from the same facts kept from the save (layer 0 only: no `video`, no loudness, `audio: []`). `rec analyze` keeps the flag from the file on disk, so starring during analysis sticks.
 
+- **Trims** (`rec_library::trim`) get their own sidecar: a new `clip.id`, `clip.parent` = the source's id, and every clip time shifted by the cut start (`saved_at` becomes `null` outside the trim; events outside it are dropped, ranged ones clipped; loudness curves sliced). `analysis` and `video.dropped_frames` are left out and `starred` is cleared, being stale; other fields are kept. A journal-only clip's trim gets a sidecar built from its journal facts.
+
 `output.sidecar = false` turns the file off. The journal is written either way.
 
 The session journal is `%LOCALAPPDATA%\rec\sessions\<session id>.jsonl`. Every line has `type` and `utc`:

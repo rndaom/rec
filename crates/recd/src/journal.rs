@@ -6,9 +6,7 @@
 //! every clip saved with its range, and when it ended. Clip ranges on one
 //! timeline make overlapping clips easy to spot (see `docs/ai-clips.md`).
 
-use std::collections::hash_map::RandomState;
 use std::fs::OpenOptions;
-use std::hash::BuildHasher;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -281,29 +279,7 @@ pub fn utc_offset_minutes() -> i32 {
 
 // ---- ids ----------------------------------------------------------------------
 
-/// A ULID: 48 bits of Unix milliseconds, then 80 random bits, in Crockford
-/// base32 (26 characters). Ids sort by creation time and stay unique
-/// across machines, so a clip keeps its id when renamed or copied.
-pub fn new_id() -> String {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
-    // RandomState is seeded from the OS random source; hashing a counter with
-    // two fresh states gives 128 random bits without another dependency.
-    let a = RandomState::new().hash_one(qpc_now());
-    let b = RandomState::new().hash_one(ms);
-    let random = (u128::from(a) << 64 | u128::from(b)) & ((1 << 80) - 1);
-    ulid(ms, random)
-}
-
-fn ulid(ms: u64, random: u128) -> String {
-    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let value = (u128::from(ms) & ((1 << 48) - 1)) << 80 | random;
-    (0..26)
-        .rev()
-        .map(|i| ALPHABET[(value >> (i * 5)) as usize & 31] as char)
-        .collect()
-}
+pub use rec_core::store::new_id;
 
 // ---- Steam --------------------------------------------------------------------
 
@@ -375,18 +351,6 @@ mod tests {
         let now = (now.as_nanos() / 100) as i64;
         let t = utc_at(qpc_now() - secs(10));
         assert!((now - secs(10) - t).abs() < secs(1));
-    }
-
-    #[test]
-    fn ulids() {
-        assert_eq!(ulid(0, 0), "00000000000000000000000000");
-        // The spec's example timestamp.
-        assert!(ulid(1_469_918_176_385, 0).starts_with("01ARYZ6S41"));
-        assert_eq!(ulid(u64::MAX, u128::MAX >> 48).len(), 26);
-        let a = new_id();
-        let b = new_id();
-        assert_eq!(a.len(), 26);
-        assert_ne!(a, b);
     }
 
     #[test]

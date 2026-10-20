@@ -17,11 +17,13 @@
 //! quick-panel row use it. `rec star` goes through rec-library, which writes
 //! sidecars with the same [`write_sidecar`].
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::BuildHasher;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -515,6 +517,32 @@ pub fn compact_number_arrays(pretty: &str) -> String {
     out
 }
 
+/// A new clip or session id: a ULID, 48 bits of Unix milliseconds then 80
+/// random bits in Crockford base32 (26 characters). Ids sort by creation
+/// time and stay unique across machines, so a clip keeps its id when renamed
+/// or copied.
+pub fn new_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let ms = now.as_millis() as u64;
+    // RandomState is seeded from the OS random source; hashing with two fresh
+    // states gives 128 random bits without another dependency.
+    let a = RandomState::new().hash_one(now.as_nanos());
+    let b = RandomState::new().hash_one(ms);
+    let random = (u128::from(a) << 64 | u128::from(b)) & ((1 << 80) - 1);
+    ulid(ms, random)
+}
+
+fn ulid(ms: u64, random: u128) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let value = (u128::from(ms) & ((1 << 48) - 1)) << 80 | random;
+    (0..26)
+        .rev()
+        .map(|i| ALPHABET[(value >> (i * 5)) as usize & 31] as char)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,6 +815,18 @@ mod tests {
         assert!(pruned.freed() > 1010);
         assert!(!old.exists() && !sidecar_for(&old).exists() && !extras_dir(&old).exists());
         assert!(new.exists() && sidecar_for(&new).exists() && other.exists());
+    }
+
+    #[test]
+    fn ulids() {
+        assert_eq!(ulid(0, 0), "00000000000000000000000000");
+        // The spec's example timestamp.
+        assert!(ulid(1_469_918_176_385, 0).starts_with("01ARYZ6S41"));
+        assert_eq!(ulid(u64::MAX, u128::MAX >> 48).len(), 26);
+        let a = new_id();
+        let b = new_id();
+        assert_eq!(a.len(), 26);
+        assert_ne!(a, b);
     }
 
     #[test]
