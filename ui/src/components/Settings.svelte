@@ -89,7 +89,12 @@
       {/each}
       <div class="grow"></div>
       <div class="files faint">
-        <button class="link" onclick={() => api.open(snap!.profile?.path ?? snap!.config_path)}>Open the file</button>
+        <button
+          class="link"
+          onclick={() =>
+            api.open(snap!.profile?.path ?? snap!.config_path).catch((e) => (status = { text: String(e), bad: true }))}
+          >Open the file</button
+        >
         <span>Comments and layout in the file are kept.</span>
       </div>
     </aside>

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { ask } from "@tauri-apps/plugin-dialog";
   import { api, fileUrl, type Detail } from "../lib/api";
   import { dragOut } from "../lib/drag";
@@ -59,21 +60,25 @@
   }
 
   // Where a lossless trim really cuts, shown on the timeline as it changes.
-  let planTimer: ReturnType<typeof setTimeout> | undefined;
+  // Only the newest request's answer counts; slower older ones are dropped.
+  let planRequest = 0;
   $effect(() => {
     const [a, b] = [inPoint ?? 0, outPoint ?? duration];
-    clearTimeout(planTimer);
+    const id = ++planRequest;
     if (!hasRange || !detail) {
       snapped = null;
       return;
     }
-    planTimer = setTimeout(async () => {
+    const timer = setTimeout(async () => {
+      let answer: { start: number; end: number } | null = null;
       try {
-        snapped = await api.trimPlan(key, a, b);
+        answer = await api.trimPlan(key, a, b);
       } catch {
-        snapped = null;
+        answer = null;
       }
+      if (id === planRequest) snapped = answer;
     }, 120);
+    return () => clearTimeout(timer);
   });
 
   function seek(t: number) {
@@ -179,6 +184,13 @@
 
   onMount(() => {
     load();
+    // Scene cuts and loud moments appear when background analysis finishes.
+    const unlisten = listen<string>("clip-updated", (e) => {
+      if (e.payload.toLowerCase() === key.toLowerCase()) load();
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
   });
 </script>
 

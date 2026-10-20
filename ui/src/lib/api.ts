@@ -14,6 +14,8 @@ export interface Status {
 
 export interface RecdState {
   running: boolean;
+  /** A game may be running: heavy work warns or waits. */
+  busy: boolean;
   status: Status | null;
   error: string | null;
 }
@@ -160,6 +162,7 @@ export interface ExportPlan {
 }
 
 export interface ExportDone {
+  job: number;
   path: string;
   bytes: number;
   width: number;
@@ -186,7 +189,7 @@ export const api = {
     invoke<TrimPlan>("trim_plan", { key, start, end }),
   trim: (key: string, start: number, end: number) => invoke<Trimmed>("trim", { key, start, end }),
   exportPlan: (request: ExportRequest) => invoke<ExportPlan>("export_plan", { request }),
-  exportStart: (request: ExportRequest) => invoke<void>("export_start", { request }),
+  exportStart: (request: ExportRequest) => invoke<number>("export_start", { request }),
   exportCancel: () => invoke<void>("export_cancel"),
 };
 

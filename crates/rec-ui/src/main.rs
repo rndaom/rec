@@ -110,7 +110,9 @@ fn clip_delete(
     let mut files = Vec::new();
     let mut thumbs = Vec::new();
     for key in &keys {
-        let clip = app.library.clip(key)?;
+        // Analysis may have the video open; it gives it up first.
+        app.signal.release(key);
+        let clip = app.library.fresh_clip(key)?;
         files.extend(library::files(&clip));
         thumbs.extend(clip.video.as_deref().map(library::cached_thumb));
     }
@@ -169,7 +171,7 @@ fn export_start(
     app: State<'_, App>,
     handle: tauri::AppHandle,
     request: export::Request,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let clip = app.library.clip(&request.key)?;
     export::start(handle, app.exports.clone(), &clip, request)
 }
@@ -182,18 +184,45 @@ fn export_cancel(app: State<'_, App>) {
 #[tauri::command(async)]
 fn clip_copy(window: WebviewWindow, keys: Vec<String>) -> Result<(), String> {
     let hwnd = window.hwnd().map_err(|e| e.to_string())?;
-    let paths: Vec<PathBuf> = keys.iter().map(PathBuf::from).collect();
+    let paths = keys
+        .iter()
+        .map(|k| allowed(std::path::Path::new(k)))
+        .collect::<Result<Vec<_>, _>>()?;
     shell::copy_files(hwnd, &paths)
 }
 
 #[tauri::command(async)]
 fn reveal(path: PathBuf) -> Result<(), String> {
-    shell::reveal(&path)
+    shell::reveal(&allowed(&path)?)
 }
 
 #[tauri::command(async)]
 fn open_path(path: PathBuf) -> Result<(), String> {
-    shell::open(&path)
+    shell::open(&allowed(&path)?)
+}
+
+/// The page may only open, show or copy rec's own files: the clips folder
+/// and what is in it (clips, trims, exports), the config file and the
+/// profiles. Anything else is refused, so a script in the page can't
+/// launch programs.
+fn allowed(path: &std::path::Path) -> Result<PathBuf, String> {
+    use rec_core::store::path_key;
+    let wanted = path_key(path);
+    let within = |dir: &std::path::Path| {
+        let dir = path_key(dir);
+        wanted == dir || wanted.starts_with(&format!("{}\\", dir.trim_end_matches('\\')))
+    };
+    let config = settings::config_path();
+    let ok = within(&library::roots().0[0])
+        || wanted == path_key(&config)
+        || config
+            .parent()
+            .is_some_and(|dir| within(&dir.join("profiles")));
+    if ok {
+        Ok(path.to_owned())
+    } else {
+        Err(format!("{} isn't one of rec's files", path.display()))
+    }
 }
 
 /// Lets the webview load videos and thumbnails from a folder through the

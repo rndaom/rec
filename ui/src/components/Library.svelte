@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { ask } from "@tauri-apps/plugin-dialog";
   import { api, type ClipItem, type Listing } from "../lib/api";
   import { bytes, inField } from "../lib/format";
   import ClipCard from "./ClipCard.svelte";
@@ -89,21 +90,32 @@
     );
   }
 
-  function deleteSelected() {
-    const keys = [...selected];
+  // Actions take only the selected clips the filters show.
+  const selectedKeys = $derived(selectedClips.map((c) => c.key));
+
+  async function deleteSelected() {
+    const keys = selectedKeys;
     const n = keys.length;
+    if (!n) return;
+    const what = n === 1 ? selectedClips[0].file : `${n} clips`;
+    const ok = await ask(`Move ${what} to the Recycle Bin?`, {
+      title: "Delete",
+      kind: "warning",
+      okLabel: "Delete",
+    });
+    if (!ok) return;
     selected = new Set();
-    act(() => api.remove(keys), `Moved ${n} clip${n === 1 ? "" : "s"} to the Recycle Bin`);
+    act(() => api.remove(keys), `Moved ${n === 1 ? "the clip" : `${n} clips`} to the Recycle Bin`);
   }
 
   function onkey(e: KeyboardEvent) {
     if (openKey || inField(e)) return;
-    if (e.key === "Delete" && selected.size) deleteSelected();
+    if (e.key === "Delete" && selectedKeys.length) deleteSelected();
     else if (e.key === "a" && e.ctrlKey) {
       selected = new Set(shown.map((c) => c.key));
       e.preventDefault();
     } else if (e.key === "Escape") selected = new Set();
-    else if (e.key === "Enter" && selected.size === 1) openKey = [...selected][0];
+    else if (e.key === "Enter" && selectedKeys.length === 1) openKey = selectedKeys[0];
   }
 
   onMount(() => {
@@ -156,15 +168,15 @@
     {#if listing}<button onclick={() => api.open(listing!.folder)}>Open folder</button>{/if}
   </header>
 
-  {#if selected.size}
+  {#if selectedKeys.length}
     <div class="selbar">
-      <span>{selected.size} selected</span>
+      <span>{selectedKeys.length} selected</span>
       <button disabled={busy} onclick={starSelected}>{allStarred ? "Unstar" : "Star"}</button>
       <button
         disabled={busy}
         onclick={() =>
-          act(() => api.copy([...selected]), "Copied: paste into Explorer, Discord or a chat")}
-        >Copy file{selected.size === 1 ? "" : "s"}</button
+          act(() => api.copy(selectedKeys), "Copied: paste into Explorer, Discord or a chat")}
+        >Copy file{selectedKeys.length === 1 ? "" : "s"}</button
       >
       <button class="danger" disabled={busy} onclick={deleteSelected}>Delete</button>
       <div class="grow"></div>

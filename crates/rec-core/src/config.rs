@@ -561,9 +561,17 @@ pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), ConfigError> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(write_err)?;
     }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).map_err(write_err)?;
-    std::fs::rename(&tmp, path).map_err(write_err)
+    // A temp name of its own per write: recd, rec-ui and `rec` may write
+    // the same file at once, and a shared temp file could be renamed into
+    // place holding another writer's half-written text.
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("toml.{}-{n}.tmp", std::process::id()));
+    let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(write_err)
 }
 
 /// One setting requested from [`Config::save_keys`] with the value `self` has

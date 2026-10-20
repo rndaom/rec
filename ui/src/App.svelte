@@ -49,7 +49,7 @@
   </nav>
   <main>
     {#if view === "library"}
-      <Library recording={recd?.status?.state === "recording"} />
+      <Library recording={recd?.busy ?? false} />
     {:else}
       <Settings />
     {/if}

@@ -34,6 +34,8 @@
   let fraction = $state(0);
   let done = $state<ExportDone | null>(null);
   let error = $state<string | null>(null);
+  // This dialog's export; events from an earlier, cancelled one are ignored.
+  let job: number | null = null;
 
   const span = $derived((end ?? clip.duration) - start);
   const target = $derived(useCustom ? custom : limit);
@@ -53,24 +55,39 @@
     fraction = 0;
     running = true;
     try {
-      await api.exportStart({ key: clip.key, limit_mb: target, start, end });
+      job = await api.exportStart({ key: clip.key, limit_mb: target, start, end });
+      endings.get(job)?.();
     } catch (e) {
       running = false;
       error = String(e);
     }
   }
 
+  // An export can end before `exportStart` has returned its id, so endings
+  // are kept by job and looked at once the id is known.
+  const endings = new Map<number, () => void>();
+  function ended(id: number, apply: () => void) {
+    if (id === job) apply();
+    else endings.set(id, apply);
+  }
+
   onMount(() => {
     const subs = [
-      listen<{ fraction: number }>("export-progress", (e) => (fraction = e.payload.fraction)),
-      listen<ExportDone>("export-done", (e) => {
-        running = false;
-        done = e.payload;
+      listen<{ job: number; fraction: number }>("export-progress", (e) => {
+        if (e.payload.job === job) fraction = e.payload.fraction;
       }),
-      listen<string>("export-failed", (e) => {
-        running = false;
-        error = e.payload;
-      }),
+      listen<ExportDone>("export-done", (e) =>
+        ended(e.payload.job, () => {
+          running = false;
+          done = e.payload;
+        }),
+      ),
+      listen<{ job: number; message: string }>("export-failed", (e) =>
+        ended(e.payload.job, () => {
+          running = false;
+          error = e.payload.message === "cancelled" ? null : e.payload.message;
+        }),
+      ),
     ];
     return () => subs.forEach((s) => s.then((f) => f()));
   });
@@ -114,7 +131,7 @@
         {/if}
       {/if}
       {#if recording}
-        <p class="warn small">A game is being recorded. Exporting uses the GPU's video engine and can cost the game frames; it's lighter to export after playing.</p>
+        <p class="warn small">A game may be running. Exporting uses the GPU's video engine and can cost the game frames; it's lighter to export after playing.</p>
       {/if}
       {#if running}
         <div class="progress"><div style="width:{Math.round(fraction * 100)}%"></div></div>

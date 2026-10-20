@@ -60,6 +60,13 @@ impl Shared {
         self.with(|lib| lib.find(key).cloned())
             .ok_or_else(|| format!("no clip {key}"))
     }
+
+    /// The clip as it is on disk now (a re-scan re-reads only changed
+    /// sidecars), for anything that shows or changes its files.
+    pub fn fresh_clip(&self, key: &str) -> Result<Clip, String> {
+        self.with_fresh(|lib| lib.find(key).cloned())
+            .ok_or_else(|| format!("no clip {key}"))
+    }
 }
 
 /// A clip in the grid.
@@ -207,7 +214,7 @@ pub struct TrackInfo {
 }
 
 pub fn detail(shared: &Shared, key: &str) -> Result<Detail, String> {
-    let clip = shared.clip(key)?;
+    let clip = shared.fresh_clip(key)?;
     let item = item(&clip).ok_or("the clip's video is gone")?;
     Ok(Detail {
         video: clip.video.clone().unwrap_or_default(),
@@ -245,7 +252,7 @@ pub fn detail(shared: &Shared, key: &str) -> Result<Detail, String> {
 /// Stars or unstars a clip in its sidecar (making one for a journal-only
 /// clip), the same way `rec star` does.
 pub fn set_starred(shared: &Shared, key: &str, starred: bool) -> Result<(), String> {
-    let mut clip = shared.clip(key)?;
+    let mut clip = shared.fresh_clip(key)?;
     rec_library::clip::set_starred(&mut clip, starred)
 }
 

@@ -268,13 +268,33 @@ pub fn thumb_time(clip: &Clip, picture: &Picture) -> f64 {
 /// analysis events filled in (and the thumbnail written, if the clip has a
 /// sidecar to point at it). Nothing is saved; see [`save`].
 pub fn analyze(clip: &Clip, imaging: &Imaging) -> Result<Clip, String> {
+    analyze_unless(clip, imaging, &|| false)
+}
+
+/// The error [`analyze_unless`] returns when `stop` asked it to.
+pub const STOPPED: &str = "analysis stopped";
+
+/// [`analyze`], giving up with [`STOPPED`] as soon as `stop` returns true,
+/// so an app can make room for a game that has just started or a clip
+/// about to be deleted. `stop` is asked after every frame (10 per clip
+/// second), so it must be cheap.
+pub fn analyze_unless(
+    clip: &Clip,
+    imaging: &Imaging,
+    stop: &dyn Fn() -> bool,
+) -> Result<Clip, String> {
     let video = clip.video.as_deref().ok_or("the clip's video is missing")?;
     let mut decoder = Decoder::open(video, Some(DECODE_WIDTH))?;
     let mut looks = Vec::new();
+    let mut stopped = false;
     decoder.each(1.0 / LOOK_HZ, |frame| {
         looks.push(Look::of(&frame));
-        true
+        stopped = stop();
+        !stopped
     })?;
+    if stopped {
+        return Err(STOPPED.into());
+    }
     let duration = if clip.duration > 0.0 {
         clip.duration
     } else {

@@ -12,6 +12,8 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 pub struct RecdState {
     pub running: bool,
+    /// A game may be running ([`busy`]): heavy work should wait or warn.
+    pub busy: bool,
     pub status: Option<Status>,
     pub error: Option<String>,
 }
@@ -20,37 +22,45 @@ pub fn state() -> RecdState {
     match ipc::send(&Request::Status) {
         Ok(Response::Status(status)) => RecdState {
             running: true,
+            busy: busy(&status),
             status: Some(status),
             error: None,
         },
         Ok(other) => RecdState {
             running: true,
+            busy: true,
             status: None,
             error: Some(format!("unexpected answer: {other:?}")),
         },
         Err(e) if e == ipc::NOT_RUNNING => RecdState {
             running: false,
+            busy: false,
             status: None,
             error: None,
         },
         Err(e) => RecdState {
             running: false,
+            busy: true,
             status: None,
             error: Some(e),
         },
     }
 }
 
-/// Whether recd is buffering a game right now. Background work (thumbnails,
-/// analysis) waits while it is, so the game gets the GPU and disk.
-pub fn recording() -> bool {
-    matches!(
-        ipc::send(&Request::Status),
-        Ok(Response::Status(Status {
-            state: RecorderState::Recording,
-            ..
-        }))
-    )
+/// Whether a game may be running, so background work (analysis) must wait
+/// and exports should warn. Only "recd isn't running" or "recd is idle
+/// with nothing to capture" count as free: a paused or failing recd may
+/// still have a game in front, and an unanswered pipe proves nothing.
+pub fn game_active() -> bool {
+    match ipc::send(&Request::Status) {
+        Ok(Response::Status(status)) => busy(&status),
+        Err(e) if e == ipc::NOT_RUNNING => false,
+        _ => true,
+    }
+}
+
+pub fn busy(status: &Status) -> bool {
+    status.state != RecorderState::Idle || status.target.is_some()
 }
 
 /// Asks a running recd to re-read the settings. `None` when recd isn't
@@ -90,4 +100,34 @@ pub fn start() -> Result<(), String> {
         .or_else(|_| spawn(flags))
         .map(drop)
         .map_err(|e| format!("can't start {}: {e}", exe.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(state: RecorderState, target: Option<&str>) -> Status {
+        Status {
+            protocol: ipc::PROTOCOL_VERSION,
+            version: String::new(),
+            state,
+            reason: None,
+            target: target.map(str::to_owned),
+            encoder: None,
+            buffered_seconds: 0.0,
+            buffer_bytes: 0,
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn only_idle_without_a_game_is_free() {
+        assert!(!busy(&status(RecorderState::Idle, None)));
+        assert!(busy(&status(RecorderState::Idle, Some("game.exe"))));
+        assert!(busy(&status(RecorderState::Recording, Some("game.exe"))));
+        // Paused (by hand, or a private app in front) and failing captures
+        // may still have a game running.
+        assert!(busy(&status(RecorderState::Paused, None)));
+        assert!(busy(&status(RecorderState::Error, None)));
+    }
 }

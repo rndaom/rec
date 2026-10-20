@@ -3,8 +3,8 @@
 //! with progress events. One export at a time.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rec_library::clip::Clip;
 use rec_library::export::{self, ExportOptions, Plan};
@@ -67,20 +67,34 @@ pub fn plan(clip: &Clip, request: &Request) -> PlanView {
     }
 }
 
+/// The export that is running, if any. Each gets an id that its events
+/// carry, so a dialog never takes a cancelled job's last event for its own.
 #[derive(Debug, Default)]
 pub struct Jobs {
-    running: AtomicBool,
-    cancel: Arc<AtomicBool>,
+    running: Mutex<Option<(u64, Arc<AtomicBool>)>>,
+    next: AtomicU64,
 }
 
 impl Jobs {
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        if let Some((_, cancel)) = &*self.running.lock().unwrap_or_else(|e| e.into_inner()) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Marks the job finished however its thread ends, panics included.
+struct Finish<'a>(&'a Jobs);
+
+impl Drop for Finish<'_> {
+    fn drop(&mut self) {
+        *self.0.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct Done {
+    job: u64,
     path: PathBuf,
     bytes: u64,
     width: u32,
@@ -89,44 +103,63 @@ struct Done {
     from_hdr: bool,
 }
 
-/// Starts exporting next to the clip (`<name> discord.mp4`); progress and
-/// the result arrive as `export-progress`, `export-done` and
-/// `export-failed` events.
-pub fn start(app: AppHandle, jobs: Arc<Jobs>, clip: &Clip, request: Request) -> Result<(), String> {
+#[derive(Clone, Debug, Serialize)]
+struct Failed {
+    job: u64,
+    message: String,
+}
+
+/// Starts exporting next to the clip (`<name> discord.mp4`) and returns the
+/// job's id; progress and the result arrive as `export-progress`,
+/// `export-done` and `export-failed` events carrying it.
+pub fn start(
+    app: AppHandle,
+    jobs: Arc<Jobs>,
+    clip: &Clip,
+    request: Request,
+) -> Result<u64, String> {
     let video = clip.video.clone().ok_or("the clip's video is gone")?;
-    if jobs.running.swap(true, Ordering::AcqRel) {
-        return Err("an export is already running".into());
-    }
-    jobs.cancel.store(false, Ordering::Relaxed);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let job = {
+        let mut running = jobs.running.lock().unwrap_or_else(|e| e.into_inner());
+        if running.is_some() {
+            return Err("an export is still running or stopping; try again in a moment".into());
+        }
+        let job = jobs.next.fetch_add(1, Ordering::Relaxed) + 1;
+        *running = Some((job, cancel.clone()));
+        job
+    };
     let output = free_name(&video, "discord");
+    let thread_jobs = jobs.clone();
     let spawned = std::thread::Builder::new()
         .name("rec-ui export".into())
         .spawn(move || {
-            // Out of a game's way when one is being recorded; otherwise
-            // as fast as the GPU allows.
-            if recd::recording() {
+            let _finish = Finish(&thread_jobs);
+            // Out of a game's way when one may be running; otherwise as fast
+            // as the GPU allows. (The GPU's video engines aren't slowed by
+            // thread priority; the dialog warns about that.)
+            if recd::game_active() {
                 worker::lower_this_thread();
             }
-            let result = sys::init().and_then(|()| {
-                let mut progress = |p: export::Progress| {
-                    let _ = app.emit(
-                        "export-progress",
-                        serde_json::json!({ "fraction": p.fraction, "pass": p.pass }),
-                    );
-                };
-                export::export(
-                    &video,
-                    &output,
-                    &request.options(),
-                    &mut progress,
-                    &jobs.cancel,
-                )
+            let run = std::panic::AssertUnwindSafe(|| {
+                sys::init().and_then(|()| {
+                    let mut progress = |p: export::Progress| {
+                        let _ = app.emit(
+                            "export-progress",
+                            serde_json::json!({ "job": job, "fraction": p.fraction, "pass": p.pass }),
+                        );
+                    };
+                    export::export(&video, &output, &request.options(), &mut progress, &cancel)
+                })
             });
+            let result = std::panic::catch_unwind(run)
+                .unwrap_or_else(|_| Err("the export crashed".into()));
             match result {
                 Ok(done) => {
                     let _ = app.emit(
                         "export-done",
                         Done {
+                            job,
                             path: done.path,
                             bytes: done.bytes,
                             width: done.width,
@@ -136,13 +169,18 @@ pub fn start(app: AppHandle, jobs: Arc<Jobs>, clip: &Clip, request: Request) -> 
                         },
                     );
                 }
-                Err(e) => {
-                    let _ = app.emit("export-failed", e);
+                Err(message) => {
+                    let _ = app.emit("export-failed", Failed { job, message });
                 }
             }
-            jobs.running.store(false, Ordering::Release);
         });
-    spawned.map(drop).map_err(|e| e.to_string())
+    match spawned {
+        Ok(_) => Ok(job),
+        Err(e) => {
+            *jobs.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            Err(format!("can't start the export: {e}"))
+        }
+    }
 }
 
 /// `<stem> <tag>.mp4` next to `video`, numbered if taken.

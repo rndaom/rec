@@ -606,6 +606,10 @@ pub struct Saved {
 /// Applies `changes` to the global settings or a profile, then asks recd to
 /// reload. Nothing is written if any change is invalid.
 pub fn apply(profile_id: Option<&str>, changes: &[Change]) -> Result<Saved, String> {
+    // One change at a time: each reads the file, patches it and writes it
+    // back, so two at once (a field's blur and a checkbox) would lose one.
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let config_path = config_path();
     let global = load_global(&config_path)?;
     let mut set = Vec::new();
