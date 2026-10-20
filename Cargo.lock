@@ -2656,6 +2656,7 @@ name = "rec-library"
 version = "0.0.1"
 dependencies = [
  "rec-core",
+ "rec-mux",
  "serde_json",
  "windows 0.62.2",
 ]
