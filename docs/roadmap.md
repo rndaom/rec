@@ -64,9 +64,11 @@ Pressing the hotkey in a game saves a playable MP4 with sound. Verified on a liv
 - [x] Cached silent AAC packet instead of encoding silence
 
 ## M3: Library
-- [ ] `rec-ui` (Tauri 2 + Svelte 5): settings, clip library, lossless trim, star / delete (Recycle Bin)
-- [ ] "Discord-ready" export: H.264 MP4 re-encoded to fit a size limit; copy-file-to-clipboard; drag out
-- [ ] Marker timeline
+Built on branch `m3` (D17). Tested in the real app on a real 1080p60 HEVC clip: playback, timeline, trim, export, star, delete, settings and profiles.
+- [x] `rec-ui` (Tauri 2 + Svelte 5): settings and per-game profiles (comments in the files kept), clip library with background analysis thumbnails, lossless trim (start snaps to the keyframe before it), star / delete (Recycle Bin); "Clips and settings" in recd's tray menu
+- [x] "Discord-ready" export: H.264 MP4 re-encoded to fit a size limit (10 / 50 / 500 MB or custom, whole clip or the trim range); copy-file-to-clipboard; drag out (drag-out not yet tried with a real mouse)
+- [x] Marker timeline: markers, scene cuts and loud moments over the loudness curve; click or `[` `]` to jump
+- Deferred: HDR clips export too dark (Windows' HDR-to-SDR conversion; reuse rec's tone-map shader), a native player fallback where WebView2 can't play HEVC/AV1, a microphone device picker
 
 ## M4: Ship it
 - [ ] Installer, code signing, start with Windows, clean uninstall

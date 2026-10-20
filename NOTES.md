@@ -6,7 +6,7 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 
 **Read first:** [docs/decisions.md](docs/decisions.md) (the why), [docs/roadmap.md](docs/roadmap.md) (the what), [docs/research.md](docs/research.md) (the evidence).
 
-**Status (2026-10-19):** M1 done, verified on a live game. M2 features are all built on branch `m2`: per-process audio, exclusive-fullscreen detection, pipeline recovery, the quick panel, HDR, AV1, the AMD AMF backend, AI-ready clips phases A and B, the storage quota, controller combos, the DDA fallback, adaptive GPU priority and per-game profiles. Still open in M2: published benchmark numbers and NVENC/oneVPL (both need other hardware).
+**Status (2026-10-20):** M1 done, verified on a live game. M2 is built (branch `m2`; open: published benchmark numbers and NVENC/oneVPL, both need other hardware). M3 is built on branch `m3`: `rec-ui` (settings, per-game profiles, clip library, player with the marker timeline, lossless trim, star, Recycle Bin delete, copy/drag out, Discord-ready export), D17.
 
 | Crate | Role |
 |---|---|
@@ -18,8 +18,9 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 | `rec-cli` | `rec`, including `rec digest`, `rec analyze` and the `rec mcp` server (`src/mcp.rs`) |
 | `rec-library` | Saved clips for AI tools: sidecars, journals, overlaps, timelines, MF/D3D11 decoding, WIC stills and sheets, layer 2 analysis |
 | `rec-bench` | Benchmark harness: PresentMon off/on runs, `recd` idle cost (see `bench/README.md`) |
+| `rec-ui` | Settings and clip library app (Tauri 2 + Svelte 5; frontend in `ui/`), D17. Separate process, never controls recording |
 
-**Next step:** M2. Suggested order:
+**Next step:** M4 (installer, start with Windows, updates), or the open M2 hardware items and the M3 leftovers below. M2 as done, in order:
 1. ~~Benchmark harness~~ (harness done; the first published run on real hardware is still to do)
 2. ~~Per-process audio tracks~~ (done)
 3. ~~Black-frame / exclusive-fullscreen detection~~ (done)
@@ -33,12 +34,13 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 11. ~~Win10 DDA fallback~~ (done: `rec-video/src/dda.rs`, `video.capture`, D14)
 12. ~~Adaptive GPU priority~~ (done: `rec-video/src/priority.rs`, `video.gpu_priority`, D15; also `video.dropped_frames` in sidecars)
 13. ~~Per-game profiles~~ (done: `rec-core/src/profile.rs`, D16, `rec profile list|show|path`, panel "Settings for" row)
-14. Remaining: a real benchmark run (admin + NVIDIA/Intel/hybrid hardware), a real Win10 + HDR display + controller check, then M3 (`rec-ui`)
+14. Remaining: a real benchmark run (admin + NVIDIA/Intel/hybrid hardware), a real Win10 + HDR display + controller check
 
 **M3 plan (branch `m3`, started 2026-10-20):**
 - ~~`rec-library::trim`~~ (done: `trim::plan` / `trim::trim`): lossless trim by cutting rec's fragmented MP4 at GOP fragments (box level: codec- and HDR-agnostic), start snaps to the keyframe at or before it (IDR every 1 s), end exact to the frame; writes `<stem> trim.mp4` + sidecar (`parent` = source id, events/loudness shifted, `analysis` and `video.dropped_frames` dropped). Only rec's own fMP4 layout is accepted. `rec_core::store::new_id` (moved from recd) makes the id. `cargo test -p rec-library ffprobe -- --ignored` checks a trim with ffprobe.
-- `rec-library::export`: "Discord-ready" H.264/AAC MP4 under a size limit (MF source reader -> sink writer, hardware, bitrate from size/duration, retry lower if over), progress + cancel, EcoQoS thread.
-- `crates/rec-ui` (Tauri 2 + Svelte 5, frontend in `ui/`): settings over `config.toml` and profiles via `save_keys` / `Profile::save_settings` then IPC `ReloadConfig`; library over `rec_library::Library` (thumbnails from analysis or made on demand), player over the asset protocol with the marker timeline (sidecar events + loudness), trim, star, delete to the Recycle Bin, copy file to clipboard, drag out. Separate process: closing it never touches recd (it never sends `Quit`), and background work is EcoQoS and paused while recd records.
+- ~~`rec-library::export`~~ (done): "Discord-ready" H.264/AAC MP4 under a size limit (MF source reader -> sink writer, GPU end to end, bitrate from size/duration, retry lower if over), progress + cancel. Notes under "Export" below.
+- ~~`crates/rec-ui`~~ (done, D17; Tauri 2 + Svelte 5, frontend in `ui/`): settings over `config.toml` and profiles via `save_keys` / `Profile::save_settings` then IPC `ReloadConfig`; library over `rec_library::Library` (thumbnails from analysis or made on demand), player over the asset protocol with the marker timeline (sidecar events + loudness), trim, star, delete to the Recycle Bin, copy file to clipboard, drag out. Separate process: closing it never touches recd (it never sends `Quit`), and background work is EcoQoS and paused while recd records.
+- Left for later: a native player fallback for PCs where WebView2 can't play HEVC/AV1 (D9 risk; it plays here), the HDR export tone-map (reuse `convert.hlsl`), a microphone device picker, profile create/delete from the app, unstarring from the quick panel, a library view of non-rec videos. M4 (installer) bundles `rec-ui.exe` next to `recd.exe`.
 
 **Things learned**
 - Video:
@@ -88,6 +90,12 @@ Handoff file so any session can pick up quickly. Keep it short and current.
   - The MS AAC encoder takes only 96/128/160/192 kbps, so 96 is the floor.
   - HDR10 -> SDR through the video processor (output type tagged BT.709) is too dark and flat on AMD: mean luma 37 vs 68 for the same footage as SDR, lifted blacks. Tested with an ffmpeg PQ conversion of the Deadlock clip, not a real rec HDR clip. Fix: rec-video's tone-map shader on the decoded P010, in a crate both can use. AV1 sources with padded frames (aperture) are untested.
   - Tests: `cargo test --release -p rec-library export -- --ignored --nocapture` (`REC_TEST_CLIP`, `REC_TEST_LIMIT_MB`, `REC_TEST_KEEP`; a synthetic clip without `REC_TEST_CLIP`).
+- rec-ui (M3):
+  - Build: `npm --prefix ui install`, `npm --prefix ui run build`, then `cargo build -p rec-ui` (it embeds `ui/dist`; `build.rs` writes a placeholder page when it is missing so CI without Node still builds). Live reload: `npm --prefix ui run app:dev` (`TAURI_APP_PATH` points the CLI at `crates/rec-ui`; `--no-default-features` drops the `embed` feature, i.e. `tauri/custom-protocol`). Tauri 2.12 needs Rust 1.90, so `rec-ui` has its own `rust-version`.
+  - Tested against the real app through WebView2 DevTools: start it with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333`, then drive the page over CDP (`Runtime.evaluate`, `Page.captureScreenshot`; Node 24 has `WebSocket` built in). Computer use can't pick the window (not an installed app). A sandbox `APPDATA`/`LOCALAPPDATA` with `output.directory` pointing at a copy of a clip keeps tests off the real library.
+  - Verified that way: library + background analysis thumbnail, HEVC 1080p60 playback in WebView2, the timeline (markers, loud moments, scene cuts, loudness), trim (start snapped 4.5 -> 4.0, output decodes with ffmpeg, sidecar shifted), star, copy (`CF_HDROP` read back), Recycle Bin delete, settings + per-game override/reset keeping comments, start recd from the app + reload, export 10 MB / trimmed 3 MB / cancel. Closing the window ends rec-ui (and its WebView2 processes) while recd keeps running. Not tested: drag-out (needs a real mouse drag), hotkey recording (keys recd holds never reach the page).
+  - Svelte 5: `$effect` copying a prop into `bind:value` state broke number fields (edits after a reload were dropped); fields now keep a `draft` (null when not editing) and show `draft ?? value`. Key handlers on `svelte:window` must not assume `e.target` is an element.
+  - The app polls recd status every 3 s (15 s hidden) and rescans the library every 10 s while visible; the scan re-parses only changed sidecars.
 - Storage quota:
   - Verified with a throwaway `APPDATA`/`LOCALAPPDATA` and 400 MB stand-in files (`SetLength`, never decoded): `rec star`, `rec prune --dry-run`, `rec prune`, and recd's startup prune all deleted only the oldest unstarred rec clip (with its sidecar and `<clip>.rec` folder), keeping starred, read-only and non-rec videos. The prune after a real save runs the same `prune::request` but wasn't run live: a sandboxed recd records whatever game is in the foreground.
   - Starring lives in the sidecar, so a journal-only clip gets a sidecar when starred. `analysis::save` re-reads `starred` from disk because `rec mcp` holds clips in memory for a long time.
