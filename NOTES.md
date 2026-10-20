@@ -35,6 +35,11 @@ Handoff file so any session can pick up quickly. Keep it short and current.
 13. ~~Per-game profiles~~ (done: `rec-core/src/profile.rs`, D16, `rec profile list|show|path`, panel "Settings for" row)
 14. Remaining: a real benchmark run (admin + NVIDIA/Intel/hybrid hardware), a real Win10 + HDR display + controller check, then M3 (`rec-ui`)
 
+**M3 plan (branch `m3`, started 2026-10-20):**
+- `rec-library::trim`: lossless trim by cutting rec's fragmented MP4 at GOP fragments (box level: codec- and HDR-agnostic), start snaps to the keyframe at or before it (IDR every 1 s), end exact; writes a new clip + sidecar (`parent` = source id, events/loudness shifted).
+- `rec-library::export`: "Discord-ready" H.264/AAC MP4 under a size limit (MF source reader -> sink writer, hardware, bitrate from size/duration, retry lower if over), progress + cancel, EcoQoS thread.
+- `crates/rec-ui` (Tauri 2 + Svelte 5, frontend in `ui/`): settings over `config.toml` and profiles via `save_keys` / `Profile::save_settings` then IPC `ReloadConfig`; library over `rec_library::Library` (thumbnails from analysis or made on demand), player over the asset protocol with the marker timeline (sidecar events + loudness), trim, star, delete to the Recycle Bin, copy file to clipboard, drag out. Separate process: closing it never touches recd (it never sends `Quit`), and background work is EcoQoS and paused while recd records.
+
 **Things learned**
 - Video:
   - The yellow WGC border turns off without any access request for this unpackaged app (Win11 25H2).
