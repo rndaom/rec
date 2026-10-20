@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { api, type Detail, type ExportDone } from "../lib/api";
+  import { api, type Detail, type ExportDone, type ExportPlan } from "../lib/api";
   import { dragOut } from "../lib/drag";
-  import { bytes, precise } from "../lib/format";
+  import { precise } from "../lib/format";
 
   let {
     clip,
@@ -37,8 +37,15 @@
 
   const span = $derived((end ?? clip.duration) - start);
   const target = $derived(useCustom ? custom : limit);
-  // Rough picture of what fits, mirroring the encoder's plan.
-  const kbps = $derived(span > 0 ? Math.max(0, Math.round((target * 8 * 1024 * 0.96) / span - 128)) : 0);
+  let plan = $state<ExportPlan | null>(null);
+  // Upload limits are decimal megabytes.
+  const mb = (n: number) => `${(n / 1e6).toFixed(n < 1e7 ? 2 : 1)} MB`;
+
+  // What the encoder will make at this size.
+  $effect(() => {
+    const request = { key: clip.key, limit_mb: target, start, end };
+    api.exportPlan(request).then((p) => (plan = p)).catch(() => (plan = null));
+  });
 
   async function go() {
     error = null;
@@ -95,10 +102,17 @@
           </strong><span class="faint">size</span>
         </button>
       </div>
-      <p class="faint small">
-        About {kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mbit/s` : `${kbps} kbit/s`} of video for {precise(span)}.
-        {#if kbps < 1500}Short clips look better at this size: trim first.{/if}
-      </p>
+      {#if plan}
+        <p class="faint small">
+          {plan.height}p{plan.fps} at {plan.video_kbps >= 1000 ? `${(plan.video_kbps / 1000).toFixed(1)} Mbit/s` : `${plan.video_kbps} kbit/s`}
+          for {precise(span)}, about {mb(plan.estimated_bytes)}.
+          {#if !plan.fits}<span class="warn">Too long for this size to look good: trim it first or pick a bigger size.</span>
+          {:else if plan.height < 720}A shorter clip would look sharper at this size.{/if}
+        </p>
+        {#if plan.hdr}
+          <p class="warn small">This clip is HDR. The export is SDR and Windows' conversion makes it look darker and flatter than the clip.</p>
+        {/if}
+      {/if}
       {#if recording}
         <p class="warn small">A game is being recorded. Exporting uses the GPU's video engine and can cost the game frames; it's lighter to export after playing.</p>
       {/if}
@@ -113,7 +127,7 @@
       </div>
     {:else}
       <div class="done">
-        <p><strong>{bytes(done.bytes)}</strong> · {done.height}p · saved next to the clip</p>
+        <p><strong>{mb(done.bytes)}</strong> · {done.height}p{done.fps} H.264 · saved next to the clip</p>
         <code>{done.path}</code>
       </div>
       <div class="row actions">

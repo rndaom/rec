@@ -148,11 +148,24 @@ export interface ExportRequest {
   end: number | null;
 }
 
+export interface ExportPlan {
+  width: number;
+  height: number;
+  fps: number;
+  video_kbps: number;
+  audio_kbps: number;
+  estimated_bytes: number;
+  fits: boolean;
+  hdr: boolean;
+}
+
 export interface ExportDone {
   path: string;
   bytes: number;
   width: number;
   height: number;
+  fps: number;
+  from_hdr: boolean;
 }
 
 export const api = {
@@ -172,6 +185,7 @@ export const api = {
   trimPlan: (key: string, start: number, end: number) =>
     invoke<TrimPlan>("trim_plan", { key, start, end }),
   trim: (key: string, start: number, end: number) => invoke<Trimmed>("trim", { key, start, end }),
+  exportPlan: (request: ExportRequest) => invoke<ExportPlan>("export_plan", { request }),
   exportStart: (request: ExportRequest) => invoke<void>("export_start", { request }),
   exportCancel: () => invoke<void>("export_cancel"),
 };

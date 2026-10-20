@@ -75,7 +75,7 @@ npm --prefix ui install
 npm --prefix ui run build
 ```
 
-Then `cargo build --release -p rec-ui`. For UI work with live reload, run `npx tauri dev -- --no-default-features` from `crates/rec-ui` (it starts the Vite dev server).
+Then `cargo build --release -p rec-ui`. For UI work with live reload, `npm --prefix ui run app:dev` starts the Vite dev server and the app against it.
 
 ## Running
 Start `target\release\recd.exe`. A dot appears in the notification area:

@@ -7,6 +7,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod export;
 mod library;
 mod recd;
 mod settings;
@@ -25,6 +26,7 @@ use crate::worker::Signal;
 struct App {
     library: Arc<Shared>,
     signal: Arc<Signal>,
+    exports: Arc<export::Jobs>,
 }
 
 #[derive(Serialize)]
@@ -157,6 +159,27 @@ fn trim(app: State<'_, App>, key: String, start: f64, end: f64) -> Result<TrimDo
 }
 
 #[tauri::command(async)]
+fn export_plan(app: State<'_, App>, request: export::Request) -> Result<export::PlanView, String> {
+    let clip = app.library.clip(&request.key)?;
+    Ok(export::plan(&clip, &request))
+}
+
+#[tauri::command(async)]
+fn export_start(
+    app: State<'_, App>,
+    handle: tauri::AppHandle,
+    request: export::Request,
+) -> Result<(), String> {
+    let clip = app.library.clip(&request.key)?;
+    export::start(handle, app.exports.clone(), &clip, request)
+}
+
+#[tauri::command]
+fn export_cancel(app: State<'_, App>) {
+    app.exports.cancel();
+}
+
+#[tauri::command(async)]
 fn clip_copy(window: WebviewWindow, keys: Vec<String>) -> Result<(), String> {
     let hwnd = window.hwnd().map_err(|e| e.to_string())?;
     let paths: Vec<PathBuf> = keys.iter().map(PathBuf::from).collect();
@@ -194,6 +217,7 @@ fn main() {
         .manage(App {
             library: shared.clone(),
             signal: signal.clone(),
+            exports: Arc::default(),
         })
         .setup(move |app| {
             let thumbs = library::cached_thumb(std::path::Path::new("x"));
@@ -219,6 +243,9 @@ fn main() {
             clip_copy,
             trim_plan,
             trim,
+            export_plan,
+            export_start,
+            export_cancel,
             reveal,
             open_path,
         ])
