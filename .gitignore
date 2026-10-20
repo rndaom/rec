@@ -1,10 +1,10 @@
 /target
 **/*.rs.bk
 
-# Tauri UI (added in a later milestone)
+# rec-ui frontend
 /ui/node_modules
 /ui/dist
-/ui/src-tauri/target
+
 
 # Local test output
 *.mp4
@@ -19,3 +19,6 @@ bench/results/**/raw/
 .idea/
 Thumbs.db
 desktop.ini
+
+# rec-ui: Tauri writes generated schemas here
+/crates/rec-ui/gen

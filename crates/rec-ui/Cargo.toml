@@ -1,0 +1,46 @@
+[package]
+name = "rec-ui"
+description = "rec's settings and clip library app (Tauri 2 + Svelte 5). Runs only when opened and never controls recording."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Tauri 2.12 needs a newer compiler than the rest of the workspace.
+rust-version = "1.90"
+
+[lints]
+workspace = true
+
+[features]
+# Serves the built `ui/dist` from the binary. `npm run tauri dev` turns it
+# off to use the Vite dev server instead.
+default = ["embed"]
+embed = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+rec-core.workspace = true
+rec-library = { path = "../rec-library" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tauri = { version = "2.12", features = ["protocol-asset"] }
+tauri-plugin-drag = "2.1"
+tauri-plugin-dialog = "2.8"
+tauri-plugin-single-instance = "2.5"
+toml = "1.1.8"
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+]
