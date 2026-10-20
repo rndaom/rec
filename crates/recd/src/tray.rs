@@ -39,6 +39,8 @@ pub enum MenuCommand {
     OpenConfig,
     OpenLog,
     Quit,
+    /// rec-ui: the clip library and settings.
+    OpenApp,
 }
 
 impl MenuCommand {
@@ -51,6 +53,7 @@ impl MenuCommand {
             Self::OpenConfig,
             Self::OpenLog,
             Self::Quit,
+            Self::OpenApp,
         ]
         .into_iter()
         .find(|c| *c as u32 == id)
@@ -212,6 +215,7 @@ impl Tray {
                 &format!("Quick panel\t{panel_hotkey}"),
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            add(MF_STRING, Some(MenuCommand::OpenApp), "Clips and settings");
             add(MF_STRING, Some(MenuCommand::OpenClips), "Open clips folder");
             add(
                 MF_STRING,

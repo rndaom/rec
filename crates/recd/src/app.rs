@@ -1590,6 +1590,22 @@ impl App {
                 open_text(&self.config_path);
             }
             MenuCommand::OpenLog => open_text(&paths::data_dir().join("recd.log")),
+            MenuCommand::OpenApp => {
+                // rec-ui is its own process: closing it never touches us.
+                let app = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|dir| dir.join("rec-ui.exe")))
+                    .filter(|app| app.is_file());
+                match app {
+                    Some(app) if shell_open(&app, None) => {}
+                    _ => {
+                        warning!("rec-ui.exe isn't next to recd.exe; opening the clips folder");
+                        let dir = paths::clips_dir(&self.config);
+                        let _ = std::fs::create_dir_all(&dir);
+                        open(&dir);
+                    }
+                }
+            }
             MenuCommand::Quit => return Flow::Quit,
         }
         Flow::Continue
