@@ -485,7 +485,7 @@ fn full(size: (u32, u32)) -> Crop {
     }
 }
 
-fn create_device() -> Result<ID3D11Device, String> {
+pub(crate) fn create_device() -> Result<ID3D11Device, String> {
     let mut device = None;
     // SAFETY: standard device creation with valid out-pointers.
     unsafe {
@@ -511,7 +511,7 @@ fn create_device() -> Result<ID3D11Device, String> {
     Ok(device)
 }
 
-fn ctx(what: &'static str) -> impl Fn(windows::core::Error) -> String {
+pub(crate) fn ctx(what: &'static str) -> impl Fn(windows::core::Error) -> String {
     move |e| format!("{what}: {e}")
 }
 
