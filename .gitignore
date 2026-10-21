@@ -14,6 +14,9 @@
 # Benchmark output: summaries are kept, raw PresentMon CSVs are large
 bench/results/**/raw/
 
+# Claude Code agent worktrees
+/.claude/worktrees/
+
 # Editors / OS
 .vscode/
 .idea/
