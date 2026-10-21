@@ -98,6 +98,29 @@ const GAME_LIBRARY_DIRS: &[&str] = &[
     r"\ubisoft game launcher\games\",
 ];
 
+/// Games that run in a shared runtime, so neither the exe nor its folder
+/// says "game": (runtime exes, window title prefix, game name). Minecraft:
+/// Java Edition plays windowed in `javaw.exe` (titles "Minecraft 1.6.4",
+/// "Minecraft* 1.21.1 - Multiplayer"); the old Java launcher has the same exe
+/// and is excluded by title.
+const HOSTED_GAMES: &[(&[&str], &str, &str)] =
+    &[(&["javaw.exe", "java.exe"], "Minecraft", "Minecraft")];
+const HOSTED_EXCLUDED_TITLES: &[&str] = &["Minecraft Launcher"];
+
+/// Games outside every store library folder that often play windowed.
+const KNOWN_GAMES: &[&str] = &["Minecraft.Windows.exe"];
+
+/// The game a shared runtime's window is running, by its title.
+fn hosted_game(exe_name: &str, title: &str) -> Option<&'static str> {
+    if HOSTED_EXCLUDED_TITLES.iter().any(|t| title.starts_with(t)) {
+        return None;
+    }
+    HOSTED_GAMES
+        .iter()
+        .find(|(exes, prefix, _)| listed(exes, exe_name) && title.starts_with(prefix))
+        .map(|&(_, _, name)| name)
+}
+
 fn listed(list: &[impl AsRef<str>], exe_name: &str) -> bool {
     list.iter()
         .any(|e| e.as_ref().eq_ignore_ascii_case(exe_name))
@@ -115,7 +138,10 @@ pub fn is_game(info: &WindowInfo, behavior: &BehaviorConfig, own_pid: u32) -> bo
     if listed(&behavior.ignored_apps, &info.exe_name) || is_private(info, behavior) {
         return false;
     }
-    if listed(&behavior.game_apps, &info.exe_name) {
+    if listed(&behavior.game_apps, &info.exe_name)
+        || listed(KNOWN_GAMES, &info.exe_name)
+        || hosted_game(&info.exe_name, &info.title).is_some()
+    {
         return true;
     }
     if listed(NOT_GAMES, &info.exe_name) {
@@ -216,11 +242,15 @@ pub fn window_info(hwnd: HWND) -> Option<WindowInfo> {
     }
 }
 
-/// A friendly game name for folders and file names: the executable's
-/// product name or description, else the window title up to the first
-/// " - " (titles like "Team Fortress 2 - Direct3D 9 - 64 Bit"), else the file
-/// stem.
+/// A friendly game name for folders and file names: the game a shared
+/// runtime runs (see `HOSTED_GAMES`), else the executable's product name or
+/// description, else the window title up to the first " - " (titles like
+/// "Team Fortress 2 - Direct3D 9 - 64 Bit"), else the file stem.
 pub fn display_name(exe_path: &Path, title: &str) -> String {
+    let exe_name = exe_path.file_name().map(|n| n.to_string_lossy());
+    if let Some(game) = exe_name.and_then(|n| hosted_game(&n, title)) {
+        return game.to_string();
+    }
     let usable = |name: &str| !name.trim().is_empty() && name.trim().len() <= 60;
     crate::win::version_string(exe_path, "ProductName")
         .or_else(|| crate::win::version_string(exe_path, "FileDescription"))
@@ -318,6 +348,33 @@ mod tests {
             &b,
             1
         ));
+    }
+
+    #[test]
+    fn minecraft_counts_even_windowed() {
+        let b = BehaviorConfig::default();
+        let mut java = window("javaw.exe", r"C:\Program Files\Java\bin\javaw.exe", false);
+        for title in [
+            "Minecraft 1.6.4",
+            "Minecraft* 1.21.1 - Multiplayer (3rd-party Server)",
+        ] {
+            java.title = title.into();
+            assert!(is_game(&java, &b, 1), "{title}");
+        }
+        java.title = "Minecraft Launcher 1.6.93".into();
+        assert!(!is_game(&java, &b, 1));
+        java.title = "Some Java Tool".into();
+        assert!(!is_game(&java, &b, 1));
+        let bedrock = window(
+            "Minecraft.Windows.exe",
+            r"C:\Program Files\WindowsApps\Microsoft.MinecraftUWP\Minecraft.Windows.exe",
+            false,
+        );
+        assert!(is_game(&bedrock, &b, 1));
+        assert_eq!(
+            display_name(Path::new(r"C:\Java\bin\javaw.exe"), "Minecraft 1.6.4"),
+            "Minecraft"
+        );
     }
 
     #[test]
