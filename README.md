@@ -1,5 +1,7 @@
 # rec
 
+# THIS PROJECT IS ON HOLD
+
 A free, open-source instant-replay recorder for Windows that stays out of your game's way.
 
 rec runs quietly in the background and keeps the last minute (or however long you choose) of your game. Press **Alt+F8** and that moment is saved as a clip. That's the whole idea. It works in any game or app, needs no account, never uploads anything, and is built so your game keeps its frame rate.
